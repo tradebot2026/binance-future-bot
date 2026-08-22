@@ -1,0 +1,16 @@
+# Binance Futures Trading Bot — Python 3.11+
+# Install: pip install -r requirements.txt
+
+# Exchange API (pulls in requests, websocket-client, etc.)
+python-binance==1.0.19
+
+# Market data & technical analysis
+pandas==2.2.0
+numpy==1.26.4
+ta==0.11.0
+
+# Configuration
+python-dotenv==1.0.1
+
+# Telegram alerts & commands
+pyTelegramBotAPI==4.14.0
