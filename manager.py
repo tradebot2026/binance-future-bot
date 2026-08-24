@@ -1,12 +1,12 @@
 """
 Trade management module.
-Monitors open positions with metadata-driven partial exits (25/25/50),
-break-even, optional virtual trailing stop, and exchange reconciliation.
+Monitors open positions with metadata-driven partial exits (33/33/34),
+dynamic break-even and TP-trailing stop loss, and exchange reconciliation.
 """
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any, Optional, TYPE_CHECKING
 
 from config import Config
@@ -20,7 +20,7 @@ from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from exceptions import OrderExecutionError
 from logger import error_logger, trade_logger
-from utils import round_step_size, safe_float
+from utils import round_step_size, safe_float, utc_now, utc_today_str
 
 if TYPE_CHECKING:
     from telegram_bot import TelegramManager
@@ -48,7 +48,7 @@ class TradeManager:
         self.risk_manager = risk_manager
 
     def monitor_open_trades(self) -> None:
-        """Evaluate all active trades against live prices."""
+        """Evaluate all active DB trades against live prices and exchange state."""
         try:
             active_trades = self.db.get_open_trades()
             if not active_trades:
@@ -56,67 +56,100 @@ class TradeManager:
 
             for trade in active_trades:
                 symbol = trade["symbol"]
+                position_side = trade.get("side", "LONG")
+
+                live_qty = self.exchange.get_position_quantity(symbol, position_side)
+                if live_qty <= 0:
+                    self._mark_trade_closed(
+                        trade,
+                        reason="RECONCILED_EXTERNAL_CLOSE",
+                        exit_price=safe_float(self.exchange.get_market_price(symbol)),
+                    )
+                    continue
+
                 price = self.exchange.get_market_price(symbol)
                 if price is None or price <= 0:
                     continue
 
-                side = trade.get("side", "LONG")
-                if side == "LONG":
+                fresh = self.db.get_trade(trade["trade_id"])
+                if fresh:
+                    trade = fresh
+
+                if position_side == "LONG":
                     self._manage_long_trade(trade, price)
-                elif side == "SHORT":
+                elif position_side == "SHORT":
                     self._manage_short_trade(trade, price)
         except Exception as exc:
             error_logger.error("Trade monitoring failed: %s", exc)
 
     def _manage_long_trade(self, trade: dict[str, Any], current_price: float) -> None:
-        if Config.ENABLE_TRAILING_STOP:
-            self._apply_trailing_stop(trade, current_price, is_long=True)
+        metadata = self.db.parse_trade_metadata(trade)
 
         stop_loss = safe_float(trade.get("stop_loss"))
         if current_price <= stop_loss:
-            self._close_position(trade, quantity=self._remaining_close_quantity(trade), reason="STOP_LOSS")
+            self._close_position(
+                trade,
+                quantity=self._remaining_close_quantity(trade),
+                reason="STOP_LOSS",
+            )
             return
+
+        if Config.ENABLE_TRAILING_STOP and metadata.get("trailing_active"):
+            self._apply_trailing_stop(trade, current_price, is_long=True)
+            trade = self.db.get_trade(trade["trade_id"]) or trade
 
         status = trade.get("status", TRADE_STATUS_OPEN)
         tp1 = safe_float(trade.get("take_profit_1"))
         tp2 = safe_float(trade.get("take_profit_2"))
         tp3 = safe_float(trade.get("take_profit_3"))
 
-        if status == TRADE_STATUS_OPEN and current_price >= tp1:
+        if status == TRADE_STATUS_OPEN and current_price >= tp1 and not metadata.get("tp1_executed"):
             self._handle_take_profit(trade, level="TP1", reason="TP1")
             return
 
-        if status == TRADE_STATUS_TP1_HIT and current_price >= tp2:
+        metadata = self.db.parse_trade_metadata(trade)
+        if status == TRADE_STATUS_TP1_HIT and current_price >= tp2 and not metadata.get("tp2_executed"):
             self._handle_take_profit(trade, level="TP2", reason="TP2")
             return
 
-        if status == TRADE_STATUS_TP2_HIT and current_price >= tp3:
+        metadata = self.db.parse_trade_metadata(trade)
+        if status == TRADE_STATUS_TP2_HIT and current_price >= tp3 and not metadata.get("tp3_executed"):
             self._handle_take_profit(trade, level="TP3", reason="TP3_FULL_CLOSE")
             return
 
     def _manage_short_trade(self, trade: dict[str, Any], current_price: float) -> None:
-        if Config.ENABLE_TRAILING_STOP:
-            self._apply_trailing_stop(trade, current_price, is_long=False)
+        metadata = self.db.parse_trade_metadata(trade)
 
         stop_loss = safe_float(trade.get("stop_loss"))
         if current_price >= stop_loss:
-            self._close_position(trade, quantity=self._remaining_close_quantity(trade), reason="STOP_LOSS")
+            self._close_position(
+                trade,
+                quantity=self._remaining_close_quantity(trade),
+                reason="STOP_LOSS",
+            )
             return
+
+        if Config.ENABLE_TRAILING_STOP and metadata.get("trailing_active"):
+            self._apply_trailing_stop(trade, current_price, is_long=False)
+            trade = self.db.get_trade(trade["trade_id"]) or trade
 
         status = trade.get("status", TRADE_STATUS_OPEN)
         tp1 = safe_float(trade.get("take_profit_1"))
         tp2 = safe_float(trade.get("take_profit_2"))
         tp3 = safe_float(trade.get("take_profit_3"))
 
-        if status == TRADE_STATUS_OPEN and current_price <= tp1:
+        metadata = self.db.parse_trade_metadata(trade)
+        if status == TRADE_STATUS_OPEN and current_price <= tp1 and not metadata.get("tp1_executed"):
             self._handle_take_profit(trade, level="TP1", reason="TP1")
             return
 
-        if status == TRADE_STATUS_TP1_HIT and current_price <= tp2:
+        metadata = self.db.parse_trade_metadata(trade)
+        if status == TRADE_STATUS_TP1_HIT and current_price <= tp2 and not metadata.get("tp2_executed"):
             self._handle_take_profit(trade, level="TP2", reason="TP2")
             return
 
-        if status == TRADE_STATUS_TP2_HIT and current_price <= tp3:
+        metadata = self.db.parse_trade_metadata(trade)
+        if status == TRADE_STATUS_TP2_HIT and current_price <= tp3 and not metadata.get("tp3_executed"):
             self._handle_take_profit(trade, level="TP3", reason="TP3_FULL_CLOSE")
             return
 
@@ -127,6 +160,10 @@ class TradeManager:
         reason: str,
     ) -> None:
         metadata = self.db.parse_trade_metadata(trade)
+        executed_key = f"{level.lower()}_executed"
+
+        if metadata.get(executed_key):
+            return
 
         if not Config.ENABLE_PARTIAL_TP:
             quantity = self._remaining_close_quantity(trade)
@@ -134,11 +171,6 @@ class TradeManager:
             return
 
         quantity_key = f"{level.lower()}_quantity"
-        executed_key = f"{level.lower()}_executed"
-
-        if metadata.get(executed_key):
-            return
-
         close_qty = safe_float(metadata.get(quantity_key))
         if close_qty <= 0:
             close_qty = self._remaining_close_quantity(trade)
@@ -146,28 +178,52 @@ class TradeManager:
         if level == "TP3":
             close_qty = self._remaining_close_quantity(trade)
 
+        # Lock the TP level immediately to prevent repeated partial closes.
+        metadata[executed_key] = True
+        self.db.update_trade(trade["trade_id"], {"metadata": metadata})
+        trade["metadata"] = metadata
+
         if not self._close_position(trade, quantity=close_qty, reason=reason, partial=True):
+            metadata[executed_key] = False
+            self.db.update_trade(trade["trade_id"], {"metadata": metadata})
             return
 
-        metadata[executed_key] = True
         updates: dict[str, Any] = {"metadata": metadata}
+        new_sl: Optional[float] = None
 
         if level == "TP1":
             updates["status"] = TRADE_STATUS_TP1_HIT
             if Config.ENABLE_BREAK_EVEN:
-                updates["stop_loss"] = safe_float(trade.get("entry_price"))
+                new_sl = safe_float(trade.get("entry_price"))
+                updates["stop_loss"] = new_sl
                 trade_logger.info(
-                    "[%s] Stop loss moved to break-even (%.6f).",
+                    "[%s] TP1 hit — stop loss moved to break-even (%.6f).",
                     trade["symbol"],
-                    updates["stop_loss"],
+                    new_sl,
                 )
         elif level == "TP2":
             updates["status"] = TRADE_STATUS_TP2_HIT
+            new_sl = safe_float(trade.get("take_profit_1"))
+            if new_sl > 0:
+                updates["stop_loss"] = new_sl
+                trade_logger.info(
+                    "[%s] TP2 hit — stop loss moved to TP1 (%.6f).",
+                    trade["symbol"],
+                    new_sl,
+                )
         elif level == "TP3":
             updates["status"] = TRADE_STATUS_CLOSED
 
         self.db.update_trade(trade["trade_id"], updates)
         trade.update(updates)
+
+        if self.telegram:
+            self.telegram.send_tp_level_alert(
+                symbol=trade["symbol"],
+                level=level,
+                reason=reason,
+                new_sl=new_sl,
+            )
 
     def _apply_trailing_stop(
         self,
@@ -184,6 +240,7 @@ class TradeManager:
         current_sl = safe_float(trade.get("stop_loss"))
         best_price = safe_float(metadata.get("best_price"), entry)
         trail_distance = atr * self.TRAILING_ATR_MULTIPLIER
+        rules = self.exchange.get_symbol_rules(trade["symbol"])
 
         updated = False
         if is_long:
@@ -195,8 +252,8 @@ class TradeManager:
                 metadata["trailing_active"] = True
                 candidate_sl = round_step_size(
                     best_price - trail_distance,
-                    self.exchange.get_symbol_rules(trade["symbol"]).tick_size,
-                    self.exchange.get_symbol_rules(trade["symbol"]).price_precision,
+                    rules.tick_size,
+                    rules.price_precision,
                 )
                 if candidate_sl > current_sl:
                     self.db.update_trade(
@@ -212,7 +269,6 @@ class TradeManager:
                 updated = True
             if current_price < entry:
                 metadata["trailing_active"] = True
-                rules = self.exchange.get_symbol_rules(trade["symbol"])
                 candidate_sl = round_step_size(
                     best_price + trail_distance,
                     rules.tick_size,
@@ -310,8 +366,7 @@ class TradeManager:
         self.db.update_trade(trade_id, {"pnl": cumulative_pnl})
         trade["pnl"] = cumulative_pnl
 
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        self.db.add_daily_realized_pnl(today, realized)
+        self.db.add_daily_realized_pnl(utc_today_str(), realized)
 
         trade_logger.info(
             "[%s] Closed qty=%s | reason=%s | pnl=%.4f",
@@ -326,8 +381,7 @@ class TradeManager:
 
         if is_full_close:
             self._mark_trade_closed(trade, reason=reason, exit_price=exit_price)
-
-        if self.telegram:
+        elif self.telegram and "STOP" in reason.upper():
             self.telegram.send_close_alert(symbol=symbol, reason=reason, pnl=realized)
 
         return True
@@ -351,14 +405,16 @@ class TradeManager:
     ) -> None:
         trade_id = trade["trade_id"]
         symbol = trade["symbol"]
-        closed_at = datetime.now(UTC).isoformat()
+        closed_at = utc_now().isoformat()
 
         opened_at_raw = trade.get("opened_at")
         duration: Optional[int] = None
         if opened_at_raw:
             try:
                 opened_at = datetime.fromisoformat(str(opened_at_raw))
-                duration = int((datetime.now(UTC) - opened_at.astimezone(UTC)).total_seconds())
+                if opened_at.tzinfo is None:
+                    opened_at = opened_at.replace(tzinfo=timezone.utc)
+                duration = int((utc_now() - opened_at).total_seconds())
             except ValueError:
                 duration = None
 
@@ -372,10 +428,9 @@ class TradeManager:
             },
         )
 
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
         balance = self.exchange.get_futures_balance(force_refresh=True)
         self.db.record_closed_trade(
-            date_str=today,
+            date_str=utc_today_str(),
             current_balance=balance,
         )
 
@@ -386,6 +441,13 @@ class TradeManager:
             reason,
             safe_float(trade.get("pnl")),
         )
+
+        if self.telegram:
+            self.telegram.send_close_alert(
+                symbol=symbol,
+                reason=reason,
+                pnl=safe_float(trade.get("pnl")),
+            )
 
         if self.scheduler:
             self.scheduler.notify_trade_event()

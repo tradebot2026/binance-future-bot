@@ -19,9 +19,9 @@ DAILY_STATUS_ACTIVE: Final[str] = "ACTIVE"
 DAILY_STATUS_PAUSED: Final[str] = "PAUSED"
 
 # ---------------- Partial take-profit ratios (original position) ----------------
-TP1_PORTION: Final[float] = 0.25
-TP2_PORTION: Final[float] = 0.25
-TP3_PORTION: Final[float] = 0.50
+TP1_PORTION: Final[float] = 0.33
+TP2_PORTION: Final[float] = 0.33
+TP3_PORTION: Final[float] = 0.34
 
 # ---------------- Database column whitelist ----------------
 ALLOWED_TRADE_COLUMNS: Final[Set[str]] = {

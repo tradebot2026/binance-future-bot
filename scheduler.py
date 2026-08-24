@@ -1,13 +1,12 @@
 """
 Daily scheduler module.
-Handles UTC day rollover, PnL-based daily profit/loss circuit breakers, and cached checks.
+Handles UTC day rollover and realized-PnL-based daily profit/loss circuit breakers.
 Pause state blocks new entries only — open-position monitoring continues in main.py.
 """
 
 from __future__ import annotations
 
 import time
-from datetime import UTC, datetime
 from typing import Optional, TYPE_CHECKING
 
 from config import Config
@@ -16,7 +15,7 @@ from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from logger import performance_logger, system_logger, trade_logger
 from risk_manager import compute_daily_pnl_metrics
-from utils import safe_float
+from utils import safe_float, utc_today_str
 
 if TYPE_CHECKING:
     from telegram_bot import TelegramManager
@@ -24,8 +23,8 @@ if TYPE_CHECKING:
 
 class DailyScheduler:
     """
-    Tracks daily PnL (realized + unrealized) against configured targets.
-    Uses the exchange balance cache to avoid REST calls every loop iteration.
+    Tracks daily realized PnL against configured targets.
+    Unrealized/floating PnL is never used for pause decisions.
     """
 
     def __init__(
@@ -37,7 +36,7 @@ class DailyScheduler:
         self.exchange = exchange
         self.db = db
         self.telegram = telegram
-        self.today_str = datetime.now(UTC).strftime("%Y-%m-%d")
+        self.today_str = utc_today_str()
         self._last_limit_check_at = 0.0
         self._limit_check_interval = float(Config.BALANCE_CACHE_TTL_SECONDS)
 
@@ -53,7 +52,7 @@ class DailyScheduler:
         return self.check_daily_limits()
 
     def check_daily_limits(self) -> tuple[bool, str]:
-        """Evaluate day rollover and PnL-based daily profit/loss thresholds."""
+        """Evaluate day rollover and realized-PnL daily profit/loss thresholds."""
         self._handle_day_rollover()
 
         stats = self.db.get_daily_stats(self.today_str)
@@ -82,27 +81,26 @@ class DailyScheduler:
         current_balance = self._get_balance(force_refresh=False)
         self.db.update_daily_balance(self.today_str, current_balance, DAILY_STATUS_ACTIVE)
 
-        if metrics.pnl_percent >= Config.DAILY_TARGET_PERCENT:
+        if metrics.realized_pnl_percent >= Config.DAILY_TARGET_PERCENT:
             reason = (
-                f"Daily profit target reached (+{metrics.pnl_percent:.2f}%). "
+                f"Daily profit target reached (+{metrics.realized_pnl_percent:.2f}% realized). "
                 f"Target={Config.DAILY_TARGET_PERCENT:.2f}%."
             )
             self._pause_entries(current_balance, reason, metrics)
             return True, reason
 
-        if metrics.pnl_percent <= -Config.DAILY_STOP_PERCENT:
+        if metrics.realized_pnl_percent <= -Config.DAILY_STOP_PERCENT:
             reason = (
-                f"Daily max loss reached ({metrics.pnl_percent:.2f}%). "
+                f"Daily max loss reached ({metrics.realized_pnl_percent:.2f}% realized). "
                 f"Limit=-{Config.DAILY_STOP_PERCENT:.2f}%."
             )
             self._pause_entries(current_balance, reason, metrics)
             return True, reason
 
         performance_logger.info(
-            "Daily PnL $%.2f (%.2f%%) | realized=$%.2f | unrealized=$%.2f | ref=$%.2f",
-            metrics.total_pnl,
-            metrics.pnl_percent,
+            "Daily realized PnL $%.2f (%.2f%%) | unrealized=$%.2f | ref=$%.2f",
             metrics.realized_pnl,
+            metrics.realized_pnl_percent,
             metrics.unrealized_pnl,
             metrics.start_balance,
         )
@@ -125,14 +123,15 @@ class DailyScheduler:
         metrics = compute_daily_pnl_metrics(self.exchange, self.db, self.today_str)
         enriched = dict(stats)
         enriched["computed_total_pnl"] = metrics.total_pnl
-        enriched["computed_pnl_percent"] = metrics.pnl_percent
+        enriched["computed_pnl_percent"] = metrics.total_pnl_percent
+        enriched["computed_realized_pnl_percent"] = metrics.realized_pnl_percent
         enriched["unrealized_pnl"] = metrics.unrealized_pnl
         return enriched
 
     # ---------------- Internal helpers ----------------
 
     def _handle_day_rollover(self) -> None:
-        current_day = datetime.now(UTC).strftime("%Y-%m-%d")
+        current_day = utc_today_str()
         if current_day == self.today_str:
             return
 
@@ -179,8 +178,8 @@ class DailyScheduler:
             pnl_line = ""
             if metrics is not None:
                 pnl_line = (
-                    f"\n📈 <b>Total PnL:</b> ${safe_float(getattr(metrics, 'total_pnl', 0)):.2f} "
-                    f"({safe_float(getattr(metrics, 'pnl_percent', 0)):.2f}%)"
+                    f"\n📈 <b>Realized PnL:</b> ${safe_float(getattr(metrics, 'realized_pnl', 0)):.2f} "
+                    f"({safe_float(getattr(metrics, 'realized_pnl_percent', 0)):.2f}%)"
                 )
             self.telegram.send_message(
                 "⏸ <b>Entries paused</b>\n"

@@ -10,7 +10,6 @@ import json
 import os
 import time
 import uuid
-from datetime import UTC, datetime
 from typing import Any, Optional
 
 from config import Config
@@ -19,7 +18,7 @@ from database import DatabaseManager
 from exchange import BinanceExchangeManager, SymbolRules
 from exceptions import OrderExecutionError
 from logger import error_logger, trade_logger
-from utils import round_step_size, safe_float
+from utils import round_step_size, safe_float, utc_now
 
 
 class TradeExecutor:
@@ -108,7 +107,7 @@ class TradeExecutor:
     def _build_partial_quantities(
         self, total_quantity: float, rules: SymbolRules
     ) -> dict[str, float]:
-        """Partition entry quantity into fixed 25% / 25% / 50% absolute amounts."""
+        """Partition entry quantity into fixed 33% / 33% / 34% absolute amounts."""
         tp1_qty = round_step_size(
             total_quantity * TP1_PORTION, rules.step_size, rules.quantity_precision
         )
@@ -246,7 +245,7 @@ class TradeExecutor:
         metadata["best_price"] = fill_price
 
         trade_id = str(uuid.uuid4())
-        opened_at = datetime.now(UTC).isoformat()
+        opened_at = utc_now().isoformat()
         exchange_order_id = str(response.get("orderId", ""))
         margin_estimate = (quantity * fill_price) / max(leverage, 1)
 

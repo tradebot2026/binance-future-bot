@@ -9,7 +9,7 @@ import json
 import sqlite3
 import threading
 from contextlib import contextmanager
-from datetime import UTC, datetime, timedelta
+from datetime import timedelta
 from typing import Any, Generator, List, Optional
 
 import pandas as pd
@@ -23,6 +23,7 @@ from constants import (
 )
 from exceptions import DatabaseError
 from logger import error_logger, system_logger
+from utils import utc_now
 
 
 class DatabaseManager:
@@ -398,7 +399,7 @@ class DatabaseManager:
     def add_to_blacklist(
         self, symbol: str, reason: str, duration_hours: Optional[int] = None
     ) -> None:
-        now = datetime.now(UTC)
+        now = utc_now()
         expires_at = (
             (now + timedelta(hours=duration_hours)).isoformat()
             if duration_hours
@@ -419,7 +420,7 @@ class DatabaseManager:
                 error_logger.error("Failed to blacklist %s: %s", symbol, exc)
 
     def cleanup_expired_blacklist(self) -> None:
-        now_str = datetime.now(UTC).isoformat()
+        now_str = utc_now().isoformat()
         with self._write_lock:
             try:
                 with self.connection() as conn:
@@ -440,7 +441,7 @@ class DatabaseManager:
                     WHERE symbol = ?
                       AND (expires_at IS NULL OR expires_at >= ?)
                     """,
-                    (symbol, datetime.now(UTC).isoformat()),
+                    (symbol, utc_now().isoformat()),
                 ).fetchone()
                 return row is not None
         except sqlite3.Error as exc:
@@ -459,7 +460,7 @@ class DatabaseManager:
     # ---------------- Watchlist ----------------
 
     def update_watchlist(self, candidates: List[dict[str, Any]]) -> None:
-        now = datetime.now(UTC).isoformat()
+        now = utc_now().isoformat()
         with self._write_lock:
             try:
                 with self.connection() as conn:
@@ -496,7 +497,7 @@ class DatabaseManager:
     # ---------------- Signals ----------------
 
     def log_signal(self, signal_data: dict[str, Any]) -> None:
-        now = datetime.now(UTC).isoformat()
+        now = utc_now().isoformat()
         with self._write_lock:
             try:
                 with self.connection() as conn:

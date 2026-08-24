@@ -7,12 +7,12 @@ Uses public DatabaseManager APIs only.
 from __future__ import annotations
 
 import os
-from datetime import UTC, datetime
 from typing import Any, Optional
 
 import pandas as pd
 
 from config import Config
+from utils import utc_now
 from database import DatabaseManager
 from logger import error_logger, performance_logger, system_logger
 
@@ -33,7 +33,7 @@ class ReportGenerator:
                 system_logger.info("No trades available to export.")
                 return ""
 
-            filename = f"trade_history_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.csv"
+            filename = f"trade_history_{utc_now().strftime('%Y%m%d_%H%M%S')}.csv"
             filepath = os.path.join(self.reports_dir, filename)
             df.to_csv(filepath, index=False)
             system_logger.info("Trade history exported: %s", filepath)
@@ -50,7 +50,7 @@ class ReportGenerator:
                 system_logger.info("No daily stats available to export.")
                 return ""
 
-            filename = f"daily_performance_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.csv"
+            filename = f"daily_performance_{utc_now().strftime('%Y%m%d_%H%M%S')}.csv"
             filepath = os.path.join(self.reports_dir, filename)
             df.to_csv(filepath, index=False)
             system_logger.info("Daily stats exported: %s", filepath)
@@ -74,7 +74,7 @@ class ReportGenerator:
             metrics = self._calculate_performance_metrics(closed)
             summary_df = pd.DataFrame([metrics])
 
-            filename = f"performance_summary_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.csv"
+            filename = f"performance_summary_{utc_now().strftime('%Y%m%d_%H%M%S')}.csv"
             filepath = os.path.join(self.reports_dir, filename)
             summary_df.to_csv(filepath, index=False)
 
@@ -144,7 +144,7 @@ class ReportGenerator:
             if period.empty:
                 return ""
 
-            filename = f"{prefix}_trades_{datetime.now(UTC).strftime('%Y%m%d_%H%M%S')}.csv"
+            filename = f"{prefix}_trades_{utc_now().strftime('%Y%m%d_%H%M%S')}.csv"
             filepath = os.path.join(self.reports_dir, filename)
             period.drop(columns=["closed_at_dt"], errors="ignore").to_csv(filepath, index=False)
             system_logger.info("%s report exported: %s", prefix.capitalize(), filepath)
@@ -180,7 +180,7 @@ class ReportGenerator:
         max_drawdown = float(drawdown.max()) if not drawdown.empty else 0.0
 
         return {
-            "generated_at_utc": datetime.now(UTC).isoformat(),
+            "generated_at_utc": utc_now().isoformat(),
             "total_trades": total,
             "wins": win_count,
             "losses": loss_count,

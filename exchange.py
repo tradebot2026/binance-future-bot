@@ -434,6 +434,14 @@ class BinanceExchangeManager:
 
     # ---------------- Positions ----------------
 
+    def fetch_open_positions(self) -> list[dict[str, Any]]:
+        """Alias for get_all_open_positions — live exchange state."""
+        return self.get_all_open_positions()
+
+    def get_open_positions_count(self) -> int:
+        """Count non-zero hedge-mode positions on the exchange."""
+        return len(self.fetch_open_positions())
+
     def get_all_open_positions(self) -> list[dict[str, Any]]:
         """Return all non-zero hedge-mode positions from the exchange."""
         try:

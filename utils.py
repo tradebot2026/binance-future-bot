@@ -4,9 +4,20 @@ from __future__ import annotations
 
 import html
 import math
+from datetime import datetime, timezone
 from typing import Union
 
 Number = Union[int, float]
+
+
+def utc_now() -> datetime:
+    """Return the current UTC-aware datetime."""
+    return datetime.now(timezone.utc)
+
+
+def utc_today_str() -> str:
+    """Return today's date string in UTC (YYYY-MM-DD)."""
+    return utc_now().strftime("%Y-%m-%d")
 
 
 def round_step_size(value: float, step_size: float, precision: int) -> float:

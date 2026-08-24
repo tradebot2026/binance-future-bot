@@ -1,13 +1,12 @@
 """
 Portfolio risk manager module.
 Pre-trade gates for max positions, daily entry count, consecutive losses,
-and PnL-based drawdown. Works alongside DailyScheduler (daily PnL pause).
+and realized-PnL-based drawdown. Works alongside DailyScheduler (daily pause).
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
 from typing import Optional
 
 from config import Config
@@ -15,18 +14,19 @@ from constants import DAILY_STATUS_PAUSED, TRADE_STATUS_CLOSED
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from logger import performance_logger, trade_logger
-from utils import safe_float
+from utils import safe_float, utc_today_str
 
 
 @dataclass
 class DailyPnLMetrics:
-    """Daily performance based on realized + unrealized PnL, not wallet balance."""
+    """Daily performance metrics — target decisions use realized PnL only."""
 
     start_balance: float
     realized_pnl: float
     unrealized_pnl: float
     total_pnl: float
-    pnl_percent: float
+    realized_pnl_percent: float
+    total_pnl_percent: float
 
 
 @dataclass
@@ -34,13 +34,14 @@ class RiskSnapshot:
     """Point-in-time portfolio risk metrics."""
 
     open_positions: int
+    exchange_open_positions: int
     daily_entries: int
     daily_trades: int
     consecutive_losses: int
     drawdown_percent: float
     current_balance: float
-    daily_pnl: float
-    daily_pnl_percent: float
+    daily_realized_pnl: float
+    daily_realized_pnl_percent: float
     unrealized_pnl: float
     entries_allowed: bool
     block_reason: str
@@ -52,8 +53,8 @@ def compute_daily_pnl_metrics(
     date_str: str,
 ) -> DailyPnLMetrics:
     """
-    Compute today's PnL from realized closes/partials plus open-position unrealized PnL.
-    Margin allocation for new entries does not affect this metric.
+    Compute today's PnL metrics.
+    Daily profit/loss circuit breakers must use realized_pnl_percent only.
     """
     stats = db.get_daily_stats(date_str) or {}
     start_balance = safe_float(stats.get("start_balance"))
@@ -62,16 +63,19 @@ def compute_daily_pnl_metrics(
     total_pnl = realized_pnl + unrealized_pnl
 
     if start_balance > 0:
-        pnl_percent = (total_pnl / start_balance) * 100.0
+        realized_pnl_percent = (realized_pnl / start_balance) * 100.0
+        total_pnl_percent = (total_pnl / start_balance) * 100.0
     else:
-        pnl_percent = 0.0
+        realized_pnl_percent = 0.0
+        total_pnl_percent = 0.0
 
     return DailyPnLMetrics(
         start_balance=start_balance,
         realized_pnl=realized_pnl,
         unrealized_pnl=unrealized_pnl,
         total_pnl=total_pnl,
-        pnl_percent=pnl_percent,
+        realized_pnl_percent=realized_pnl_percent,
+        total_pnl_percent=total_pnl_percent,
     )
 
 
@@ -81,13 +85,17 @@ class RiskManager:
     def __init__(self, exchange: BinanceExchangeManager, db: DatabaseManager) -> None:
         self.exchange = exchange
         self.db = db
-        self._peak_daily_pnl = 0.0
+        self._peak_realized_pnl = 0.0
         self._reference_balance = 0.0
         balance = self.exchange.get_futures_balance(force_refresh=True)
         if balance > 0:
             self._reference_balance = balance
 
     # ---------------- Public API ----------------
+
+    def get_exchange_open_positions_count(self) -> int:
+        """Return live open position count from Binance (source of truth)."""
+        return self.exchange.get_open_positions_count()
 
     def can_open_trade(self, symbol: Optional[str] = None) -> tuple[bool, str]:
         """
@@ -98,14 +106,20 @@ class RiskManager:
         if not snapshot.entries_allowed:
             return False, snapshot.block_reason
 
-        if symbol and self._has_active_trade_for_symbol(symbol):
-            return False, f"Active trade already tracked for {symbol}."
+        if symbol:
+            if self._has_active_trade_for_symbol(symbol):
+                return False, f"Active trade already tracked for {symbol}."
+            for side in ("LONG", "SHORT"):
+                if self.exchange.has_open_position(symbol, side):
+                    return False, (
+                        f"Exchange position already open for {symbol} {side}."
+                    )
 
         return True, ""
 
     def is_daily_pnl_limit_reached(self) -> tuple[bool, str]:
-        """Return whether daily profit target or max loss has been hit (PnL-based)."""
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        """Return whether daily profit target or max loss has been hit (realized PnL)."""
+        today = utc_today_str()
         stats = self.db.get_daily_stats(today) or {}
         if stats.get("status") == DAILY_STATUS_PAUSED:
             return True, "Daily limit already reached — entries paused for today."
@@ -114,16 +128,16 @@ class RiskManager:
         if metrics.start_balance <= 0:
             return False, ""
 
-        if metrics.pnl_percent >= Config.DAILY_TARGET_PERCENT:
+        if metrics.realized_pnl_percent >= Config.DAILY_TARGET_PERCENT:
             reason = (
-                f"Daily profit target reached (+{metrics.pnl_percent:.2f}%). "
+                f"Daily profit target reached (+{metrics.realized_pnl_percent:.2f}%). "
                 f"Target={Config.DAILY_TARGET_PERCENT:.2f}%."
             )
             return True, reason
 
-        if metrics.pnl_percent <= -Config.DAILY_STOP_PERCENT:
+        if metrics.realized_pnl_percent <= -Config.DAILY_STOP_PERCENT:
             reason = (
-                f"Daily max loss reached ({metrics.pnl_percent:.2f}%). "
+                f"Daily max loss reached ({metrics.realized_pnl_percent:.2f}%). "
                 f"Limit=-{Config.DAILY_STOP_PERCENT:.2f}%."
             )
             return True, reason
@@ -132,13 +146,16 @@ class RiskManager:
 
     def get_daily_pnl_metrics(self, date_str: Optional[str] = None) -> DailyPnLMetrics:
         if date_str is None:
-            date_str = datetime.now(UTC).strftime("%Y-%m-%d")
+            date_str = utc_today_str()
         return compute_daily_pnl_metrics(self.exchange, self.db, date_str)
 
     def get_risk_snapshot(self) -> RiskSnapshot:
         """Compute current risk metrics and whether entries are allowed."""
-        open_positions = self.db.get_active_trades_count()
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        exchange_open = self.get_exchange_open_positions_count()
+        db_open = self.db.get_active_trades_count()
+        open_positions = max(exchange_open, db_open)
+
+        today = utc_today_str()
         daily_stats = self.db.get_daily_stats(today) or {}
 
         daily_entries = int(daily_stats.get("entries_count", 0) or 0)
@@ -146,11 +163,11 @@ class RiskManager:
         consecutive_losses = self._count_consecutive_losses(Config.MAX_CONSECUTIVE_LOSSES)
 
         pnl_metrics = compute_daily_pnl_metrics(self.exchange, self.db, today)
-        if pnl_metrics.total_pnl > self._peak_daily_pnl:
-            self._peak_daily_pnl = pnl_metrics.total_pnl
+        if pnl_metrics.realized_pnl > self._peak_realized_pnl:
+            self._peak_realized_pnl = pnl_metrics.realized_pnl
 
-        drawdown = self._calculate_pnl_drawdown_percent(
-            current_pnl=pnl_metrics.total_pnl,
+        drawdown = self._calculate_realized_drawdown_percent(
+            current_realized=pnl_metrics.realized_pnl,
             reference_balance=pnl_metrics.start_balance or self._reference_balance,
         )
 
@@ -159,9 +176,10 @@ class RiskManager:
 
         if daily_stats.get("status") == DAILY_STATUS_PAUSED:
             block_reason = "Daily PnL limit reached — entries paused for today."
-        elif open_positions >= Config.MAX_POSITIONS:
+        elif exchange_open >= Config.MAX_POSITIONS:
             block_reason = (
-                f"Max open positions reached ({open_positions}/{Config.MAX_POSITIONS})."
+                f"Max open positions reached on exchange "
+                f"({exchange_open}/{Config.MAX_POSITIONS})."
             )
         elif daily_entries >= Config.MAX_DAILY_TRADES:
             block_reason = (
@@ -174,16 +192,16 @@ class RiskManager:
             )
         elif drawdown >= Config.MAX_ACCOUNT_DRAWDOWN:
             block_reason = (
-                f"PnL drawdown limit reached ({drawdown:.2f}% >= "
+                f"Realized PnL drawdown limit reached ({drawdown:.2f}% >= "
                 f"{Config.MAX_ACCOUNT_DRAWDOWN:.2f}%)."
             )
-        elif pnl_metrics.pnl_percent >= Config.DAILY_TARGET_PERCENT:
+        elif pnl_metrics.realized_pnl_percent >= Config.DAILY_TARGET_PERCENT:
             block_reason = (
-                f"Daily profit target reached (+{pnl_metrics.pnl_percent:.2f}%)."
+                f"Daily profit target reached (+{pnl_metrics.realized_pnl_percent:.2f}%)."
             )
-        elif pnl_metrics.pnl_percent <= -Config.DAILY_STOP_PERCENT:
+        elif pnl_metrics.realized_pnl_percent <= -Config.DAILY_STOP_PERCENT:
             block_reason = (
-                f"Daily max loss reached ({pnl_metrics.pnl_percent:.2f}%)."
+                f"Daily max loss reached ({pnl_metrics.realized_pnl_percent:.2f}%)."
             )
 
         entries_allowed = block_reason == ""
@@ -192,24 +210,25 @@ class RiskManager:
 
         return RiskSnapshot(
             open_positions=open_positions,
+            exchange_open_positions=exchange_open,
             daily_entries=daily_entries,
             daily_trades=daily_trades,
             consecutive_losses=consecutive_losses,
             drawdown_percent=drawdown,
             current_balance=current_balance,
-            daily_pnl=pnl_metrics.total_pnl,
-            daily_pnl_percent=pnl_metrics.pnl_percent,
+            daily_realized_pnl=pnl_metrics.realized_pnl,
+            daily_realized_pnl_percent=pnl_metrics.realized_pnl_percent,
             unrealized_pnl=pnl_metrics.unrealized_pnl,
             entries_allowed=entries_allowed,
             block_reason=block_reason,
         )
 
     def notify_trade_event(self) -> None:
-        """Refresh PnL peak tracking after entries, exits, or partial closes."""
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
+        """Refresh realized PnL peak tracking after entries, exits, or partial closes."""
+        today = utc_today_str()
         metrics = compute_daily_pnl_metrics(self.exchange, self.db, today)
-        if metrics.total_pnl > self._peak_daily_pnl:
-            self._peak_daily_pnl = metrics.total_pnl
+        if metrics.realized_pnl > self._peak_realized_pnl:
+            self._peak_realized_pnl = metrics.realized_pnl
 
         balance = self.exchange.get_futures_balance(force_refresh=True)
         if balance > 0 and self._reference_balance <= 0:
@@ -217,23 +236,22 @@ class RiskManager:
 
     def record_entry_opened(self) -> None:
         """Track a newly opened entry against the daily entry cap."""
-        today = datetime.now(UTC).strftime("%Y-%m-%d")
-        self.db.increment_daily_entries(today)
+        self.db.increment_daily_entries(utc_today_str())
 
     def log_snapshot(self) -> None:
         """Write a concise risk summary to the performance log."""
         snap = self.get_risk_snapshot()
         performance_logger.info(
-            "Risk | open=%s/%s | daily_entries=%s/%s | consec_losses=%s/%s | "
-            "daily_pnl=$%.2f (%.2f%%) | unrealized=$%.2f | drawdown=%.2f%%/%.2f%% | allowed=%s",
-            snap.open_positions,
+            "Risk | exchange_open=%s/%s | daily_entries=%s/%s | consec_losses=%s/%s | "
+            "realized_pnl=$%.2f (%.2f%%) | unrealized=$%.2f | drawdown=%.2f%%/%.2f%% | allowed=%s",
+            snap.exchange_open_positions,
             Config.MAX_POSITIONS,
             snap.daily_entries,
             Config.MAX_DAILY_TRADES,
             snap.consecutive_losses,
             Config.MAX_CONSECUTIVE_LOSSES,
-            snap.daily_pnl,
-            snap.daily_pnl_percent,
+            snap.daily_realized_pnl,
+            snap.daily_realized_pnl_percent,
             snap.unrealized_pnl,
             snap.drawdown_percent,
             Config.MAX_ACCOUNT_DRAWDOWN,
@@ -242,20 +260,17 @@ class RiskManager:
 
     # ---------------- Internal helpers ----------------
 
-    def _calculate_pnl_drawdown_percent(
+    def _calculate_realized_drawdown_percent(
         self,
-        current_pnl: float,
+        current_realized: float,
         reference_balance: float,
     ) -> float:
-        """
-        Drawdown from the session's peak total PnL, normalized by reference balance.
-        Uses PnL performance rather than raw wallet balance movement.
-        """
-        if reference_balance <= 0 or self._peak_daily_pnl <= 0:
+        """Drawdown from session peak realized PnL (closed trades only)."""
+        if reference_balance <= 0 or self._peak_realized_pnl <= 0:
             return 0.0
-        if current_pnl >= self._peak_daily_pnl:
+        if current_realized >= self._peak_realized_pnl:
             return 0.0
-        pnl_drop = self._peak_daily_pnl - current_pnl
+        pnl_drop = self._peak_realized_pnl - current_realized
         return (pnl_drop / reference_balance) * 100.0
 
     def _count_consecutive_losses(self, lookback: int) -> int:

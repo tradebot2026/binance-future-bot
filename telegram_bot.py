@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import threading
 import time
-from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Optional
 
 import telebot
@@ -15,7 +14,7 @@ import telebot
 from config import Config
 from database import DatabaseManager
 from logger import error_logger, system_logger
-from utils import escape_html, safe_float
+from utils import escape_html, safe_float, utc_today_str
 
 if TYPE_CHECKING:
     from exchange import BinanceExchangeManager
@@ -165,6 +164,25 @@ class TelegramManager:
             msg += f"\n💰 <b>Realized PnL:</b> ${pnl:.4f}"
         self.send_message(msg)
 
+    def send_tp_level_alert(
+        self,
+        symbol: str,
+        level: str,
+        reason: str,
+        new_sl: Optional[float] = None,
+        pnl: Optional[float] = None,
+    ) -> None:
+        msg = (
+            f"✅ <b>{escape_html(level)} HIT</b>\n\n"
+            f"🪙 <b>Pair:</b> {escape_html(symbol)}\n"
+            f"📌 <b>Action:</b> {escape_html(reason)}"
+        )
+        if new_sl is not None:
+            msg += f"\n🛑 <b>New SL:</b> {new_sl:.6f}"
+        if pnl is not None:
+            msg += f"\n💰 <b>Partial PnL:</b> ${pnl:.4f}"
+        self.send_message(msg)
+
     # ---------------- Command handlers ----------------
 
     def _register_handlers(self) -> None:
@@ -184,7 +202,7 @@ class TelegramManager:
         def status_handler(message: telebot.types.Message) -> None:
             if not self._authorized(message):
                 return
-            today = datetime.now(UTC).strftime("%Y-%m-%d")
+            today = utc_today_str()
             stats = (
                 self.scheduler.get_today_stats()
                 if self.scheduler
@@ -219,14 +237,15 @@ class TelegramManager:
             snap = self.risk_manager.get_risk_snapshot()
             msg = (
                 "🛡 <b>Risk Snapshot</b>\n\n"
-                f"📂 <b>Open positions:</b> {snap.open_positions}/{Config.MAX_POSITIONS}\n"
+                f"📂 <b>Exchange open:</b> {snap.exchange_open_positions}/{Config.MAX_POSITIONS}\n"
                 f"🆕 <b>Daily entries:</b> {snap.daily_entries}/{Config.MAX_DAILY_TRADES}\n"
                 f"✅ <b>Daily closes:</b> {snap.daily_trades}\n"
                 f"📉 <b>Consecutive losses:</b> {snap.consecutive_losses}/"
                 f"{Config.MAX_CONSECUTIVE_LOSSES}\n"
-                f"📈 <b>Daily PnL:</b> ${snap.daily_pnl:.2f} ({snap.daily_pnl_percent:.2f}%)\n"
+                f"📈 <b>Realized PnL:</b> ${snap.daily_realized_pnl:.2f} "
+                f"({snap.daily_realized_pnl_percent:.2f}%)\n"
                 f"📊 <b>Unrealized:</b> ${snap.unrealized_pnl:.2f}\n"
-                f"📉 <b>PnL drawdown:</b> {snap.drawdown_percent:.2f}% / "
+                f"📉 <b>Realized drawdown:</b> {snap.drawdown_percent:.2f}% / "
                 f"{Config.MAX_ACCOUNT_DRAWDOWN:.2f}%\n"
                 f"💵 <b>Balance:</b> ${snap.current_balance:.2f}\n"
                 f"✅ <b>Entries allowed:</b> {snap.entries_allowed}"

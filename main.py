@@ -7,6 +7,7 @@ Includes auto-restart on recoverable failures.
 
 from __future__ import annotations
 
+import threading
 import time
 import traceback
 from typing import Any, Optional
@@ -19,10 +20,10 @@ from executor import TradeExecutor
 from logger import error_logger, system_logger
 from manager import TradeManager
 from risk_manager import RiskManager
-from reconciliation import reconcile_positions_at_startup
+from reconciliation import reconcile_positions, reconcile_positions_at_startup
 from scheduler import DailyScheduler
 from telegram_bot import TelegramManager
-from utils import safe_float
+from utils import safe_float, utc_today_str
 
 try:
     from reporter import ReportGenerator
@@ -68,9 +69,7 @@ def _maybe_export_daily_report(reporter: Any, last_report_day: str) -> str:
     if not Config.ENABLE_DAILY_REPORT:
         return last_report_day
 
-    from datetime import UTC, datetime
-
-    today = datetime.now(UTC).strftime("%Y-%m-%d")
+    today = utc_today_str()
     if today == last_report_day:
         return last_report_day
 
@@ -123,10 +122,10 @@ def _entries_allowed(
     if is_paused:
         return False, pause_reason
 
-    if db.get_active_trades_count() >= Config.MAX_POSITIONS:
+    if risk.get_exchange_open_positions_count() >= Config.MAX_POSITIONS:
         return False, (
-            f"Max open positions reached ({db.get_active_trades_count()}/"
-            f"{Config.MAX_POSITIONS})."
+            f"Max open positions reached on exchange "
+            f"({risk.get_exchange_open_positions_count()}/{Config.MAX_POSITIONS})."
         )
 
     allowed, reason = risk.can_open_trade()
@@ -227,6 +226,30 @@ def _execute_candidates(
             continue
 
 
+def _start_position_monitor(
+    manager: TradeManager,
+    stop_event: threading.Event,
+) -> threading.Thread:
+    """Run position monitoring in a background thread every MONITOR_INTERVAL_SECONDS."""
+
+    def _monitor_loop() -> None:
+        while not stop_event.is_set():
+            try:
+                manager.monitor_open_trades()
+            except Exception as exc:
+                error_logger.error("Background monitor error: %s", exc)
+                error_logger.error(traceback.format_exc())
+            stop_event.wait(Config.MONITOR_INTERVAL_SECONDS)
+
+    thread = threading.Thread(target=_monitor_loop, name="position-monitor", daemon=True)
+    thread.start()
+    system_logger.info(
+        "Background position monitor started (interval=%ss).",
+        Config.MONITOR_INTERVAL_SECONDS,
+    )
+    return thread
+
+
 def _handle_loop_error(
     exc: Exception,
     consecutive_errors: int,
@@ -297,10 +320,14 @@ def main() -> None:
 
     reconcile_positions_at_startup(exchange, db, tg)
 
+    monitor_stop = threading.Event()
+    _start_position_monitor(manager, monitor_stop)
+
     system_logger.info("Initialization complete. Entering main trading loop.")
 
     last_heartbeat = time.monotonic()
     last_report_day = ""
+    last_reconciliation = time.monotonic()
     cycle = 0
     consecutive_errors = 0
 
@@ -309,12 +336,11 @@ def main() -> None:
         loop_started = time.monotonic()
 
         try:
-            # Step 1 — ALWAYS monitor open trades (even when entries paused)
-            try:
-                manager.monitor_open_trades()
-            except Exception as exc:
-                consecutive_errors = _handle_loop_error(exc, consecutive_errors, tg)
-                continue
+            # Step 1 — Periodic DB/exchange reconciliation (every 15 min)
+            now_mono = time.monotonic()
+            if now_mono - last_reconciliation >= Config.RECONCILIATION_INTERVAL_SECONDS:
+                reconcile_positions(exchange, db, tg, context="periodic")
+                last_reconciliation = now_mono
 
             # Step 2 — Scan and execute only when entries are allowed
             if scanner is None:
@@ -346,13 +372,13 @@ def main() -> None:
                 snap = risk.get_risk_snapshot()
                 is_paused, _ = scheduler.is_entry_paused()
                 system_logger.info(
-                    "Heartbeat | cycle=%s | open=%s | paused=%s | "
-                    "daily_pnl=$%.2f (%.2f%%) | unrealized=$%.2f | drawdown=%.2f%%",
+                    "Heartbeat | cycle=%s | exchange_open=%s | paused=%s | "
+                    "realized_pnl=$%.2f (%.2f%%) | unrealized=$%.2f | drawdown=%.2f%%",
                     cycle,
-                    snap.open_positions,
+                    snap.exchange_open_positions,
                     is_paused,
-                    snap.daily_pnl,
-                    snap.daily_pnl_percent,
+                    snap.daily_realized_pnl,
+                    snap.daily_realized_pnl_percent,
                     snap.unrealized_pnl,
                     snap.drawdown_percent,
                 )
