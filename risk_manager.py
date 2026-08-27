@@ -13,8 +13,8 @@ from config import Config
 from constants import DAILY_STATUS_PAUSED, TRADE_STATUS_CLOSED
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
-from logger import performance_logger, trade_logger
-from utils import safe_float, utc_today_str
+from logger import performance_logger, system_logger, trade_logger
+from utils import safe_float, utc_now, utc_today_str
 
 
 @dataclass
@@ -87,9 +87,26 @@ class RiskManager:
         self.db = db
         self._peak_realized_pnl = 0.0
         self._reference_balance = 0.0
+        # Only closed trades after this timestamp count toward consecutive-loss blocks.
+        self._consecutive_loss_reset_at = utc_now().isoformat()
         balance = self.exchange.get_futures_balance(force_refresh=True)
         if balance > 0:
             self._reference_balance = balance
+        system_logger.info(
+            "Risk manager initialized — consecutive loss streak reset (0/%s).",
+            Config.MAX_CONSECUTIVE_LOSSES,
+        )
+
+    def reset_consecutive_loss_block(self) -> None:
+        """
+        Clear the consecutive-loss entry gate.
+        Historical losses before this point no longer block new entries.
+        """
+        self._consecutive_loss_reset_at = utc_now().isoformat()
+        trade_logger.info(
+            "Consecutive loss block cleared — counter reset to 0/%s.",
+            Config.MAX_CONSECUTIVE_LOSSES,
+        )
 
     # ---------------- Public API ----------------
 
@@ -285,11 +302,17 @@ class RiskManager:
                 rows = conn.execute(
                     """
                     SELECT pnl FROM trades
-                    WHERE status = ? AND closed_at IS NOT NULL
+                    WHERE status = ?
+                      AND closed_at IS NOT NULL
+                      AND closed_at >= ?
                     ORDER BY closed_at DESC
                     LIMIT ?
                     """,
-                    (TRADE_STATUS_CLOSED, lookback),
+                    (
+                        TRADE_STATUS_CLOSED,
+                        self._consecutive_loss_reset_at,
+                        lookback,
+                    ),
                 ).fetchall()
         except Exception:
             return 0

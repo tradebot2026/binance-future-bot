@@ -426,15 +426,36 @@ class TelegramManager:
                 self.bot.reply_to(message, "Scheduler not attached.")
                 return
             self.scheduler.resume_entries_manual()
+            if self.risk_manager:
+                self.risk_manager.reset_consecutive_loss_block()
+
             paused, reason = self.scheduler.is_entry_paused()
+            if self.risk_manager:
+                snap = self.risk_manager.get_risk_snapshot()
+                consec_line = (
+                    f"\n📉 <b>Consecutive losses:</b> "
+                    f"{snap.consecutive_losses}/{Config.MAX_CONSECUTIVE_LOSSES}"
+                )
+                allowed_line = (
+                    f"\n✅ <b>Entries allowed:</b> {snap.entries_allowed}"
+                )
+            else:
+                consec_line = ""
+                allowed_line = ""
+
             if paused:
                 self.bot.reply_to(
                     message,
                     f"⚠️ Manual pause cleared, but entries still blocked:\n"
-                    f"{escape_html(reason)}",
+                    f"{escape_html(reason)}"
+                    f"{consec_line}{allowed_line}",
                 )
             else:
-                self.bot.reply_to(message, "▶️ <b>Entries resumed.</b> Scanning will continue.")
+                self.bot.reply_to(
+                    message,
+                    "▶️ <b>Entries resumed.</b> Scanning will continue."
+                    f"{consec_line}{allowed_line}",
+                )
 
         @self.bot.message_handler(commands=["closeall"])
         @authorized
