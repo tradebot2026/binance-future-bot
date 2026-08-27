@@ -47,8 +47,11 @@ class MarketAnalyzer:
         df["macd_signal"] = macd.macd_signal()
         df["macd_hist"] = macd.macd_diff()
 
-        df["atr"] = ta.trend.average_true_range(
-            df["high"], df["low"], df["close"], window=14
+        df["atr"] = ta.volatility.average_true_range(
+            high=df["high"],
+            low=df["low"],
+            close=df["close"],
+            window=14,
         )
         df["adx"] = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
         df["vol_sma"] = df["volume"].rolling(window=20).mean()
