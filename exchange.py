@@ -5,6 +5,7 @@ Thread-safe symbol rules cache, rate limiting, balance caching, and order execut
 
 from __future__ import annotations
 
+import random
 import threading
 import time
 from dataclasses import dataclass
@@ -75,7 +76,15 @@ class RateLimiter:
 
 
 class BinanceExchangeManager:
-    """Binance Futures integration with caching, retries, and thread-safe rule access."""
+    """
+    Binance Futures integration with caching, retries, and thread-safe rule access.
+
+    Strict rate-limit protection (equivalent to enableRateLimit=True in CCXT) is
+    enforced via MIN_REQUEST_INTERVAL_MS throttling plus exponential backoff with
+    jitter on HTTP 429/418 and Binance codes -1003/-1015.
+    """
+
+    RATE_LIMIT_CODES = frozenset({-1003, -1015, 429, 418})
 
     DEFAULT_RULES = SymbolRules(
         price_precision=2,
@@ -104,27 +113,49 @@ class BinanceExchangeManager:
         self._leverage_cache: dict[str, int] = {}
         self._rate_limiter = RateLimiter(Config.MIN_REQUEST_INTERVAL_MS)
         self._balance_cache = BalanceCache()
+        self._critical_alerts: Any = None
 
         self._configure_account()
         self.refresh_symbol_rules()
 
         mode = "TESTNET" if self.testnet else "MAINNET"
-        system_logger.info("Binance Futures exchange initialized (%s).", mode)
+        strict = "ON" if Config.ENABLE_STRICT_RATE_LIMIT else "OFF"
+        system_logger.info(
+            "Binance Futures exchange initialized (%s, strict_rate_limit=%s).",
+            mode,
+            strict,
+        )
+
+    def attach_critical_alerts(self, alerts: Any) -> None:
+        """Optional hook for immediate Telegram critical notifications."""
+        self._critical_alerts = alerts
 
     # ---------------- Internal helpers ----------------
+
+    def _backoff_seconds(self, attempt: int) -> float:
+        base = min(2 ** attempt, Config.API_BACKOFF_MAX_SECONDS)
+        jitter = random.uniform(0.0, 1.0) if Config.ENABLE_STRICT_RATE_LIMIT else 0.0
+        return base + jitter
+
+    def _is_rate_limit_error(self, exc: BinanceAPIException) -> bool:
+        if exc.code in self.RATE_LIMIT_CODES:
+            return True
+        message = str(exc.message).lower()
+        return "429" in message or "418" in message or "rate limit" in message
 
     def _throttled_call(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         last_error: Optional[Exception] = None
         for attempt in range(1, Config.MAX_RETRIES + 1):
-            self._rate_limiter.wait()
+            if Config.ENABLE_STRICT_RATE_LIMIT:
+                self._rate_limiter.wait()
             try:
                 return func(*args, **kwargs)
             except BinanceAPIException as exc:
                 last_error = exc
-                if exc.code in (-1003, 429):
-                    sleep_seconds = min(2 ** attempt, 30)
+                if self._is_rate_limit_error(exc):
+                    sleep_seconds = self._backoff_seconds(attempt)
                     error_logger.warning(
-                        "Rate limit hit (code=%s). Backoff %ss (attempt %s/%s).",
+                        "Rate limit hit (code=%s). Backoff %.1fs (attempt %s/%s).",
                         exc.code,
                         sleep_seconds,
                         attempt,
@@ -132,14 +163,45 @@ class BinanceExchangeManager:
                     )
                     time.sleep(sleep_seconds)
                     if attempt == Config.MAX_RETRIES:
+                        if self._critical_alerts:
+                            self._critical_alerts.notify(
+                                "RATE_LIMIT",
+                                f"Binance rate limit exhausted after {Config.MAX_RETRIES} retries",
+                                exc=exc,
+                            )
                         raise ExchangeRateLimitError(str(exc.message)) from exc
-                else:
-                    raise ExchangeError(str(exc.message)) from exc
+                    continue
+                if self._critical_alerts and exc.code in (-1021, -2015, -2014):
+                    self._critical_alerts.notify(
+                        "API_DISCONNECT",
+                        f"Binance API error code {exc.code}: {exc.message}",
+                        exc=exc,
+                    )
+                raise ExchangeError(str(exc.message)) from exc
+            except (ConnectionError, TimeoutError, OSError) as exc:
+                last_error = exc
+                sleep_seconds = self._backoff_seconds(attempt)
+                error_logger.warning(
+                    "Network error on API call (attempt %s/%s): %s — retry in %.1fs",
+                    attempt,
+                    Config.MAX_RETRIES,
+                    exc,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
+                if attempt == Config.MAX_RETRIES:
+                    if self._critical_alerts:
+                        self._critical_alerts.notify(
+                            "API_DISCONNECT",
+                            "Binance API connection failed after retries",
+                            exc=exc,
+                        )
+                    raise ExchangeError(str(exc)) from exc
             except Exception as exc:
                 last_error = exc
                 if attempt == Config.MAX_RETRIES:
                     raise ExchangeError(str(exc)) from exc
-                time.sleep(min(2 ** attempt, 10))
+                time.sleep(self._backoff_seconds(attempt))
         raise ExchangeError(str(last_error))
 
     def _parse_symbol_rules(self, symbol_data: dict[str, Any]) -> SymbolRules:
@@ -608,10 +670,28 @@ class BinanceExchangeManager:
                 exc.message,
                 exc.code,
             )
+            if self._critical_alerts:
+                self._critical_alerts.notify(
+                    "ORDER_FAILURE",
+                    f"Order rejected on {symbol} {side} {position_side}: {exc.message}",
+                    exc=exc,
+                )
             raise OrderExecutionError(exc.message) from exc
         except BinanceOrderException as exc:
+            if self._critical_alerts:
+                self._critical_alerts.notify(
+                    "ORDER_FAILURE",
+                    f"Order exception on {symbol}: {exc.message}",
+                    exc=exc,
+                )
             raise OrderExecutionError(exc.message) from exc
         except Exception as exc:
+            if self._critical_alerts:
+                self._critical_alerts.notify(
+                    "ORDER_FAILURE",
+                    f"Unexpected order failure on {symbol}: {exc}",
+                    exc=exc,
+                )
             raise OrderExecutionError(str(exc)) from exc
 
     def close_position_quantity(

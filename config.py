@@ -33,6 +33,8 @@ class Config:
     REQUEST_TIMEOUT: int = _env_int("REQUEST_TIMEOUT", 15)
     MAX_RETRIES: int = _env_int("MAX_RETRIES", 5)
     MIN_REQUEST_INTERVAL_MS: int = _env_int("MIN_REQUEST_INTERVAL_MS", 100)
+    ENABLE_STRICT_RATE_LIMIT: bool = _env_bool("ENABLE_STRICT_RATE_LIMIT", True)
+    API_BACKOFF_MAX_SECONDS: int = _env_int("API_BACKOFF_MAX_SECONDS", 60)
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
     TIMEZONE: str = os.getenv("TIMEZONE", "UTC")
 
@@ -69,6 +71,11 @@ class Config:
     MAX_RESTART_DELAY_SECONDS: int = _env_int("MAX_RESTART_DELAY_SECONDS", 120)
     MAX_AUTO_RESTARTS: int = _env_int("MAX_AUTO_RESTARTS", 0)
     ERROR_ALERT_THRESHOLD: int = _env_int("ERROR_ALERT_THRESHOLD", 3)
+    CRITICAL_ALERT_COOLDOWN_SECONDS: int = _env_int("CRITICAL_ALERT_COOLDOWN_SECONDS", 300)
+
+    # ---------------- Database maintenance ----------------
+    DB_RETENTION_DAYS: int = _env_int("DB_RETENTION_DAYS", 30)
+    DB_MAINTENANCE_INTERVAL_SECONDS: int = _env_int("DB_MAINTENANCE_INTERVAL_SECONDS", 86400)
 
     # ---------------- ATR exits ----------------
     SL_ATR_MULTIPLIER: float = _env_float("SL_ATR_MULTIPLIER", 2.0)
@@ -79,11 +86,27 @@ class Config:
     ENABLE_TRAILING_STOP: bool = _env_bool("ENABLE_TRAILING_STOP", True)
     ENABLE_PARTIAL_TP: bool = _env_bool("ENABLE_PARTIAL_TP", True)
 
-    # ---------------- Strategy ----------------
+    # ---------------- Strategy / SMC ----------------
     STRATEGY_MIN_SCORE: float = _env_float("STRATEGY_MIN_SCORE", 70.0)
+    SCORE_FULL_SIZE: float = _env_float("SCORE_FULL_SIZE", 80.0)
+    HALF_SIZE_MULTIPLIER: float = _env_float("HALF_SIZE_MULTIPLIER", 0.5)
+    VOLUME_BONUS_POINTS: float = _env_float("VOLUME_BONUS_POINTS", 5.0)
+    RETEST_LOOKBACK_BARS: int = _env_int("RETEST_LOOKBACK_BARS", 12)
+    RETEST_ZONE_ATR_TOLERANCE: float = _env_float("RETEST_ZONE_ATR_TOLERANCE", 0.25)
+    MAX_CHASE_ATR: float = _env_float("MAX_CHASE_ATR", 0.35)
+    PD_LOOKBACK_BARS: int = _env_int("PD_LOOKBACK_BARS", 48)
     SCORE_HIGH_CONFIDENCE: float = _env_float("HIGH_CONFIDENCE_SCORE", 90.0)
     SCORE_MEDIUM_CONFIDENCE: float = _env_float("MEDIUM_CONFIDENCE_SCORE", 80.0)
     SCORE_LOW_CONFIDENCE: float = _env_float("LOW_CONFIDENCE_SCORE", 70.0)
+
+    # ---------------- R:R & structural exits ----------------
+    SL_BUFFER_ATR: float = _env_float("SL_BUFFER_ATR", 0.15)
+    MAX_SL_ATR_MULTIPLIER: float = _env_float("MAX_SL_ATR_MULTIPLIER", 2.0)
+    TP1_R_MULTIPLE: float = _env_float("TP1_R_MULTIPLE", 1.0)
+    TP2_R_MULTIPLE: float = _env_float("TP2_R_MULTIPLE", 2.0)
+    TP3_R_MULTIPLE: float = _env_float("TP3_R_MULTIPLE", 3.5)
+    MIN_OPPOSING_RR: float = _env_float("MIN_OPPOSING_RR", 1.5)
+    SYMBOL_COOLDOWN_MINUTES: int = _env_int("SYMBOL_COOLDOWN_MINUTES", 20)
 
     # ---------------- Market filters ----------------
     MIN_24H_VOLUME_USDT: float = _env_float("MIN_24H_VOLUME_USDT", 15_000_000.0)

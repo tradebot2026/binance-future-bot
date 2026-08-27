@@ -23,7 +23,7 @@ from constants import (
 )
 from exceptions import DatabaseError
 from logger import error_logger, system_logger
-from utils import utc_now
+from utils import safe_float, utc_now
 
 
 class DatabaseManager:
@@ -148,6 +148,46 @@ class DatabaseManager:
                 self._ensure_column(cursor, "trades", "metadata", "TEXT")
                 self._ensure_column(cursor, "trades", "exchange_order_id", "TEXT")
                 self._ensure_column(cursor, "daily_stats", "entries_count", "INTEGER DEFAULT 0")
+                self._ensure_column(cursor, "signals", "accepted", "INTEGER DEFAULT 0")
+                self._ensure_column(cursor, "signals", "outcome", "TEXT")
+                self._ensure_column(cursor, "signals", "structure_metadata", "TEXT")
+                self._ensure_column(cursor, "signals", "rejection_reason", "TEXT")
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS signal_rejections (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT,
+                        direction TEXT,
+                        score REAL,
+                        timestamp TEXT,
+                        strategy TEXT,
+                        reasons TEXT
+                    )
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS symbol_cooldowns (
+                        symbol TEXT PRIMARY KEY,
+                        cooldown_until TEXT,
+                        reason TEXT
+                    )
+                    """
+                )
+
+                cursor.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS critical_errors (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        category TEXT NOT NULL,
+                        message TEXT NOT NULL,
+                        stack_trace TEXT,
+                        timestamp TEXT NOT NULL
+                    )
+                    """
+                )
 
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_trade_symbol ON trades(symbol)"
@@ -160,6 +200,15 @@ class DatabaseManager:
                 )
                 cursor.execute(
                     "CREATE INDEX IF NOT EXISTS idx_blacklist_expiry ON blacklist(expires_at)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_signal_rejection_symbol ON signal_rejections(symbol)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_trades_closed_at ON trades(closed_at)"
+                )
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_critical_errors_ts ON critical_errors(timestamp)"
                 )
 
                 conn.commit()
@@ -496,16 +545,20 @@ class DatabaseManager:
 
     # ---------------- Signals ----------------
 
-    def log_signal(self, signal_data: dict[str, Any]) -> None:
+    def log_signal(self, signal_data: dict[str, Any]) -> Optional[int]:
         now = utc_now().isoformat()
+        metadata = signal_data.get("structure_metadata")
+        if isinstance(metadata, dict):
+            metadata = json.dumps(metadata)
         with self._write_lock:
             try:
                 with self.connection() as conn:
-                    conn.execute(
+                    cursor = conn.execute(
                         """
                         INSERT INTO signals (
-                            symbol, timeframe, direction, score, timestamp, strategy, reason
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                            symbol, timeframe, direction, score, timestamp, strategy, reason,
+                            accepted, outcome, structure_metadata, rejection_reason
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             signal_data.get("symbol"),
@@ -515,11 +568,168 @@ class DatabaseManager:
                             now,
                             signal_data.get("strategy"),
                             signal_data.get("reason"),
+                            1 if signal_data.get("accepted") else 0,
+                            signal_data.get("outcome"),
+                            metadata,
+                            signal_data.get("rejection_reason"),
+                        ),
+                    )
+                    conn.commit()
+                    return int(cursor.lastrowid)
+            except sqlite3.Error as exc:
+                error_logger.error("Failed to log signal: %s", exc)
+                return None
+
+    def log_signal_rejection(
+        self,
+        symbol: str,
+        direction: str,
+        score: float,
+        reasons: list[str],
+        strategy: str = "SMC_MULTITF",
+    ) -> None:
+        now = utc_now().isoformat()
+        with self._write_lock:
+            try:
+                with self.connection() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO signal_rejections (
+                            symbol, direction, score, timestamp, strategy, reasons
+                        ) VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            symbol,
+                            direction,
+                            score,
+                            now,
+                            strategy,
+                            json.dumps(reasons),
                         ),
                     )
                     conn.commit()
             except sqlite3.Error as exc:
-                error_logger.error("Failed to log signal: %s", exc)
+                error_logger.error("Failed to log signal rejection: %s", exc)
+
+    def set_symbol_cooldown(self, symbol: str, minutes: int, reason: str) -> None:
+        until = (utc_now() + timedelta(minutes=minutes)).isoformat()
+        with self._write_lock:
+            try:
+                with self.connection() as conn:
+                    conn.execute(
+                        """
+                        INSERT OR REPLACE INTO symbol_cooldowns (symbol, cooldown_until, reason)
+                        VALUES (?, ?, ?)
+                        """,
+                        (symbol, until, reason),
+                    )
+                    conn.commit()
+            except sqlite3.Error as exc:
+                error_logger.error("Failed to set symbol cooldown for %s: %s", symbol, exc)
+
+    def is_symbol_on_cooldown(self, symbol: str) -> tuple[bool, str]:
+        try:
+            with self.connection() as conn:
+                row = conn.execute(
+                    "SELECT cooldown_until, reason FROM symbol_cooldowns WHERE symbol = ?",
+                    (symbol,),
+                ).fetchone()
+                if not row:
+                    return False, ""
+                until = str(row[0])
+                reason = str(row[1] or "cooldown")
+                if until <= utc_now().isoformat():
+                    return False, ""
+                return True, reason
+        except sqlite3.Error as exc:
+            error_logger.error("Cooldown check failed for %s: %s", symbol, exc)
+            return False, ""
+
+    def cleanup_expired_cooldowns(self) -> None:
+        now = utc_now().isoformat()
+        with self._write_lock:
+            try:
+                with self.connection() as conn:
+                    conn.execute(
+                        "DELETE FROM symbol_cooldowns WHERE cooldown_until <= ?",
+                        (now,),
+                    )
+                    conn.commit()
+            except sqlite3.Error as exc:
+                error_logger.error("Failed to cleanup cooldowns: %s", exc)
+
+    def record_signal_outcome(self, trade_id: str, outcome: str) -> None:
+        """Link latest accepted signal for trade symbol to win/loss outcome."""
+        trade = self.get_trade(trade_id)
+        if not trade:
+            return
+        symbol = trade.get("symbol")
+        with self._write_lock:
+            try:
+                with self.connection() as conn:
+                    conn.execute(
+                        """
+                        UPDATE signals
+                        SET outcome = ?
+                        WHERE id = (
+                            SELECT id FROM signals
+                            WHERE symbol = ? AND accepted = 1
+                            ORDER BY timestamp DESC
+                            LIMIT 1
+                        )
+                        """,
+                        (outcome, symbol),
+                    )
+                    conn.commit()
+            except sqlite3.Error as exc:
+                error_logger.error("Failed to record signal outcome: %s", exc)
+
+    def get_daily_trade_analytics(self, date_str: str) -> dict[str, Any]:
+        """Win rate, W/L breakdown, profit factor for closed trades on a UTC day."""
+        try:
+            with self.connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT pnl FROM trades
+                    WHERE status = 'CLOSED'
+                      AND closed_at IS NOT NULL
+                      AND closed_at LIKE ?
+                    """,
+                    (f"{date_str}%",),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            error_logger.error("Failed to fetch daily analytics: %s", exc)
+            return {
+                "wins": 0,
+                "losses": 0,
+                "win_rate": 0.0,
+                "profit_factor": 0.0,
+                "total_pnl": 0.0,
+            }
+
+        pnls = [safe_float(row[0]) for row in rows]
+        wins = [p for p in pnls if p > 0]
+        losses = [p for p in pnls if p < 0]
+        win_count = len(wins)
+        loss_count = len(losses)
+        total = win_count + loss_count
+        win_rate = (win_count / total * 100.0) if total > 0 else 0.0
+        gross_profit = sum(wins)
+        gross_loss = abs(sum(losses))
+        if gross_loss > 0:
+            profit_factor = gross_profit / gross_loss
+        elif gross_profit > 0:
+            profit_factor = float("inf")
+        else:
+            profit_factor = 0.0
+
+        return {
+            "wins": win_count,
+            "losses": loss_count,
+            "win_rate": win_rate,
+            "profit_factor": profit_factor,
+            "total_pnl": sum(pnls),
+        }
 
     # ---------------- Trades ----------------
 
@@ -624,7 +834,98 @@ class DatabaseManager:
         except json.JSONDecodeError:
             return {}
 
+    # ---------------- Critical errors ----------------
+
+    def log_critical_error(
+        self,
+        category: str,
+        message: str,
+        stack_trace: str = "",
+    ) -> None:
+        now = utc_now().isoformat()
+        with self._write_lock:
+            try:
+                with self.connection() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO critical_errors (category, message, stack_trace, timestamp)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        (category, message, stack_trace, now),
+                    )
+                    conn.commit()
+            except sqlite3.Error as exc:
+                error_logger.error("Failed to log critical error: %s", exc)
+
+    def get_recent_critical_errors(self, limit: int = 15) -> list[dict[str, Any]]:
+        try:
+            with self.connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT category, message, timestamp
+                    FROM critical_errors
+                    ORDER BY timestamp DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+                return [
+                    {
+                        "category": str(row[0]),
+                        "message": str(row[1]),
+                        "timestamp": str(row[2]),
+                    }
+                    for row in rows
+                ]
+        except sqlite3.Error as exc:
+            error_logger.error("Failed to fetch critical errors: %s", exc)
+            return []
+
     # ---------------- Maintenance ----------------
+
+    def purge_old_records(self, retention_days: int | None = None) -> dict[str, int]:
+        """Delete log-style records older than retention_days."""
+        days = retention_days if retention_days is not None else Config.DB_RETENTION_DAYS
+        cutoff = (utc_now() - timedelta(days=days)).isoformat()
+        purged: dict[str, int] = {}
+
+        with self._write_lock:
+            try:
+                with self.connection() as conn:
+                    for table, column in (
+                        ("signal_rejections", "timestamp"),
+                        ("critical_errors", "timestamp"),
+                        ("signals", "timestamp"),
+                    ):
+                        cursor = conn.execute(
+                            f"DELETE FROM {table} WHERE {column} < ?",
+                            (cutoff,),
+                        )
+                        purged[table] = cursor.rowcount
+                    conn.commit()
+            except sqlite3.Error as exc:
+                error_logger.error("Failed to purge old records: %s", exc)
+
+        if any(purged.values()):
+            system_logger.info(
+                "Purged old DB records (>%sd): %s",
+                days,
+                ", ".join(f"{k}={v}" for k, v in purged.items() if v),
+            )
+        return purged
+
+    def run_maintenance(
+        self,
+        retention_days: int | None = None,
+        vacuum: bool = True,
+    ) -> dict[str, Any]:
+        """Purge stale logs and optionally VACUUM the database."""
+        purged = self.purge_old_records(retention_days)
+        self.cleanup_expired_cooldowns()
+        self.cleanup_expired_blacklist()
+        if vacuum:
+            self.vacuum_database()
+        return {"purged": purged, "vacuum": vacuum}
 
     def vacuum_database(self) -> None:
         with self._write_lock:

@@ -12,10 +12,12 @@ import time
 import traceback
 from typing import Any, Optional
 
+from bot_controller import BotController
 from config import Config
+from critical_alerts import CriticalAlertService
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
-from exceptions import DatabaseError, ExchangeError, ExchangeRateLimitError
+from exceptions import DatabaseError, ExchangeError, ExchangeRateLimitError, OrderExecutionError
 from executor import TradeExecutor
 from logger import error_logger, system_logger
 from manager import TradeManager
@@ -109,6 +111,7 @@ def _validate_candidate(candidate: dict[str, Any]) -> tuple[bool, str, dict[str,
         "price": price,
         "score": score,
         "strategy": strategy,
+        "structure_metadata": candidate.get("structure_metadata") or {},
     }
     return True, "", normalized
 
@@ -142,6 +145,7 @@ def _execute_candidates(
     scheduler: DailyScheduler,
     db: DatabaseManager,
     tg: TelegramManager,
+    critical_alerts: Optional[CriticalAlertService] = None,
 ) -> None:
     entries_this_cycle = 0
 
@@ -184,6 +188,7 @@ def _execute_candidates(
                 current_price=normalized["price"],
                 strategy=normalized["strategy"],
                 score=normalized["score"],
+                structure_metadata=normalized.get("structure_metadata"),
             )
             if not result:
                 continue
@@ -192,6 +197,12 @@ def _execute_candidates(
             risk.record_entry_opened()
 
             if result.get("orphan_fill"):
+                if critical_alerts:
+                    critical_alerts.notify(
+                        "ORPHAN_FILL",
+                        f"Orphan fill on {symbol} {action} orderId={result.get('exchange_order_id')}",
+                        force=True,
+                    )
                 tg.send_message(
                     "🚨 <b>CRITICAL: Orphan fill</b>\n"
                     f"Order filled on exchange but DB logging failed.\n"
@@ -216,6 +227,19 @@ def _execute_candidates(
             scheduler.notify_trade_event()
             risk.notify_trade_event()
 
+        except OrderExecutionError as exc:
+            error_logger.error(
+                "Order execution failed for %s: %s",
+                candidate.get("symbol", "?"),
+                exc,
+            )
+            if critical_alerts:
+                critical_alerts.notify(
+                    "ORDER_FAILURE",
+                    f"Candidate execution failed for {candidate.get('symbol', '?')}: {exc}",
+                    exc=exc,
+                )
+            continue
         except Exception as exc:
             error_logger.error(
                 "Candidate execution failed for %s: %s",
@@ -223,6 +247,12 @@ def _execute_candidates(
                 exc,
             )
             error_logger.error(traceback.format_exc())
+            if critical_alerts:
+                critical_alerts.notify(
+                    "UNHANDLED_EXCEPTION",
+                    f"Candidate loop error for {candidate.get('symbol', '?')}: {exc}",
+                    exc=exc,
+                )
             continue
 
 
@@ -254,6 +284,7 @@ def _handle_loop_error(
     exc: Exception,
     consecutive_errors: int,
     tg: Optional[TelegramManager],
+    critical_alerts: Optional[CriticalAlertService] = None,
 ) -> int:
     consecutive_errors += 1
     error_logger.error(
@@ -263,8 +294,18 @@ def _handle_loop_error(
     )
     error_logger.error(traceback.format_exc())
 
+    if critical_alerts:
+        if isinstance(exc, ExchangeRateLimitError):
+            critical_alerts.notify("RATE_LIMIT", str(exc), exc=exc)
+        elif isinstance(exc, ExchangeError):
+            critical_alerts.notify("API_DISCONNECT", str(exc), exc=exc)
+        elif isinstance(exc, DatabaseError):
+            critical_alerts.notify("DATABASE", str(exc), exc=exc)
+        else:
+            critical_alerts.notify("UNHANDLED_EXCEPTION", str(exc), exc=exc)
+
     if isinstance(exc, ExchangeRateLimitError):
-        sleep_for = min(Config.RESTART_DELAY_SECONDS * 3, 120)
+        sleep_for = min(Config.RESTART_DELAY_SECONDS * 3, Config.API_BACKOFF_MAX_SECONDS)
     elif isinstance(exc, (ExchangeError, DatabaseError)):
         sleep_for = min(Config.RESTART_DELAY_SECONDS * 2, 90)
     else:
@@ -283,16 +324,26 @@ def _handle_loop_error(
     return consecutive_errors
 
 
-def main() -> None:
+def main(controller: Optional[BotController] = None) -> str:
+    """
+    Run the trading loop until shutdown is requested.
+    Returns 'restart' if a graceful restart was requested, else 'stop'.
+    """
     if not _validate_startup():
-        return
+        return "stop"
 
     _startup_banner()
+
+    controller = controller or BotController()
+    controller.reset()
 
     db = DatabaseManager()
     exchange = BinanceExchangeManager()
 
-    scheduler = DailyScheduler(exchange, db, telegram=None)
+    critical_alerts = CriticalAlertService(db)
+    exchange.attach_critical_alerts(critical_alerts)
+
+    scheduler = DailyScheduler(exchange, db, telegram=None, controller=controller)
     risk = RiskManager(exchange, db)
 
     tg = TelegramManager(
@@ -300,15 +351,11 @@ def main() -> None:
         scheduler=scheduler,
         risk_manager=risk,
         exchange=exchange,
+        controller=controller,
     )
     scheduler.telegram = tg
+    critical_alerts.attach_telegram(tg)
 
-    tg.start_listening()
-    mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
-    tg.send_message(f"🚀 <b>Bot started</b> and connected to Binance ({mode}).")
-
-    scanner = MarketScanner(exchange, db) if SCANNER_AVAILABLE else None
-    executor = TradeExecutor(exchange, db)
     manager = TradeManager(
         exchange=exchange,
         db=db,
@@ -316,6 +363,14 @@ def main() -> None:
         scheduler=scheduler,
         risk_manager=risk,
     )
+    tg.manager = manager
+
+    tg.start_listening()
+    mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
+    tg.send_message(f"🚀 <b>Bot started</b> and connected to Binance ({mode}).")
+
+    scanner = MarketScanner(exchange, db) if SCANNER_AVAILABLE else None
+    executor = TradeExecutor(exchange, db)
     reporter = ReportGenerator(db) if REPORTER_AVAILABLE else None
 
     reconcile_positions_at_startup(exchange, db, tg)
@@ -328,10 +383,11 @@ def main() -> None:
     last_heartbeat = time.monotonic()
     last_report_day = ""
     last_reconciliation = time.monotonic()
+    last_maintenance = time.monotonic()
     cycle = 0
     consecutive_errors = 0
 
-    while True:
+    while not controller.is_shutdown_requested():
         cycle += 1
         loop_started = time.monotonic()
 
@@ -340,7 +396,13 @@ def main() -> None:
             now_mono = time.monotonic()
             if now_mono - last_reconciliation >= Config.RECONCILIATION_INTERVAL_SECONDS:
                 reconcile_positions(exchange, db, tg, context="periodic")
+                db.cleanup_expired_cooldowns()
                 last_reconciliation = now_mono
+
+            # Step 1b — Periodic DB purge + VACUUM (default: daily)
+            if now_mono - last_maintenance >= Config.DB_MAINTENANCE_INTERVAL_SECONDS:
+                db.run_maintenance(retention_days=Config.DB_RETENTION_DAYS, vacuum=True)
+                last_maintenance = now_mono
 
             # Step 2 — Scan and execute only when entries are allowed
             if scanner is None:
@@ -359,6 +421,7 @@ def main() -> None:
                         scheduler=scheduler,
                         db=db,
                         tg=tg,
+                        critical_alerts=critical_alerts,
                     )
                 elif gate_reason:
                     system_logger.info("Entries paused: %s", gate_reason)
@@ -389,21 +452,51 @@ def main() -> None:
         except KeyboardInterrupt:
             raise
         except Exception as exc:
-            consecutive_errors = _handle_loop_error(exc, consecutive_errors, tg)
+            consecutive_errors = _handle_loop_error(
+                exc, consecutive_errors, tg, critical_alerts
+            )
             continue
+
+        if controller.is_shutdown_requested():
+            break
 
         elapsed = time.monotonic() - loop_started
         sleep_for = max(Config.SCAN_INTERVAL_SECONDS - elapsed, 0.5)
-        time.sleep(sleep_for)
+        slept = 0.0
+        while slept < sleep_for and not controller.is_shutdown_requested():
+            chunk = min(1.0, sleep_for - slept)
+            time.sleep(chunk)
+            slept += chunk
+
+    # Graceful shutdown
+    monitor_stop.set()
+    tg.send_message("🛑 <b>Bot stopped</b> — trading loop shut down safely.")
+    tg.stop_listening()
+    system_logger.info("Trading loop stopped gracefully.")
+
+    if controller.is_restart_requested():
+        controller.clear_restart_flag()
+        return "restart"
+    return "stop"
 
 
 def run_with_auto_restart() -> None:
     """Restart the bot after recoverable crashes or network failures."""
     restart_count = 0
+    controller = BotController()
 
     while True:
         try:
-            main()
+            outcome = main(controller)
+            if outcome == "restart":
+                restart_count += 1
+                system_logger.info(
+                    "Graceful restart requested via Telegram (restart #%s).",
+                    restart_count,
+                )
+                controller.reset()
+                time.sleep(Config.RESTART_DELAY_SECONDS)
+                continue
             break
         except KeyboardInterrupt:
             system_logger.info("Bot stopped manually (KeyboardInterrupt).")
@@ -429,6 +522,7 @@ def run_with_auto_restart() -> None:
                 Config.MAX_RESTART_DELAY_SECONDS,
             )
             system_logger.warning("Auto-restarting in %ss…", delay)
+            controller.reset()
             time.sleep(delay)
 
 

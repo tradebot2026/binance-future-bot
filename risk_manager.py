@@ -109,6 +109,9 @@ class RiskManager:
         if symbol:
             if self._has_active_trade_for_symbol(symbol):
                 return False, f"Active trade already tracked for {symbol}."
+            on_cooldown, cooldown_reason = self.db.is_symbol_on_cooldown(symbol)
+            if on_cooldown:
+                return False, f"{symbol} on post-SL cooldown ({cooldown_reason})."
             for side in ("LONG", "SHORT"):
                 if self.exchange.has_open_position(symbol, side):
                     return False, (

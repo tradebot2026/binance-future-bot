@@ -19,6 +19,7 @@ from utils import safe_float, utc_today_str
 
 if TYPE_CHECKING:
     from telegram_bot import TelegramManager
+    from bot_controller import BotController
 
 
 class DailyScheduler:
@@ -32,10 +33,12 @@ class DailyScheduler:
         exchange: BinanceExchangeManager,
         db: DatabaseManager,
         telegram: Optional["TelegramManager"] = None,
+        controller: Optional["BotController"] = None,
     ) -> None:
         self.exchange = exchange
         self.db = db
         self.telegram = telegram
+        self.controller = controller
         self.today_str = utc_today_str()
         self._last_limit_check_at = 0.0
         self._limit_check_interval = float(Config.BALANCE_CACHE_TTL_SECONDS)
@@ -49,7 +52,19 @@ class DailyScheduler:
         Returns whether new scans/entries should be skipped.
         Does NOT affect trade monitoring — main loop must always call manager first.
         """
+        if self.controller:
+            manual, reason = self.controller.is_manually_paused()
+            if manual:
+                return True, reason
         return self.check_daily_limits()
+
+    def pause_entries_manual(self, reason: str = "Manual pause via Telegram") -> None:
+        if self.controller:
+            self.controller.pause_entries(reason)
+
+    def resume_entries_manual(self) -> None:
+        if self.controller:
+            self.controller.resume_entries()
 
     def check_daily_limits(self) -> tuple[bool, str]:
         """Evaluate day rollover and realized-PnL daily profit/loss thresholds."""

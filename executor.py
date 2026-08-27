@@ -1,7 +1,6 @@
 """
 Trade execution module.
-Calculates position size, ATR-based SL/TP levels, partitions partial quantities,
-and persists metadata for deterministic exits in the trade manager.
+Structural SL, R-multiple TP ladder, tiered sizing, and metadata persistence.
 """
 
 from __future__ import annotations
@@ -13,11 +12,18 @@ import uuid
 from typing import Any, Optional
 
 from config import Config
-from constants import TP1_PORTION, TP2_PORTION, TP3_PORTION, TRADE_STATUS_OPEN
+from constants import TP1_PORTION, TP2_PORTION, TRADE_STATUS_OPEN
 from database import DatabaseManager
 from exchange import BinanceExchangeManager, SymbolRules
 from exceptions import OrderExecutionError
 from logger import error_logger, trade_logger
+from smc_engine import (
+    StructureMetadata,
+    check_opposing_liquidity_rr,
+    compute_rr_ladder,
+    compute_structural_sl,
+    size_multiplier_for_score,
+)
 from utils import round_step_size, safe_float, utc_now
 
 
@@ -34,25 +40,17 @@ class TradeExecutor:
         entry_price: float,
         atr: float,
         rules: SymbolRules,
+        structure: Optional[dict[str, Any]] = None,
     ) -> tuple[float, float, float, float]:
-        """Calculate stop loss and three take-profit levels using Config ATR multipliers."""
-        sl_dist = atr * Config.SL_ATR_MULTIPLIER
-        tp1_dist = atr * Config.TP1_ATR_MULTIPLIER
-        tp2_dist = atr * Config.TP2_ATR_MULTIPLIER
-        tp3_dist = atr * Config.TP3_ATR_MULTIPLIER
+        """Structural stop with R-multiple take-profit ladder."""
+        meta = StructureMetadata()
+        if structure:
+            for key, value in structure.items():
+                if hasattr(meta, key):
+                    setattr(meta, key, value)
 
-        if action == "LONG":
-            sl = entry_price - sl_dist
-            if sl <= 0:
-                sl = entry_price * 0.995
-            tp1 = entry_price + tp1_dist
-            tp2 = entry_price + tp2_dist
-            tp3 = entry_price + tp3_dist
-        else:
-            sl = entry_price + sl_dist
-            tp1 = entry_price - tp1_dist
-            tp2 = entry_price - tp2_dist
-            tp3 = entry_price - tp3_dist
+        sl = compute_structural_sl(action, entry_price, atr, meta)
+        sl, tp1, tp2, tp3 = compute_rr_ladder(action, entry_price, sl)
 
         return (
             round_step_size(sl, rules.tick_size, rules.price_precision),
@@ -66,13 +64,18 @@ class TradeExecutor:
         entry_price: float,
         sl_price: float,
         rules: SymbolRules,
+        score: float = 80.0,
     ) -> float:
-        """Risk-based position sizing with notional and exchange filter guards."""
+        """Risk-based position sizing with tiered score multiplier."""
         balance = self.exchange.get_futures_balance()
         if balance <= 0:
             raise OrderExecutionError("Cannot size position: zero or unavailable balance.")
 
-        risk_amount = balance * (Config.RISK_PER_TRADE_PERCENT / 100.0)
+        size_mult = size_multiplier_for_score(score)
+        if size_mult <= 0:
+            return 0.0
+
+        risk_amount = balance * (Config.RISK_PER_TRADE_PERCENT / 100.0) * size_mult
         sl_distance = abs(entry_price - sl_price)
         if sl_distance <= 0:
             return 0.0
@@ -138,7 +141,6 @@ class TradeExecutor:
     def _persist_trade_with_retry(
         self, trade_data: dict[str, Any], attempts: int = 3
     ) -> bool:
-        """Retry DB persistence to reduce orphan exchange positions after fills."""
         for attempt in range(1, attempts + 1):
             try:
                 self.db.log_trade(trade_data)
@@ -156,7 +158,6 @@ class TradeExecutor:
         return False
 
     def _persist_orphan_fill(self, trade_data: dict[str, Any]) -> None:
-        """Write orphan fill details to disk when DB persistence fails."""
         path = os.path.join(Config.DATA_DIR, "orphan_fills.jsonl")
         try:
             with open(path, "a", encoding="utf-8") as handle:
@@ -172,11 +173,11 @@ class TradeExecutor:
         current_price: float,
         strategy: str = "DEFAULT",
         score: float = 0.0,
+        structure_metadata: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
         """
-        Execute a market entry and log the trade with metadata for manager exits.
-
-        Returns a result dict on success (includes trade_id, SL/TP levels), else None.
+        Execute a market entry after structural SL / R:R validation.
+        Returns result dict on success, else None.
         """
         if atr <= 0:
             error_logger.error("Execution aborted: invalid ATR (%.8f) for %s.", atr, symbol)
@@ -184,6 +185,13 @@ class TradeExecutor:
 
         if action not in ("LONG", "SHORT"):
             error_logger.error("Execution aborted: invalid action %s.", action)
+            return None
+
+        on_cooldown, cooldown_reason = self.db.is_symbol_on_cooldown(symbol)
+        if on_cooldown:
+            trade_logger.info(
+                "Execution skipped: %s on cooldown (%s).", symbol, cooldown_reason
+            )
             return None
 
         position_side = action
@@ -194,10 +202,20 @@ class TradeExecutor:
             return None
 
         rules = self.exchange.get_symbol_rules(symbol)
-        sl, tp1, tp2, tp3 = self.calculate_sl_tp(action, current_price, atr, rules)
+        structure = structure_metadata or {}
+        sl, tp1, tp2, tp3 = self.calculate_sl_tp(
+            action, current_price, atr, rules, structure=structure
+        )
+
+        opposing = safe_float(structure.get("opposing_liquidity"))
+        rr_ok, rr_reason = check_opposing_liquidity_rr(action, current_price, sl, opposing)
+        if not rr_ok:
+            trade_logger.info("Execution skipped %s: %s", symbol, rr_reason)
+            self.db.log_signal_rejection(symbol, action, score, [rr_reason])
+            return None
 
         try:
-            quantity = self.calculate_position_size(current_price, sl, rules)
+            quantity = self.calculate_position_size(current_price, sl, rules, score=score)
         except OrderExecutionError as exc:
             error_logger.error("Sizing failed for %s: %s", symbol, exc)
             return None
@@ -215,6 +233,9 @@ class TradeExecutor:
         metadata["atr_at_entry"] = atr
         metadata["trailing_active"] = False
         metadata["best_price"] = current_price
+        metadata["structure"] = structure
+        metadata["size_multiplier"] = size_multiplier_for_score(score)
+        metadata["r_distance"] = abs(current_price - sl)
 
         try:
             leverage = self.exchange.optimize_and_set_leverage(symbol)
@@ -240,9 +261,11 @@ class TradeExecutor:
         fill_price = self.exchange.get_fill_price_from_order(
             symbol, response, fallback=current_price
         )
-        sl, tp1, tp2, tp3 = self.calculate_sl_tp(action, fill_price, atr, rules)
-
+        sl, tp1, tp2, tp3 = self.calculate_sl_tp(
+            action, fill_price, atr, rules, structure=structure
+        )
         metadata["best_price"] = fill_price
+        metadata["r_distance"] = abs(fill_price - sl)
 
         trade_id = str(uuid.uuid4())
         opened_at = utc_now().isoformat()
@@ -286,15 +309,17 @@ class TradeExecutor:
             self._persist_orphan_fill(trade_data)
 
         trade_logger.info(
-            "Entry executed | %s %s | qty=%s | fill=%.6f | SL=%.6f | TP1=%.6f | id=%s | db_logged=%s",
+            "Entry executed | %s %s | qty=%s | fill=%.6f | SL=%.6f | TP1=%.6f | "
+            "R=%.6f | size_mult=%.2f | id=%s",
             symbol,
             action,
             quantity,
             fill_price,
             sl,
             tp1,
+            metadata["r_distance"],
+            metadata["size_multiplier"],
             trade_id[:8],
-            db_logged,
         )
 
         return {

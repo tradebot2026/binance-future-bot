@@ -449,7 +449,71 @@ class TradeManager:
                 pnl=safe_float(trade.get("pnl")),
             )
 
+        outcome = "WIN" if safe_float(trade.get("pnl")) > 0 else "LOSS"
+        if "STOP" in reason.upper():
+            outcome = "LOSS"
+            self.db.set_symbol_cooldown(
+                symbol,
+                Config.SYMBOL_COOLDOWN_MINUTES,
+                reason="STOP_LOSS",
+            )
+        elif safe_float(trade.get("pnl")) > 0:
+            outcome = "WIN"
+
+        self.db.record_signal_outcome(trade_id, outcome)
+
         if self.scheduler:
             self.scheduler.notify_trade_event()
         if self.risk_manager:
             self.risk_manager.notify_trade_event()
+
+    def close_all_positions(self, reason: str = "MANUAL_CLOSE_ALL") -> dict[str, Any]:
+        """Close all tracked DB trades and any remaining exchange positions."""
+        closed: list[str] = []
+        failed: list[str] = []
+        handled: set[tuple[str, str]] = set()
+
+        for trade in self.db.get_open_trades():
+            symbol = str(trade.get("symbol", ""))
+            position_side = str(trade.get("side", "LONG"))
+            handled.add((symbol, position_side))
+            try:
+                ok = self._close_position(
+                    trade,
+                    quantity=self._remaining_close_quantity(trade),
+                    reason=reason,
+                )
+                if ok:
+                    closed.append(f"{symbol} {position_side}")
+                else:
+                    failed.append(f"{symbol} {position_side}")
+            except Exception as exc:
+                error_logger.error("Close-all failed for %s %s: %s", symbol, position_side, exc)
+                failed.append(f"{symbol} {position_side}: {exc}")
+
+        for pos in self.exchange.fetch_open_positions():
+            symbol = str(pos.get("symbol", ""))
+            position_side = str(pos.get("positionSide", ""))
+            if (symbol, position_side) in handled:
+                continue
+            quantity = safe_float(pos.get("quantity"))
+            if quantity <= 0:
+                continue
+            try:
+                response = self.exchange.close_position_quantity(
+                    symbol, position_side, quantity
+                )
+                if response:
+                    closed.append(f"{symbol} {position_side} (exchange-only)")
+                else:
+                    failed.append(f"{symbol} {position_side} (exchange-only)")
+            except Exception as exc:
+                error_logger.error(
+                    "Close-all exchange-only failed for %s %s: %s",
+                    symbol,
+                    position_side,
+                    exc,
+                )
+                failed.append(f"{symbol} {position_side}: {exc}")
+
+        return {"closed": closed, "failed": failed}

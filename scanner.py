@@ -1,14 +1,14 @@
 """
 Market scanner module.
-Universe filtering, multi-timeframe technical analysis, strategy scoring,
-and watchlist generation with rate-limit-aware scanning.
+Universe filtering, multi-timeframe SMC analysis, confluence gates,
+retest-based entry validation, and watchlist generation.
 """
 
 from __future__ import annotations
 
 import time
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
 import pandas as pd
 import ta
@@ -17,6 +17,11 @@ from config import Config
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from logger import error_logger, scanner_logger, signal_logger
+from smc_engine import (
+    evaluate_confluence_gate,
+    score_setup,
+    validate_retest_entry,
+)
 from utils import safe_float
 
 MIN_ANALYZER_BARS = 250
@@ -42,7 +47,7 @@ class MarketAnalyzer:
         df["macd_signal"] = macd.macd_signal()
         df["macd_hist"] = macd.macd_diff()
 
-        df["atr"] = ta.volatility.average_true_range(
+        df["atr"] = ta.trend.average_true_range(
             df["high"], df["low"], df["close"], window=14
         )
         df["adx"] = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
@@ -95,12 +100,10 @@ class MarketAnalyzer:
         df["liq_sweep_bullish"] = (
             (df["low"] < df["last_swing_low"].shift(1))
             & (df["close"] > df["last_swing_low"].shift(1))
-            & (df["vol_spike"] | df["is_bull_displacement"])
         )
         df["liq_sweep_bearish"] = (
             (df["high"] > df["last_swing_high"].shift(1))
             & (df["close"] < df["last_swing_high"].shift(1))
-            & (df["vol_spike"] | df["is_bear_displacement"])
         )
 
         df["ob_bullish_formed"] = (df["bos_bullish"] | df["choch_bullish"]) & df[
@@ -121,143 +124,19 @@ class MarketAnalyzer:
         return 0.0
 
     @staticmethod
-    def extract_latest_signals(df: pd.DataFrame) -> Tuple[dict, dict]:
+    def extract_latest_signals(df: pd.DataFrame) -> tuple[dict, dict]:
         if len(df) < 2:
             return {}, {}
         return df.iloc[-1].to_dict(), df.iloc[-2].to_dict()
 
 
-class StrategyEngine:
-    """Weighted confidence scoring with SMC penalties and HTF soft bias."""
-
-    def __init__(self) -> None:
-        self.min_score = Config.STRATEGY_MIN_SCORE
-        self.smc_penalty = 12.0
-        self.htf_influence = 5.0
-        self.min_separation = 5.0
-
-    def evaluate_setup(
-        self,
-        latest: Dict[str, Any],
-        previous: Dict[str, Any],
-        macro_trend: str = "NEUTRAL",
-    ) -> Tuple[str, float]:
-        if not latest or not previous:
-            return "NEUTRAL", 0.0
-
-        long_score = self._calculate_long_score(latest, previous, macro_trend)
-        short_score = self._calculate_short_score(latest, previous, macro_trend)
-
-        if abs(long_score - short_score) < self.min_separation:
-            signal_logger.info(
-                "Equilibrium | %s LONG vs %s SHORT — skipped.",
-                f"{long_score:.1f}",
-                f"{short_score:.1f}",
-            )
-            return "NEUTRAL", max(long_score, short_score)
-
-        if long_score >= self.min_score and long_score > short_score:
-            return "LONG", long_score
-        if short_score >= self.min_score and short_score > long_score:
-            return "SHORT", short_score
-        return "NEUTRAL", max(long_score, short_score)
-
-    def validate_multi_timeframe(self, macro_trend: str, micro_signal: str) -> bool:
-        if macro_trend == "NEUTRAL":
-            return False
-        return macro_trend == micro_signal
-
-    def _calculate_long_score(
-        self, latest: Dict[str, Any], previous: Dict[str, Any], macro_trend: str
-    ) -> float:
-        score = 0.0
-        if latest.get("trend_bullish", False):
-            score += 20.0
-        if safe_float(latest.get("ema_20")) > safe_float(latest.get("ema_50")):
-            score += 10.0
-        if safe_float(latest.get("adx")) >= 20.0:
-            score += 5.0
-
-        rsi = safe_float(latest.get("rsi"), 50.0)
-        if 38 <= rsi <= 68:
-            score += 12.0
-        if safe_float(latest.get("macd")) > safe_float(latest.get("macd_signal")):
-            score += 13.0
-
-        has_smc = False
-        if latest.get("liq_sweep_bullish") or previous.get("liq_sweep_bullish"):
-            score += 15.0
-            has_smc = True
-        if latest.get("fvg_bullish") or previous.get("fvg_bullish"):
-            score += 10.0
-            has_smc = True
-        if latest.get("bos_bullish") or latest.get("choch_bullish"):
-            score += 8.0
-            has_smc = True
-        if latest.get("ob_bullish_formed"):
-            score += 8.0
-            has_smc = True
-        if latest.get("vol_spike"):
-            score += 15.0
-
-        if not has_smc:
-            score = max(score - self.smc_penalty, 0.0)
-        if macro_trend == "LONG":
-            score += self.htf_influence
-        elif macro_trend == "SHORT":
-            score = max(score - self.htf_influence, 0.0)
-        return min(score, 100.0)
-
-    def _calculate_short_score(
-        self, latest: Dict[str, Any], previous: Dict[str, Any], macro_trend: str
-    ) -> float:
-        score = 0.0
-        if latest.get("trend_bearish", False):
-            score += 20.0
-        if safe_float(latest.get("ema_20")) < safe_float(latest.get("ema_50")):
-            score += 10.0
-        if safe_float(latest.get("adx")) >= 20.0:
-            score += 5.0
-
-        rsi = safe_float(latest.get("rsi"), 50.0)
-        if 32 <= rsi <= 62:
-            score += 12.0
-        if safe_float(latest.get("macd")) < safe_float(latest.get("macd_signal")):
-            score += 13.0
-
-        has_smc = False
-        if latest.get("liq_sweep_bearish") or previous.get("liq_sweep_bearish"):
-            score += 15.0
-            has_smc = True
-        if latest.get("fvg_bearish") or previous.get("fvg_bearish"):
-            score += 10.0
-            has_smc = True
-        if latest.get("bos_bearish") or latest.get("choch_bearish"):
-            score += 8.0
-            has_smc = True
-        if latest.get("ob_bearish_formed"):
-            score += 8.0
-            has_smc = True
-        if latest.get("vol_spike"):
-            score += 15.0
-
-        if not has_smc:
-            score = max(score - self.smc_penalty, 0.0)
-        if macro_trend == "SHORT":
-            score += self.htf_influence
-        elif macro_trend == "LONG":
-            score = max(score - self.htf_influence, 0.0)
-        return min(score, 100.0)
-
-
 class MarketScanner:
-    """Scans Binance Futures for scored entry candidates."""
+    """Scans Binance Futures for SMC confluence + retest entry candidates."""
 
     def __init__(self, exchange: BinanceExchangeManager, db: DatabaseManager) -> None:
         self.exchange = exchange
         self.db = db
         self.analyzer = MarketAnalyzer()
-        self.strategy = StrategyEngine()
         self.entry_tf = Config.ENTRY_TIMEFRAME
         self.confirm_tf = Config.CONFIRM_TIMEFRAME
         self.trend_tf = Config.TREND_TIMEFRAME
@@ -324,21 +203,62 @@ class MarketScanner:
                 time.sleep(0.5)
         return pd.DataFrame()
 
-    def _resolve_macro_trend(self, df_trend: pd.DataFrame, df_confirm: pd.DataFrame) -> str:
-        trend_latest, _ = self.analyzer.extract_latest_signals(df_trend)
-        confirm_latest, _ = self.analyzer.extract_latest_signals(df_confirm)
+    def _evaluate_direction(
+        self,
+        symbol: str,
+        df_entry: pd.DataFrame,
+        df_confirm: pd.DataFrame,
+        df_trend: pd.DataFrame,
+        action: str,
+    ) -> Dict[str, Any]:
+        neutral = {"symbol": symbol, "score": 0.0, "action": "NEUTRAL"}
+        latest, previous = self.analyzer.extract_latest_signals(df_entry)
+        atr = self.analyzer.get_latest_atr(df_entry)
+        live_price = self.exchange.get_market_price(symbol)
+        price = safe_float(live_price) if live_price else float(df_entry.iloc[-1]["close"])
 
-        macro = "NEUTRAL"
-        if trend_latest.get("trend_bullish"):
-            macro = "LONG"
-        elif trend_latest.get("trend_bearish"):
-            macro = "SHORT"
+        if atr <= 0 or price <= 0:
+            return neutral
 
-        if macro == "LONG" and confirm_latest.get("trend_bearish"):
-            return "NEUTRAL"
-        if macro == "SHORT" and confirm_latest.get("trend_bullish"):
-            return "NEUTRAL"
-        return macro
+        gate = evaluate_confluence_gate(action, df_entry, df_trend, df_confirm, price, atr)
+        if not gate.passed:
+            self.db.log_signal_rejection(symbol, action, 0.0, gate.reasons)
+            signal_logger.info(
+                "Rejected %s %s | reasons=%s", symbol, action, ",".join(gate.reasons)
+            )
+            return neutral
+
+        retest_ok, retest_reason = validate_retest_entry(action, price, gate.structure, atr)
+        if not retest_ok:
+            self.db.log_signal_rejection(symbol, action, 0.0, [retest_reason])
+            signal_logger.info("Rejected %s %s | %s", symbol, action, retest_reason)
+            return neutral
+
+        score = score_setup(action, latest, previous, gate.structure, gate.structure.macro_trend)
+        if score < Config.STRATEGY_MIN_SCORE:
+            self.db.log_signal_rejection(
+                symbol, action, score, [f"score_below_min_{score:.1f}"]
+            )
+            return neutral
+
+        long_score = score if action == "LONG" else 0.0
+        short_score = score if action == "SHORT" else 0.0
+
+        return {
+            "symbol": symbol,
+            "action": action,
+            "direction": action,
+            "score": score,
+            "long_score": long_score,
+            "short_score": short_score,
+            "atr": atr,
+            "price": price,
+            "strategy": "SMC_MULTITF",
+            "timeframe": self.entry_tf,
+            "macro_trend": gate.structure.macro_trend,
+            "structure_metadata": gate.structure.to_dict(),
+            "confluence": gate.structure.confluence_type,
+        }
 
     def evaluate_single_symbol(self, symbol: str) -> Dict[str, Any]:
         """Analyze entry, confirm, and trend timeframes for one symbol."""
@@ -358,31 +278,32 @@ class MarketScanner:
             if df_entry.empty or df_confirm.empty or df_trend.empty:
                 return neutral
 
-            macro_trend = self._resolve_macro_trend(df_trend, df_confirm)
-            latest, previous = self.analyzer.extract_latest_signals(df_entry)
-            action, score = self.strategy.evaluate_setup(latest, previous, macro_trend)
+            long_candidate = self._evaluate_direction(
+                symbol, df_entry, df_confirm, df_trend, "LONG"
+            )
+            short_candidate = self._evaluate_direction(
+                symbol, df_entry, df_confirm, df_trend, "SHORT"
+            )
 
-            if action != "NEUTRAL" and macro_trend in ("LONG", "SHORT"):
-                if not self.strategy.validate_multi_timeframe(macro_trend, action):
-                    return neutral
+            long_score = safe_float(long_candidate.get("score"))
+            short_score = safe_float(short_candidate.get("score"))
 
-            atr = self.analyzer.get_latest_atr(df_entry)
-            price = float(df_entry.iloc[-1]["close"])
-
-            if atr <= 0 or price <= 0:
+            if long_score <= 0 and short_score <= 0:
                 return neutral
 
-            return {
-                "symbol": symbol,
-                "action": action,
-                "direction": action,
-                "score": score,
-                "atr": atr,
-                "price": price,
-                "strategy": "SMC_MULTITF",
-                "timeframe": self.entry_tf,
-                "macro_trend": macro_trend,
-            }
+            if abs(long_score - short_score) < 5.0:
+                signal_logger.info(
+                    "Equilibrium | %s LONG=%.1f SHORT=%.1f — skipped.",
+                    symbol,
+                    long_score,
+                    short_score,
+                )
+                return neutral
+
+            if long_score > short_score:
+                return long_candidate
+            return short_candidate
+
         except Exception as exc:
             error_logger.error("Evaluation failed for %s: %s", symbol, exc)
             return neutral
@@ -405,7 +326,7 @@ class MarketScanner:
                     result = future.result()
                     if (
                         result.get("action") not in (None, "NEUTRAL")
-                        and safe_float(result.get("score")) >= self.strategy.min_score
+                        and safe_float(result.get("score")) >= Config.STRATEGY_MIN_SCORE
                     ):
                         candidates.append(result)
                         self.db.log_signal(
@@ -415,7 +336,12 @@ class MarketScanner:
                                 "direction": result["action"],
                                 "score": result["score"],
                                 "strategy": result.get("strategy", "SMC_MULTITF"),
-                                "reason": f"macro={result.get('macro_trend')}",
+                                "reason": (
+                                    f"macro={result.get('macro_trend')}|"
+                                    f"confluence={result.get('confluence')}"
+                                ),
+                                "accepted": True,
+                                "structure_metadata": result.get("structure_metadata"),
                             }
                         )
             except FuturesTimeoutError:
@@ -430,10 +356,11 @@ class MarketScanner:
             self.db.update_watchlist(top)
             for item in top:
                 scanner_logger.info(
-                    "Candidate | %s | %s | score=%.1f | price=%.6f",
+                    "Candidate | %s | %s | score=%.1f | confluence=%s | price=%.6f",
                     item["symbol"],
                     item["action"],
                     safe_float(item["score"]),
+                    item.get("confluence", "?"),
                     safe_float(item["price"]),
                 )
         else:
