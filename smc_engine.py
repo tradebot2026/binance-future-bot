@@ -167,14 +167,70 @@ def _find_sweep_level(df: pd.DataFrame, bullish: bool) -> float:
     return 0.0
 
 
-def check_mtf_alignment(action: str, macro: str, confirm: str) -> tuple[bool, str]:
+def resolve_entry_trend(df_entry: pd.DataFrame) -> str:
+    if df_entry.empty:
+        return "NEUTRAL"
+    latest = df_entry.iloc[-1]
+    if bool(latest.get("trend_bullish")):
+        return "LONG"
+    if bool(latest.get("trend_bearish")):
+        return "SHORT"
+    return "NEUTRAL"
+
+
+def is_pd_zone_acceptable(
+    action: str,
+    pd_zone: str,
+    price: float,
+    equilibrium: float,
+    range_high: float,
+    range_low: float,
+) -> tuple[bool, str]:
+    """Premium/discount filter with optional equilibrium tolerance band."""
+    if action == "LONG":
+        if pd_zone == "DISCOUNT":
+            return True, "pd_discount"
+        if pd_zone == "PREMIUM":
+            return False, f"premium_discount_long_requires_discount got_{pd_zone}"
+    else:
+        if pd_zone == "PREMIUM":
+            return True, "pd_premium"
+        if pd_zone == "DISCOUNT":
+            return False, f"premium_discount_short_requires_premium got_{pd_zone}"
+
+    if not Config.ALLOW_PD_EQUILIBRIUM or equilibrium <= 0 or range_high <= range_low:
+        return False, f"premium_discount_{action.lower()}_requires_strict_zone got_{pd_zone}"
+
+    range_size = range_high - range_low
+    tolerance = range_size * (Config.PD_EQUILIBRIUM_TOLERANCE_PCT / 100.0)
+    if action == "LONG" and price <= equilibrium + tolerance:
+        return True, "pd_equilibrium_tolerance_long"
+    if action == "SHORT" and price >= equilibrium - tolerance:
+        return True, "pd_equilibrium_tolerance_short"
+    return False, f"premium_discount_{action.lower()}_outside_tolerance got_{pd_zone}"
+
+
+def check_mtf_alignment(
+    action: str,
+    macro: str,
+    confirm: str,
+    entry_trend: str = "NEUTRAL",
+) -> tuple[bool, str]:
     if macro in ("LONG", "SHORT"):
         if macro != action:
             return False, f"macro_{macro}_opposes_{action}"
         return True, "macro_aligned"
 
+    if confirm == action:
+        return True, "confirm_aligned_neutral_macro"
+
+    if Config.ALLOW_NEUTRAL_MACRO_SETUPS and entry_trend == action:
+        if confirm == "NEUTRAL" or confirm == action:
+            return True, "entry_aligned_neutral_macro"
+        return False, f"confirm_{confirm}_opposes_{action}"
+
     if confirm == "NEUTRAL":
-        return False, "neutral_macro_requires_15m_structure"
+        return False, "neutral_macro_requires_15m_or_5m_structure"
     if confirm != action:
         return False, f"confirm_{confirm}_opposes_{action}"
     return True, "confirm_aligned_neutral_macro"
@@ -197,22 +253,32 @@ def evaluate_confluence_gate(
 
     macro = resolve_macro_trend(df_trend, df_confirm)
     confirm = resolve_confirm_trend(df_confirm)
+    entry_trend = resolve_entry_trend(df_entry)
     structure.macro_trend = macro
     structure.confirm_trend = confirm
 
-    mtf_ok, mtf_reason = check_mtf_alignment(action, macro, confirm)
+    mtf_ok, mtf_reason = check_mtf_alignment(action, macro, confirm, entry_trend)
     if not mtf_ok:
         reasons.append(mtf_reason)
 
+    lookback = min(Config.PD_LOOKBACK_BARS, len(df_trend))
+    range_high = range_low = equilibrium = 0.0
+    if lookback >= 10:
+        window = df_trend.iloc[-lookback:]
+        range_high = float(window["high"].max())
+        range_low = float(window["low"].min())
     equilibrium, pd_zone = compute_premium_discount(df_trend, price)
     structure.equilibrium = equilibrium
-    if action == "LONG" and pd_zone != "DISCOUNT":
-        reasons.append(f"premium_discount_long_requires_discount got_{pd_zone}")
-    if action == "SHORT" and pd_zone != "PREMIUM":
-        reasons.append(f"premium_discount_short_requires_premium got_{pd_zone}")
+
+    pd_ok, pd_reason = is_pd_zone_acceptable(
+        action, pd_zone, price, equilibrium, range_high, range_low
+    )
+    if not pd_ok:
+        reasons.append(pd_reason)
 
     bullish = action == "LONG"
     tolerance = atr * Config.RETEST_ZONE_ATR_TOLERANCE
+    nearby_tolerance = tolerance * Config.STRUCTURE_NEARBY_ATR_MULT
 
     sweep_level = _find_sweep_level(df_entry, bullish)
     fvg_low, fvg_high = _find_active_fvg_zone(df_entry, bullish)
@@ -233,11 +299,32 @@ def evaluate_confluence_gate(
     )
     structure.volume_bonus = bool(latest.get("vol_spike"))
 
-    sweep_retest = sweep_level > 0 and _price_in_zone(
-        price, sweep_level, sweep_level, tolerance
+    def _zone_hit(
+        present: bool,
+        low: float,
+        high: float,
+        strict_tol: float,
+        nearby_tol: float,
+    ) -> bool:
+        if not present:
+            return False
+        if low == high and low > 0:
+            return _price_in_zone(price, low, high, strict_tol) or _price_in_zone(
+                price, low, high, nearby_tol
+            )
+        return _price_in_zone(price, low, high, strict_tol) or _price_in_zone(
+            price, low, high, nearby_tol
+        )
+
+    sweep_retest = sweep_level > 0 and _zone_hit(
+        True, sweep_level, sweep_level, tolerance, nearby_tolerance
     )
-    fvg_retest = _price_in_zone(price, fvg_low, fvg_high, tolerance)
-    ob_retest = _price_in_zone(price, ob_low, ob_high, tolerance)
+    fvg_retest = (fvg_low > 0 and fvg_high > 0) and _zone_hit(
+        True, fvg_low, fvg_high, tolerance, nearby_tolerance
+    )
+    ob_retest = (ob_low > 0 and ob_high > 0) and _zone_hit(
+        True, ob_low, ob_high, tolerance, nearby_tolerance
+    )
 
     confluence_hits: list[str] = []
     if sweep_retest:
@@ -329,7 +416,7 @@ def validate_retest_entry(
 ) -> tuple[bool, str]:
     """Ensure live price taps structure zone and has not chased too far."""
     tolerance = atr * Config.RETEST_ZONE_ATR_TOLERANCE
-    bullish = action == "LONG"
+    nearby_tolerance = tolerance * Config.STRUCTURE_NEARBY_ATR_MULT
 
     zones: list[tuple[float, float]] = []
     if structure.sweep_level > 0:
@@ -342,7 +429,11 @@ def validate_retest_entry(
     if not zones:
         return False, "no_entry_zone"
 
-    tapped = any(_price_in_zone(live_price, lo, hi, tolerance) for lo, hi in zones)
+    tapped = any(
+        _price_in_zone(live_price, lo, hi, tolerance)
+        or _price_in_zone(live_price, lo, hi, nearby_tolerance)
+        for lo, hi in zones
+    )
     if not tapped:
         return False, "price_not_in_retest_zone"
 

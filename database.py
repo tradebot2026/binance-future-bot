@@ -242,6 +242,99 @@ class DatabaseManager:
             error_logger.error("Failed to count active trades: %s", exc)
             return 0
 
+    def count_active_trades_by_strategy(self, strategy: str) -> int:
+        placeholders = ",".join("?" for _ in ACTIVE_TRADE_STATUSES)
+        query = (
+            f"SELECT COUNT(*) FROM trades WHERE status IN ({placeholders}) AND strategy = ?"
+        )
+        try:
+            with self.connection() as conn:
+                row = conn.execute(query, (*ACTIVE_TRADE_STATUSES, strategy)).fetchone()
+                return int(row[0]) if row else 0
+        except sqlite3.Error as exc:
+            error_logger.error("Failed to count active trades for %s: %s", strategy, exc)
+            return 0
+
+    def get_strategy_daily_realized_pnl(self, date_str: str, strategy: str) -> float:
+        """Sum realized PnL from closed trades for a strategy on a UTC day."""
+        try:
+            with self.connection() as conn:
+                row = conn.execute(
+                    """
+                    SELECT COALESCE(SUM(pnl), 0.0) FROM trades
+                    WHERE strategy = ?
+                      AND status = 'CLOSED'
+                      AND closed_at IS NOT NULL
+                      AND closed_at LIKE ?
+                    """,
+                    (strategy, f"{date_str}%"),
+                ).fetchone()
+                return safe_float(row[0]) if row else 0.0
+        except sqlite3.Error as exc:
+            error_logger.error(
+                "Failed to fetch strategy daily PnL for %s: %s", strategy, exc
+            )
+            return 0.0
+
+    def count_consecutive_strategy_losses(
+        self, strategy: str, lookback: int = 5
+    ) -> int:
+        if lookback <= 0:
+            return 0
+        try:
+            with self.connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT pnl FROM trades
+                    WHERE strategy = ?
+                      AND status = 'CLOSED'
+                      AND closed_at IS NOT NULL
+                    ORDER BY closed_at DESC
+                    LIMIT ?
+                    """,
+                    (strategy, lookback),
+                ).fetchall()
+        except sqlite3.Error as exc:
+            error_logger.error(
+                "Failed to count consecutive losses for %s: %s", strategy, exc
+            )
+            return 0
+
+        consecutive = 0
+        for row in rows:
+            pnl = safe_float(row[0])
+            if pnl < 0:
+                consecutive += 1
+            else:
+                break
+        return consecutive
+
+    def is_range_entries_paused(self, date_str: str) -> tuple[bool, str]:
+        """Kill-switch: pause RANGE entries after daily loss or consecutive SLs."""
+        from constants import STRATEGY_RANGE_REVERSION
+
+        stats = self.get_daily_stats(date_str) or {}
+        start_balance = safe_float(stats.get("start_balance"))
+        range_pnl = self.get_strategy_daily_realized_pnl(date_str, STRATEGY_RANGE_REVERSION)
+
+        if start_balance > 0:
+            range_pnl_pct = (range_pnl / start_balance) * 100.0
+            if range_pnl_pct <= -Config.RANGE_DAILY_MAX_LOSS_PERCENT:
+                return True, (
+                    f"Range daily loss limit hit ({range_pnl_pct:.2f}% <= "
+                    f"-{Config.RANGE_DAILY_MAX_LOSS_PERCENT:.2f}%)"
+                )
+
+        consec = self.count_consecutive_strategy_losses(
+            STRATEGY_RANGE_REVERSION, Config.RANGE_MAX_CONSECUTIVE_LOSSES
+        )
+        if consec >= Config.RANGE_MAX_CONSECUTIVE_LOSSES:
+            return True, (
+                f"Range consecutive SL limit ({consec}/"
+                f"{Config.RANGE_MAX_CONSECUTIVE_LOSSES})"
+            )
+        return False, ""
+
     def get_open_trades(self) -> List[dict[str, Any]]:
         """Return active trades ordered FIFO."""
         placeholders = ",".join("?" for _ in ACTIVE_TRADE_STATUSES)

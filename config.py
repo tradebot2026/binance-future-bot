@@ -32,7 +32,7 @@ class Config:
     USE_TESTNET: bool = _env_bool("USE_TESTNET", True)
     REQUEST_TIMEOUT: int = _env_int("REQUEST_TIMEOUT", 15)
     MAX_RETRIES: int = _env_int("MAX_RETRIES", 5)
-    MIN_REQUEST_INTERVAL_MS: int = _env_int("MIN_REQUEST_INTERVAL_MS", 100)
+    MIN_REQUEST_INTERVAL_MS: int = _env_int("MIN_REQUEST_INTERVAL_MS", 150)
     ENABLE_STRICT_RATE_LIMIT: bool = _env_bool("ENABLE_STRICT_RATE_LIMIT", True)
     API_BACKOFF_MAX_SECONDS: int = _env_int("API_BACKOFF_MAX_SECONDS", 60)
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -92,9 +92,14 @@ class Config:
     HALF_SIZE_MULTIPLIER: float = _env_float("HALF_SIZE_MULTIPLIER", 0.5)
     VOLUME_BONUS_POINTS: float = _env_float("VOLUME_BONUS_POINTS", 5.0)
     RETEST_LOOKBACK_BARS: int = _env_int("RETEST_LOOKBACK_BARS", 12)
-    RETEST_ZONE_ATR_TOLERANCE: float = _env_float("RETEST_ZONE_ATR_TOLERANCE", 0.25)
-    MAX_CHASE_ATR: float = _env_float("MAX_CHASE_ATR", 0.35)
+    RETEST_ZONE_ATR_TOLERANCE: float = _env_float("RETEST_ZONE_ATR_TOLERANCE", 0.35)
+    MAX_CHASE_ATR: float = _env_float("MAX_CHASE_ATR", 0.45)
     PD_LOOKBACK_BARS: int = _env_int("PD_LOOKBACK_BARS", 48)
+    ALLOW_NEUTRAL_MACRO_SETUPS: bool = _env_bool("ALLOW_NEUTRAL_MACRO_SETUPS", True)
+    NEUTRAL_MACRO_MIN_SCORE: float = _env_float("NEUTRAL_MACRO_MIN_SCORE", 75.0)
+    ALLOW_PD_EQUILIBRIUM: bool = _env_bool("ALLOW_PD_EQUILIBRIUM", True)
+    PD_EQUILIBRIUM_TOLERANCE_PCT: float = _env_float("PD_EQUILIBRIUM_TOLERANCE_PCT", 5.0)
+    STRUCTURE_NEARBY_ATR_MULT: float = _env_float("STRUCTURE_NEARBY_ATR_MULT", 1.5)
     SCORE_HIGH_CONFIDENCE: float = _env_float("HIGH_CONFIDENCE_SCORE", 90.0)
     SCORE_MEDIUM_CONFIDENCE: float = _env_float("MEDIUM_CONFIDENCE_SCORE", 80.0)
     SCORE_LOW_CONFIDENCE: float = _env_float("LOW_CONFIDENCE_SCORE", 70.0)
@@ -108,6 +113,21 @@ class Config:
     MIN_OPPOSING_RR: float = _env_float("MIN_OPPOSING_RR", 1.5)
     SYMBOL_COOLDOWN_MINUTES: int = _env_int("SYMBOL_COOLDOWN_MINUTES", 20)
 
+    # ---------------- Range regime ----------------
+    ENABLE_RANGE_REGIME: bool = _env_bool("ENABLE_RANGE_REGIME", True)
+    MAX_RANGE_POSITIONS: int = _env_int("MAX_RANGE_POSITIONS", 4)
+    RANGE_COOLDOWN_MINUTES: int = _env_int("RANGE_COOLDOWN_MINUTES", 5)
+    RANGE_SIZE_MULTIPLIER: float = _env_float("RANGE_SIZE_MULTIPLIER", 0.5)
+    RANGE_DAILY_MAX_LOSS_PERCENT: float = _env_float("RANGE_DAILY_MAX_LOSS_PERCENT", 3.0)
+    RANGE_MAX_CONSECUTIVE_LOSSES: int = _env_int("RANGE_MAX_CONSECUTIVE_LOSSES", 2)
+    RANGE_REGIME_MAX_ADX_1H: float = _env_float("RANGE_REGIME_MAX_ADX_1H", 22.0)
+    RANGE_EXIT_ADX_15M: float = _env_float("RANGE_EXIT_ADX_15M", 25.0)
+    RANGE_BREAKOUT_ATR_MULT: float = _env_float("RANGE_BREAKOUT_ATR_MULT", 0.3)
+    RANGE_TIME_STOP_BARS: int = _env_int("RANGE_TIME_STOP_BARS", 16)
+    RANGE_EDGE_ATR_TOLERANCE: float = _env_float("RANGE_EDGE_ATR_TOLERANCE", 0.35)
+    RANGE_LOOKBACK_BARS: int = _env_int("RANGE_LOOKBACK_BARS", 48)
+    RANGE_MIN_SCORE: float = _env_float("RANGE_MIN_SCORE", 65.0)
+
     # ---------------- Market filters ----------------
     MIN_24H_VOLUME_USDT: float = _env_float("MIN_24H_VOLUME_USDT", 15_000_000.0)
     MAX_SPREAD_PERCENT: float = _env_float("MAX_SPREAD_PERCENT", 0.15)
@@ -115,9 +135,11 @@ class Config:
     BLACKLIST_SCORE: float = _env_float("BLACKLIST_SCORE", 40.0)
 
     # ---------------- Scanner ----------------
-    MAX_WORKERS: int = _env_int("MAX_WORKERS", 3)
-    SCAN_TIMEOUT_SEC: int = _env_int("SCAN_TIMEOUT_SEC", 45)
-    CANDLE_FETCH_LIMIT: int = _env_int("CANDLE_FETCH_LIMIT", 300)
+    MAX_WORKERS: int = _env_int("MAX_WORKERS", 1)
+    SCAN_TIMEOUT_SEC: int = _env_int("SCAN_TIMEOUT_SEC", 120)
+    SCAN_PAIR_DELAY_SECONDS: float = _env_float("SCAN_PAIR_DELAY_SECONDS", 0.25)
+    SCAN_TIMEFRAME_DELAY_SECONDS: float = _env_float("SCAN_TIMEFRAME_DELAY_SECONDS", 0.05)
+    CANDLE_FETCH_LIMIT: int = _env_int("CANDLE_FETCH_LIMIT", 280)
 
     # ---------------- Ops / VPS ----------------
     HEARTBEAT_SECONDS: int = _env_int("HEARTBEAT_SECONDS", 60)

@@ -12,11 +12,12 @@ import uuid
 from typing import Any, Optional
 
 from config import Config
-from constants import TP1_PORTION, TP2_PORTION, TRADE_STATUS_OPEN
+from constants import TP1_PORTION, TP2_PORTION, TRADE_STATUS_OPEN, is_range_strategy
 from database import DatabaseManager
 from exchange import BinanceExchangeManager, SymbolRules
 from exceptions import OrderExecutionError
 from logger import error_logger, trade_logger
+from range_engine import RangeMetadata, compute_range_sl_tp
 from smc_engine import (
     StructureMetadata,
     check_opposing_liquidity_rr,
@@ -65,13 +66,17 @@ class TradeExecutor:
         sl_price: float,
         rules: SymbolRules,
         score: float = 80.0,
+        strategy: str = "DEFAULT",
     ) -> float:
         """Risk-based position sizing with tiered score multiplier."""
         balance = self.exchange.get_futures_balance()
         if balance <= 0:
             raise OrderExecutionError("Cannot size position: zero or unavailable balance.")
 
-        size_mult = size_multiplier_for_score(score)
+        if is_range_strategy(strategy):
+            size_mult = Config.RANGE_SIZE_MULTIPLIER
+        else:
+            size_mult = size_multiplier_for_score(score)
         if size_mult <= 0:
             return 0.0
 
@@ -203,19 +208,37 @@ class TradeExecutor:
 
         rules = self.exchange.get_symbol_rules(symbol)
         structure = structure_metadata or {}
-        sl, tp1, tp2, tp3 = self.calculate_sl_tp(
-            action, current_price, atr, rules, structure=structure
-        )
+        range_mode = is_range_strategy(strategy)
 
-        opposing = safe_float(structure.get("opposing_liquidity"))
-        rr_ok, rr_reason = check_opposing_liquidity_rr(action, current_price, sl, opposing)
-        if not rr_ok:
-            trade_logger.info("Execution skipped %s: %s", symbol, rr_reason)
-            self.db.log_signal_rejection(symbol, action, score, [rr_reason])
-            return None
+        if range_mode:
+            rmeta = RangeMetadata()
+            for key, value in structure.items():
+                if hasattr(rmeta, key):
+                    setattr(rmeta, key, value)
+            sl, tp1, tp2, tp3 = compute_range_sl_tp(action, current_price, atr, rmeta)
+            sl = round_step_size(sl, rules.tick_size, rules.price_precision)
+            tp1 = round_step_size(tp1, rules.tick_size, rules.price_precision)
+            tp2 = round_step_size(tp2, rules.tick_size, rules.price_precision)
+            tp3 = round_step_size(tp3, rules.tick_size, rules.price_precision)
+        else:
+            sl, tp1, tp2, tp3 = self.calculate_sl_tp(
+                action, current_price, atr, rules, structure=structure
+            )
+            opposing = safe_float(structure.get("opposing_liquidity"))
+            rr_ok, rr_reason = check_opposing_liquidity_rr(
+                action, current_price, sl, opposing
+            )
+            if not rr_ok:
+                trade_logger.info("Execution skipped %s: %s", symbol, rr_reason)
+                self.db.log_signal_rejection(
+                    symbol, action, score, [rr_reason], strategy=strategy
+                )
+                return None
 
         try:
-            quantity = self.calculate_position_size(current_price, sl, rules, score=score)
+            quantity = self.calculate_position_size(
+                current_price, sl, rules, score=score, strategy=strategy
+            )
         except OrderExecutionError as exc:
             error_logger.error("Sizing failed for %s: %s", symbol, exc)
             return None
@@ -234,7 +257,16 @@ class TradeExecutor:
         metadata["trailing_active"] = False
         metadata["best_price"] = current_price
         metadata["structure"] = structure
-        metadata["size_multiplier"] = size_multiplier_for_score(score)
+        metadata["strategy_tag"] = strategy
+        if range_mode:
+            metadata["size_multiplier"] = Config.RANGE_SIZE_MULTIPLIER
+            metadata["range_high"] = safe_float(structure.get("range_high"))
+            metadata["range_low"] = safe_float(structure.get("range_low"))
+            metadata["equilibrium"] = safe_float(structure.get("equilibrium"))
+            metadata["entry_timeframe"] = Config.ENTRY_TIMEFRAME
+            metadata["range_edge"] = structure.get("edge", "")
+        else:
+            metadata["size_multiplier"] = size_multiplier_for_score(score)
         metadata["r_distance"] = abs(current_price - sl)
 
         try:
@@ -261,9 +293,20 @@ class TradeExecutor:
         fill_price = self.exchange.get_fill_price_from_order(
             symbol, response, fallback=current_price
         )
-        sl, tp1, tp2, tp3 = self.calculate_sl_tp(
-            action, fill_price, atr, rules, structure=structure
-        )
+        if range_mode:
+            rmeta = RangeMetadata()
+            for key, value in structure.items():
+                if hasattr(rmeta, key):
+                    setattr(rmeta, key, value)
+            sl, tp1, tp2, tp3 = compute_range_sl_tp(action, fill_price, atr, rmeta)
+            sl = round_step_size(sl, rules.tick_size, rules.price_precision)
+            tp1 = round_step_size(tp1, rules.tick_size, rules.price_precision)
+            tp2 = round_step_size(tp2, rules.tick_size, rules.price_precision)
+            tp3 = round_step_size(tp3, rules.tick_size, rules.price_precision)
+        else:
+            sl, tp1, tp2, tp3 = self.calculate_sl_tp(
+                action, fill_price, atr, rules, structure=structure
+            )
         metadata["best_price"] = fill_price
         metadata["r_distance"] = abs(fill_price - sl)
 
@@ -309,10 +352,11 @@ class TradeExecutor:
             self._persist_orphan_fill(trade_data)
 
         trade_logger.info(
-            "Entry executed | %s %s | qty=%s | fill=%.6f | SL=%.6f | TP1=%.6f | "
+            "Entry executed | %s %s | strategy=%s | qty=%s | fill=%.6f | SL=%.6f | TP1=%.6f | "
             "R=%.6f | size_mult=%.2f | id=%s",
             symbol,
             action,
+            strategy,
             quantity,
             fill_price,
             sl,
@@ -326,6 +370,7 @@ class TradeExecutor:
             "trade_id": trade_id,
             "symbol": symbol,
             "action": action,
+            "strategy": strategy,
             "entry_price": fill_price,
             "stop_loss": sl,
             "take_profit_1": tp1,

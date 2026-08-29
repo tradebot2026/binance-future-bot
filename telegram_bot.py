@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 import telebot
 
 from config import Config
+from constants import strategy_display_label
 from database import DatabaseManager
 from logger import error_logger, system_logger
 from utils import escape_html, safe_float, utc_today_str
@@ -136,8 +137,9 @@ class TelegramManager:
             f"{emoji} <b>NEW TRADE EXECUTED</b>\n\n"
             f"🪙 <b>Pair:</b> {escape_html(symbol)}\n"
             f"🎯 <b>Action:</b> {escape_html(action)}\n"
+            f"🧠 <b>Strategy:</b> {escape_html(strategy_display_label(strategy))}\n"
+            f"🏷 <b>Tag:</b> {escape_html(strategy)}\n"
             f"📊 <b>Score:</b> {score:.1f}\n"
-            f"🧠 <b>Strategy:</b> {escape_html(strategy)}\n"
             f"💵 <b>Entry:</b> {price:.6f}\n"
             f"✅ <b>TP1:</b> {tp1:.6f}\n"
         )
@@ -153,6 +155,7 @@ class TelegramManager:
         symbol: str,
         reason: str,
         pnl: Optional[float] = None,
+        strategy: str = "",
     ) -> None:
         if "TP" in reason.upper():
             emoji = "✅"
@@ -169,6 +172,8 @@ class TelegramManager:
             f"🪙 <b>Pair:</b> {escape_html(symbol)}\n"
             f"📌 <b>Trigger:</b> {escape_html(reason)}"
         )
+        if strategy:
+            msg += f"\n🧠 <b>Strategy:</b> {escape_html(strategy_display_label(strategy))}"
         if pnl is not None:
             msg += f"\n💰 <b>Realized PnL:</b> ${pnl:.4f}"
         self.send_message(msg)
@@ -401,6 +406,7 @@ class TelegramManager:
                 lines.append(
                     f"• {escape_html(trade.get('symbol', '?'))} "
                     f"{escape_html(trade.get('side', '?'))} | "
+                    f"{escape_html(strategy_display_label(str(trade.get('strategy', ''))))} | "
                     f"status={escape_html(str(trade.get('status')))} | "
                     f"entry={safe_float(trade.get('entry_price')):.4f}"
                 )

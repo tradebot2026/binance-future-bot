@@ -15,6 +15,7 @@ from typing import Any, Optional
 from bot_controller import BotController
 from config import Config
 from critical_alerts import CriticalAlertService
+from constants import is_range_strategy
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from exceptions import DatabaseError, ExchangeError, ExchangeRateLimitError, OrderExecutionError
@@ -101,8 +102,11 @@ def _validate_candidate(candidate: dict[str, Any]) -> tuple[bool, str, dict[str,
         return False, f"invalid ATR ({atr})", {}
     if price <= 0:
         return False, f"invalid price ({price})", {}
-    if score < Config.STRATEGY_MIN_SCORE:
-        return False, f"score {score:.1f} below minimum {Config.STRATEGY_MIN_SCORE:.1f}", {}
+    if score < (Config.RANGE_MIN_SCORE if is_range_strategy(strategy) else Config.STRATEGY_MIN_SCORE):
+        min_required = (
+            Config.RANGE_MIN_SCORE if is_range_strategy(strategy) else Config.STRATEGY_MIN_SCORE
+        )
+        return False, f"score {score:.1f} below minimum {min_required:.1f}", {}
 
     normalized = {
         "symbol": symbol,
@@ -176,7 +180,9 @@ def _execute_candidates(
                 system_logger.info("Entry gate closed: %s", gate_reason)
                 break
 
-            allowed, reason = risk.can_open_trade(symbol)
+            allowed, reason = risk.can_open_trade(
+                symbol, strategy=normalized["strategy"]
+            )
             if not allowed:
                 system_logger.info("Skipping %s: %s", symbol, reason)
                 continue
@@ -413,9 +419,9 @@ def main(controller: Optional[BotController] = None) -> str:
             else:
                 allowed, gate_reason = _entries_allowed(scheduler, risk, db)
                 if allowed:
-                    candidates = scanner.scan_market()
+                    smc_candidates = scanner.scan_market()
                     _execute_candidates(
-                        candidates=candidates,
+                        candidates=smc_candidates,
                         executor=executor,
                         risk=risk,
                         scheduler=scheduler,
@@ -423,6 +429,25 @@ def main(controller: Optional[BotController] = None) -> str:
                         tg=tg,
                         critical_alerts=critical_alerts,
                     )
+
+                    if Config.ENABLE_RANGE_REGIME:
+                        range_candidates = scanner.scan_range_market()
+                        if range_candidates:
+                            system_logger.info(
+                                "RANGE scan found %s candidate(s) — SMC has priority; "
+                                "filling up to %s RANGE slots.",
+                                len(range_candidates),
+                                Config.MAX_RANGE_POSITIONS,
+                            )
+                        _execute_candidates(
+                            candidates=range_candidates,
+                            executor=executor,
+                            risk=risk,
+                            scheduler=scheduler,
+                            db=db,
+                            tg=tg,
+                            critical_alerts=critical_alerts,
+                        )
                 elif gate_reason:
                     system_logger.info("Entries paused: %s", gate_reason)
 

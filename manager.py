@@ -11,10 +11,12 @@ from typing import Any, Optional, TYPE_CHECKING
 
 from config import Config
 from constants import (
+    STRATEGY_RANGE_REVERSION,
     TRADE_STATUS_CLOSED,
     TRADE_STATUS_OPEN,
     TRADE_STATUS_TP1_HIT,
     TRADE_STATUS_TP2_HIT,
+    is_range_strategy,
 )
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
@@ -75,12 +77,115 @@ class TradeManager:
                 if fresh:
                     trade = fresh
 
+                if is_range_strategy(str(trade.get("strategy", ""))):
+                    if self._check_range_hard_exits(trade, price):
+                        continue
+
                 if position_side == "LONG":
                     self._manage_long_trade(trade, price)
                 elif position_side == "SHORT":
                     self._manage_short_trade(trade, price)
         except Exception as exc:
             error_logger.error("Trade monitoring failed: %s", exc)
+
+    _TF_BAR_SECONDS: dict[str, int] = {
+        "1m": 60,
+        "3m": 180,
+        "5m": 300,
+        "15m": 900,
+        "30m": 1800,
+        "1h": 3600,
+        "4h": 14400,
+    }
+
+    def _entry_bar_seconds(self, trade: dict[str, Any]) -> int:
+        metadata = self.db.parse_trade_metadata(trade)
+        tf = str(metadata.get("entry_timeframe") or Config.ENTRY_TIMEFRAME)
+        return self._TF_BAR_SECONDS.get(tf, 300)
+
+    def _range_bars_elapsed(self, trade: dict[str, Any]) -> int:
+        opened_at_raw = trade.get("opened_at")
+        if not opened_at_raw:
+            return 0
+        try:
+            opened_at = datetime.fromisoformat(str(opened_at_raw))
+            if opened_at.tzinfo is None:
+                opened_at = opened_at.replace(tzinfo=timezone.utc)
+            elapsed = (utc_now() - opened_at).total_seconds()
+            bar_seconds = self._entry_bar_seconds(trade)
+            return int(elapsed // bar_seconds) if bar_seconds > 0 else 0
+        except ValueError:
+            return 0
+
+    def _fetch_confirm_adx(self, symbol: str) -> float:
+        try:
+            import ta
+
+            df = self.exchange.fetch_historical_candles(
+                symbol, Config.CONFIRM_TIMEFRAME, limit=80
+            )
+            if df.empty or len(df) < 20:
+                return 0.0
+            df = df.copy()
+            df["adx"] = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
+            return safe_float(df["adx"].iloc[-1])
+        except Exception as exc:
+            error_logger.warning("ADX fetch failed for %s: %s", symbol, exc)
+            return 0.0
+
+    def _check_range_hard_exits(self, trade: dict[str, Any], price: float) -> bool:
+        """Range kill rules: ADX breakout, range boundary violation, time stop."""
+        metadata = self.db.parse_trade_metadata(trade)
+        atr = safe_float(metadata.get("atr_at_entry"))
+        range_high = safe_float(metadata.get("range_high"))
+        range_low = safe_float(metadata.get("range_low"))
+
+        if self._range_bars_elapsed(trade) >= Config.RANGE_TIME_STOP_BARS:
+            trade_logger.info(
+                "[%s] RANGE time stop (%s bars).",
+                trade.get("symbol"),
+                Config.RANGE_TIME_STOP_BARS,
+            )
+            self._close_position(
+                trade,
+                quantity=self._remaining_close_quantity(trade),
+                reason="RANGE_TIME_STOP",
+            )
+            return True
+
+        if atr > 0 and range_high > 0 and range_low > 0:
+            breakout_buffer = atr * Config.RANGE_BREAKOUT_ATR_MULT
+            if price > range_high + breakout_buffer or price < range_low - breakout_buffer:
+                trade_logger.info(
+                    "[%s] RANGE boundary breakout exit | price=%.6f range=[%.6f, %.6f]",
+                    trade.get("symbol"),
+                    price,
+                    range_low,
+                    range_high,
+                )
+                self._close_position(
+                    trade,
+                    quantity=self._remaining_close_quantity(trade),
+                    reason="RANGE_BOUNDARY_BREAKOUT",
+                )
+                return True
+
+        adx_15m = self._fetch_confirm_adx(trade["symbol"])
+        if adx_15m >= Config.RANGE_EXIT_ADX_15M:
+            trade_logger.info(
+                "[%s] RANGE ADX exit | 15m ADX=%.1f >= %.1f",
+                trade.get("symbol"),
+                adx_15m,
+                Config.RANGE_EXIT_ADX_15M,
+            )
+            self._close_position(
+                trade,
+                quantity=self._remaining_close_quantity(trade),
+                reason="RANGE_ADX_BREAKOUT",
+            )
+            return True
+
+        return False
 
     def _manage_long_trade(self, trade: dict[str, Any], current_price: float) -> None:
         metadata = self.db.parse_trade_metadata(trade)
@@ -447,10 +552,19 @@ class TradeManager:
                 symbol=symbol,
                 reason=reason,
                 pnl=safe_float(trade.get("pnl")),
+                strategy=str(trade.get("strategy", "")),
             )
 
         outcome = "WIN" if safe_float(trade.get("pnl")) > 0 else "LOSS"
-        if "STOP" in reason.upper():
+        strategy = str(trade.get("strategy", ""))
+        if is_range_strategy(strategy):
+            outcome = "LOSS" if safe_float(trade.get("pnl")) < 0 else outcome
+            self.db.set_symbol_cooldown(
+                symbol,
+                Config.RANGE_COOLDOWN_MINUTES,
+                reason="RANGE_CLOSE",
+            )
+        elif "STOP" in reason.upper():
             outcome = "LOSS"
             self.db.set_symbol_cooldown(
                 symbol,

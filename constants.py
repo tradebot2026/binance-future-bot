@@ -23,6 +23,33 @@ TP1_PORTION: Final[float] = 0.33
 TP2_PORTION: Final[float] = 0.33
 TP3_PORTION: Final[float] = 0.34
 
+# ---------------- Strategy identifiers (persisted on every trade) ----------------
+STRATEGY_SMC_TREND: Final[str] = "SMC_TREND"
+STRATEGY_SMC_LEGACY: Final[str] = "SMC_MULTITF"
+STRATEGY_RANGE_REVERSION: Final[str] = "RANGE_REVERSION"
+
+SMC_STRATEGY_TAGS: Final[tuple[str, ...]] = (
+    STRATEGY_SMC_TREND,
+    STRATEGY_SMC_LEGACY,
+)
+
+
+def is_range_strategy(strategy: str) -> bool:
+    return str(strategy).upper() == STRATEGY_RANGE_REVERSION
+
+
+def is_smc_strategy(strategy: str) -> bool:
+    tag = str(strategy).upper()
+    return tag in SMC_STRATEGY_TAGS or tag == STRATEGY_SMC_LEGACY
+
+
+def strategy_display_label(strategy: str) -> str:
+    if is_range_strategy(strategy):
+        return "RANGE Mode"
+    if is_smc_strategy(strategy):
+        return "SMC Mode"
+    return str(strategy)
+
 # ---------------- Database column whitelist ----------------
 ALLOWED_TRADE_COLUMNS: Final[Set[str]] = {
     "symbol",

@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from config import Config
-from constants import DAILY_STATUS_PAUSED, TRADE_STATUS_CLOSED
+from constants import DAILY_STATUS_PAUSED, STRATEGY_RANGE_REVERSION, TRADE_STATUS_CLOSED, is_range_strategy
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from logger import performance_logger, system_logger, trade_logger
@@ -114,7 +114,9 @@ class RiskManager:
         """Return live open position count from Binance (source of truth)."""
         return self.exchange.get_open_positions_count()
 
-    def can_open_trade(self, symbol: Optional[str] = None) -> tuple[bool, str]:
+    def can_open_trade(
+        self, symbol: Optional[str] = None, strategy: Optional[str] = None
+    ) -> tuple[bool, str]:
         """
         Return (True, '') if a new entry is permitted, else (False, reason).
         Intended to be called immediately before execute_trade().
@@ -123,12 +125,23 @@ class RiskManager:
         if not snapshot.entries_allowed:
             return False, snapshot.block_reason
 
+        if strategy and is_range_strategy(strategy):
+            paused, pause_reason = self.db.is_range_entries_paused(utc_today_str())
+            if paused:
+                return False, pause_reason
+
+            range_open = self.db.count_active_trades_by_strategy(STRATEGY_RANGE_REVERSION)
+            if range_open >= Config.MAX_RANGE_POSITIONS:
+                return False, (
+                    f"Max RANGE positions reached ({range_open}/{Config.MAX_RANGE_POSITIONS})"
+                )
+
         if symbol:
             if self._has_active_trade_for_symbol(symbol):
                 return False, f"Active trade already tracked for {symbol}."
             on_cooldown, cooldown_reason = self.db.is_symbol_on_cooldown(symbol)
             if on_cooldown:
-                return False, f"{symbol} on post-SL cooldown ({cooldown_reason})."
+                return False, f"{symbol} on cooldown ({cooldown_reason})."
             for side in ("LONG", "SHORT"):
                 if self.exchange.has_open_position(symbol, side):
                     return False, (
