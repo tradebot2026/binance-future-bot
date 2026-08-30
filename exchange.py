@@ -114,9 +114,22 @@ class BinanceExchangeManager:
         self._rate_limiter = RateLimiter(Config.MIN_REQUEST_INTERVAL_MS)
         self._balance_cache = BalanceCache()
         self._critical_alerts: Any = None
+        self._market_data: Any = None
+        self._full_init_done = False
 
-        self._configure_account()
-        self.refresh_symbol_rules()
+        ban = self.check_startup_ban()
+        if ban.is_banned:
+            error_logger.critical(
+                "Binance IP ban detected at startup | until=%s | %s",
+                ban.banned_until_iso or "unknown",
+                ban.message,
+            )
+            system_logger.warning(
+                "Deferring account/symbol REST init until ban expires (~%ss).",
+                ban.seconds_remaining,
+            )
+        else:
+            self.ensure_initialized()
 
         mode = "TESTNET" if self.testnet else "MAINNET"
         strict = "ON" if Config.ENABLE_STRICT_RATE_LIMIT else "OFF"
@@ -129,6 +142,47 @@ class BinanceExchangeManager:
     def attach_critical_alerts(self, alerts: Any) -> None:
         """Optional hook for immediate Telegram critical notifications."""
         self._critical_alerts = alerts
+
+    def attach_market_data(self, hub: Any) -> None:
+        """Attach WebSocket + candle cache hub."""
+        self._market_data = hub
+        if hub and hasattr(self, "_startup_ban") and self._startup_ban.is_banned:
+            hub.apply_startup_ban(self._startup_ban)
+
+    def check_startup_ban(self) -> Any:
+        from market_data_hub import BanStatus, check_binance_ban_status
+
+        self._startup_ban = check_binance_ban_status(self.client)
+        return self._startup_ban
+
+    @staticmethod
+    def _init_rest_pause() -> None:
+        if Config.INIT_REST_DELAY_SECONDS > 0:
+            time.sleep(Config.INIT_REST_DELAY_SECONDS)
+
+    def get_startup_ban_status(self) -> Any:
+        return getattr(self, "_startup_ban", None)
+
+    def ensure_initialized(self) -> bool:
+        """Run deferred REST init (account mode + symbol rules) once API is reachable."""
+        if self._full_init_done:
+            return True
+
+        ban = self.get_startup_ban_status()
+        if ban and ban.is_banned:
+            if self._market_data:
+                halted, _ = self._market_data.is_scan_halted()
+                if halted:
+                    return False
+            else:
+                return False
+
+        self._init_rest_pause()
+        self._configure_account()
+        self._init_rest_pause()
+        self.refresh_symbol_rules()
+        self._full_init_done = True
+        return True
 
     # ---------------- Internal helpers ----------------
 
@@ -153,6 +207,10 @@ class BinanceExchangeManager:
             except BinanceAPIException as exc:
                 last_error = exc
                 if self._is_rate_limit_error(exc):
+                    if exc.code == -1003 and self._market_data:
+                        self._market_data.handle_rate_limit_error(exc)
+                        raise ExchangeRateLimitError(str(exc.message)) from exc
+
                     sleep_seconds = self._backoff_seconds(attempt)
                     error_logger.warning(
                         "Rate limit hit (code=%s). Backoff %.1fs (attempt %s/%s).",
@@ -163,6 +221,8 @@ class BinanceExchangeManager:
                     )
                     time.sleep(sleep_seconds)
                     if attempt == Config.MAX_RETRIES:
+                        if self._market_data:
+                            self._market_data.handle_rate_limit_error(exc)
                         if self._critical_alerts:
                             self._critical_alerts.notify(
                                 "RATE_LIMIT",
@@ -338,7 +398,8 @@ class BinanceExchangeManager:
         self, symbol: str, timeframe: str, limit: int | None = None
     ) -> pd.DataFrame:
         fetch_limit = limit or Config.CANDLE_FETCH_LIMIT
-        try:
+
+        def _rest_fetch() -> pd.DataFrame:
             klines = self._throttled_call(
                 self.client.futures_klines,
                 symbol=symbol,
@@ -369,6 +430,25 @@ class BinanceExchangeManager:
             for col in ("open", "high", "low", "close", "volume"):
                 df[col] = pd.to_numeric(df[col], errors="coerce")
             return df[["timestamp", "open", "high", "low", "close", "volume"]]
+
+        if self._market_data:
+            try:
+                return self._market_data.get_candles(
+                    symbol, timeframe, fetch_limit, _rest_fetch
+                )
+            except ExchangeRateLimitError:
+                raise
+            except Exception as exc:
+                error_logger.error(
+                    "Cached candle fetch failed for %s %s: %s",
+                    symbol,
+                    timeframe,
+                    exc,
+                )
+                return pd.DataFrame()
+
+        try:
+            return _rest_fetch()
         except Exception as exc:
             error_logger.error(
                 "Failed to fetch candles for %s %s: %s", symbol, timeframe, exc
@@ -376,6 +456,11 @@ class BinanceExchangeManager:
             return pd.DataFrame()
 
     def get_market_price(self, symbol: str) -> Optional[float]:
+        if self._market_data:
+            cached = self._market_data.get_price(symbol)
+            if cached is not None and cached > 0:
+                return cached
+
         for attempt in range(1, Config.MAX_RETRIES + 1):
             try:
                 ticker = self._throttled_call(
@@ -384,6 +469,8 @@ class BinanceExchangeManager:
                 )
                 price = safe_float(ticker.get("price"))
                 return price if price > 0 else None
+            except ExchangeRateLimitError:
+                raise
             except Exception as exc:
                 error_logger.warning(
                     "Price fetch failed for %s (attempt %s/%s): %s",
@@ -396,46 +483,71 @@ class BinanceExchangeManager:
         return None
 
     def get_book_spread_percent(self, symbol: str) -> Optional[float]:
-        """Bid/ask spread % via bookTicker — used by scanner spread filter."""
+        """Bid/ask spread % via cached bookTicker map when available."""
         try:
-            ticker = self._throttled_call(
-                self.client.futures_orderbook_ticker,
-                symbol=symbol,
-            )
+            book_map = self.get_book_ticker_map()
+            ticker = book_map.get(symbol.upper(), {})
             bid = safe_float(ticker.get("bidPrice"))
             ask = safe_float(ticker.get("askPrice"))
             if bid <= 0 or ask <= 0:
                 return None
             return ((ask - bid) / bid) * 100.0
+        except ExchangeRateLimitError:
+            raise
         except Exception as exc:
             error_logger.warning("Spread fetch failed for %s: %s", symbol, exc)
             return None
 
     def get_24h_quote_volume(self, symbol: str) -> float:
         try:
-            tickers = self._throttled_call(self.client.futures_ticker)
-            for ticker in tickers:
-                if ticker.get("symbol") == symbol:
-                    return safe_float(ticker.get("quoteVolume"))
-            return 0.0
+            if self._market_data and not self._market_data.ws_is_stale():
+                row = self._market_data.get_ticker_map().get(symbol.upper(), {})
+                volume = safe_float(row.get("quoteVolume"))
+                if volume > 0:
+                    return volume
+
+            ticker_map = self.get_futures_ticker_map()
+            row = ticker_map.get(symbol.upper(), {})
+            return safe_float(row.get("quoteVolume"))
+        except ExchangeRateLimitError:
+            raise
         except Exception as exc:
             error_logger.warning("24h volume fetch failed for %s: %s", symbol, exc)
             return 0.0
 
     def get_futures_ticker_map(self) -> dict[str, dict[str, Any]]:
-        """Return all 24h futures tickers keyed by symbol (single API call)."""
+        """Return futures tickers from WebSocket cache, REST fallback if stale."""
+        if self._market_data and not self._market_data.ws_is_stale():
+            cached = self._market_data.get_ticker_map()
+            if cached:
+                return cached
+
         try:
             tickers = self._throttled_call(self.client.futures_ticker)
-            return {str(t["symbol"]): t for t in tickers if t.get("symbol")}
+            result = {str(t["symbol"]): t for t in tickers if t.get("symbol")}
+            if self._market_data and result:
+                self._market_data.seed_tickers_from_rest(result)
+            return result
+        except ExchangeRateLimitError:
+            raise
         except Exception as exc:
             error_logger.error("Failed to fetch futures ticker map: %s", exc)
+            if self._market_data:
+                return self._market_data.get_ticker_map()
             return {}
 
     def get_book_ticker_map(self) -> dict[str, dict[str, Any]]:
-        """Return all book tickers keyed by symbol (single API call)."""
+        """Return book tickers with TTL cache (single REST refresh)."""
+        if self._market_data:
+            return self._market_data.get_book_ticker_map(self._fetch_book_ticker_map_rest)
+        return self._fetch_book_ticker_map_rest()
+
+    def _fetch_book_ticker_map_rest(self) -> dict[str, dict[str, Any]]:
         try:
             tickers = self._throttled_call(self.client.futures_orderbook_ticker)
             return {str(t["symbol"]): t for t in tickers if t.get("symbol")}
+        except ExchangeRateLimitError:
+            raise
         except Exception as exc:
             error_logger.error("Failed to fetch book ticker map: %s", exc)
             return {}

@@ -16,6 +16,7 @@ import ta
 from config import Config
 from constants import STRATEGY_RANGE_REVERSION, STRATEGY_SMC_TREND
 from database import DatabaseManager
+from exceptions import ExchangeRateLimitError
 from exchange import BinanceExchangeManager
 from logger import error_logger, scanner_logger, signal_logger
 from range_engine import evaluate_range_setup
@@ -146,6 +147,12 @@ class MarketScanner:
         self.confirm_tf = Config.CONFIRM_TIMEFRAME
         self.trend_tf = Config.TREND_TIMEFRAME
         self.candle_limit = Config.CANDLE_FETCH_LIMIT
+        self._hub = getattr(exchange, "_market_data", None)
+
+    def _scan_gate_open(self) -> tuple[bool, str]:
+        if self._hub:
+            return self._hub.is_scan_halted()
+        return False, ""
 
     def get_tradable_symbols(self) -> tuple[List[str], dict[str, float]]:
         """Filter universe by volume, spread, and blacklist (two bulk API calls)."""
@@ -209,6 +216,8 @@ class MarketScanner:
                 df = self.exchange.fetch_historical_candles(symbol, timeframe, limit=limit)
                 if not df.empty and len(df) >= MIN_ANALYZER_BARS:
                     return df
+            except ExchangeRateLimitError:
+                raise
             except Exception as exc:
                 if attempt == Config.MAX_RETRIES:
                     raise exc
@@ -379,6 +388,11 @@ class MarketScanner:
 
     def scan_market(self) -> List[Dict[str, Any]]:
         """Run a sequential, rate-limit-aware scan and return top candidates."""
+        halted, halt_reason = self._scan_gate_open()
+        if halted:
+            scanner_logger.warning("SMC scan skipped — %s", halt_reason)
+            return []
+
         scanner_logger.info(
             "Starting market scan cycle (sequential, pair_delay=%.2fs)...",
             Config.SCAN_PAIR_DELAY_SECONDS,
@@ -551,6 +565,11 @@ class MarketScanner:
     def scan_range_market(self) -> List[Dict[str, Any]]:
         """Scan for mean-reversion setups when the market is ranging."""
         if not Config.ENABLE_RANGE_REGIME:
+            return []
+
+        halted, halt_reason = self._scan_gate_open()
+        if halted:
+            scanner_logger.warning("RANGE scan skipped — %s", halt_reason)
             return []
 
         scanner_logger.info(

@@ -291,6 +291,7 @@ def _handle_loop_error(
     consecutive_errors: int,
     tg: Optional[TelegramManager],
     critical_alerts: Optional[CriticalAlertService] = None,
+    market_data: Any = None,
 ) -> int:
     consecutive_errors += 1
     error_logger.error(
@@ -311,7 +312,19 @@ def _handle_loop_error(
             critical_alerts.notify("UNHANDLED_EXCEPTION", str(exc), exc=exc)
 
     if isinstance(exc, ExchangeRateLimitError):
-        sleep_for = min(Config.RESTART_DELAY_SECONDS * 3, Config.API_BACKOFF_MAX_SECONDS)
+        if tg and market_data:
+            ban = market_data.get_ban_status()
+            if ban and ban.is_banned:
+                tg.send_message(market_data.format_ban_message(ban))
+            else:
+                halted, reason = market_data.is_scan_halted()
+                if halted:
+                    tg.send_message(
+                        "🚫 <b>Binance rate limit</b>\n\n"
+                        f"{reason}\n\n"
+                        "<i>Scanning paused; position monitoring continues.</i>"
+                    )
+        sleep_for = Config.RATE_LIMIT_HALT_SECONDS
     elif isinstance(exc, (ExchangeError, DatabaseError)):
         sleep_for = min(Config.RESTART_DELAY_SECONDS * 2, 90)
     else:
@@ -346,6 +359,11 @@ def main(controller: Optional[BotController] = None) -> str:
     db = DatabaseManager()
     exchange = BinanceExchangeManager()
 
+    from market_data_hub import MarketDataHub
+
+    market_data = MarketDataHub(exchange.client)
+    exchange.attach_market_data(market_data)
+
     critical_alerts = CriticalAlertService(db)
     exchange.attach_critical_alerts(critical_alerts)
 
@@ -361,6 +379,22 @@ def main(controller: Optional[BotController] = None) -> str:
     )
     scheduler.telegram = tg
     critical_alerts.attach_telegram(tg)
+
+    startup_ban = exchange.get_startup_ban_status()
+    if startup_ban and startup_ban.is_banned:
+        ban_msg = market_data.format_ban_message(startup_ban)
+        error_logger.critical("Startup ban check: %s", startup_ban.message)
+        system_logger.warning(
+            "Binance IP ban active — scanning halted until ban expires (~%ss).",
+            startup_ban.seconds_remaining,
+        )
+        tg.send_message(ban_msg)
+
+    market_data.start()
+    system_logger.info(
+        "Market data hub online (websocket=%s, candle_cache=bar-aligned).",
+        Config.ENABLE_WEBSOCKET_STREAMS,
+    )
 
     manager = TradeManager(
         exchange=exchange,
@@ -398,6 +432,9 @@ def main(controller: Optional[BotController] = None) -> str:
         loop_started = time.monotonic()
 
         try:
+            # Step 0 — Complete deferred exchange init once ban/halt clears
+            exchange.ensure_initialized()
+
             # Step 1 — Periodic DB/exchange reconciliation (every 15 min)
             now_mono = time.monotonic()
             if now_mono - last_reconciliation >= Config.RECONCILIATION_INTERVAL_SECONDS:
@@ -478,7 +515,7 @@ def main(controller: Optional[BotController] = None) -> str:
             raise
         except Exception as exc:
             consecutive_errors = _handle_loop_error(
-                exc, consecutive_errors, tg, critical_alerts
+                exc, consecutive_errors, tg, critical_alerts, market_data
             )
             continue
 
@@ -495,6 +532,7 @@ def main(controller: Optional[BotController] = None) -> str:
 
     # Graceful shutdown
     monitor_stop.set()
+    market_data.stop()
     tg.send_message("🛑 <b>Bot stopped</b> — trading loop shut down safely.")
     tg.stop_listening()
     system_logger.info("Trading loop stopped gracefully.")
@@ -502,6 +540,7 @@ def main(controller: Optional[BotController] = None) -> str:
     if controller.is_restart_requested():
         controller.clear_restart_flag()
         return "restart"
+
     return "stop"
 
 
