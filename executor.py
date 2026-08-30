@@ -35,6 +35,24 @@ class TradeExecutor:
         self.exchange = exchange
         self.db = db
 
+    def _validate_stop_loss(
+        self, action: str, entry_price: float, sl_price: float
+    ) -> tuple[bool, str]:
+        """Ensure stop loss is on the correct side of entry."""
+        if entry_price <= 0 or sl_price <= 0:
+            return False, "invalid_entry_or_sl_price"
+        if action == "LONG" and sl_price >= entry_price:
+            return (
+                False,
+                f"long_sl_must_be_below_entry entry={entry_price:.6f} sl={sl_price:.6f}",
+            )
+        if action == "SHORT" and sl_price <= entry_price:
+            return (
+                False,
+                f"short_sl_must_be_above_entry entry={entry_price:.6f} sl={sl_price:.6f}",
+            )
+        return True, "ok"
+
     def calculate_sl_tp(
         self,
         action: str,
@@ -220,10 +238,34 @@ class TradeExecutor:
             tp1 = round_step_size(tp1, rules.tick_size, rules.price_precision)
             tp2 = round_step_size(tp2, rules.tick_size, rules.price_precision)
             tp3 = round_step_size(tp3, rules.tick_size, rules.price_precision)
+            sl_ok, sl_reason = self._validate_stop_loss(action, current_price, sl)
+            if not sl_ok:
+                error_logger.error(
+                    "Execution aborted %s %s RANGE: invalid SL — %s",
+                    symbol,
+                    action,
+                    sl_reason,
+                )
+                self.db.log_signal_rejection(
+                    symbol, action, score, [sl_reason], strategy=strategy
+                )
+                return None
         else:
             sl, tp1, tp2, tp3 = self.calculate_sl_tp(
                 action, current_price, atr, rules, structure=structure
             )
+            sl_ok, sl_reason = self._validate_stop_loss(action, current_price, sl)
+            if not sl_ok:
+                error_logger.error(
+                    "Execution aborted %s %s SMC: invalid SL — %s",
+                    symbol,
+                    action,
+                    sl_reason,
+                )
+                self.db.log_signal_rejection(
+                    symbol, action, score, [sl_reason], strategy=strategy
+                )
+                return None
             opposing = safe_float(structure.get("opposing_liquidity"))
             rr_ok, rr_reason = check_opposing_liquidity_rr(
                 action, current_price, sl, opposing
@@ -307,6 +349,21 @@ class TradeExecutor:
             sl, tp1, tp2, tp3 = self.calculate_sl_tp(
                 action, fill_price, atr, rules, structure=structure
             )
+
+        sl_ok, sl_reason = self._validate_stop_loss(action, fill_price, sl)
+        if not sl_ok:
+            error_logger.critical(
+                "Post-fill invalid SL for %s %s — %s | closing orphan position.",
+                symbol,
+                action,
+                sl_reason,
+            )
+            try:
+                self.exchange.close_position_quantity(symbol, position_side, quantity)
+            except Exception as exc:
+                error_logger.error("Failed to close orphan %s: %s", symbol, exc)
+            return None
+
         metadata["best_price"] = fill_price
         metadata["r_distance"] = abs(fill_price - sl)
 

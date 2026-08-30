@@ -176,19 +176,22 @@ def compute_range_sl_tp(
 ) -> tuple[float, float, float, float]:
     """Tight range SL beyond boundary; TPs toward equilibrium and opposite edge."""
     buffer = atr * Config.SL_BUFFER_ATR
+    max_dist = atr * Config.MAX_SL_ATR_MULTIPLIER
 
     if action == "LONG":
-        sl = meta.range_low - buffer
+        boundary_sl = meta.range_low - buffer
+        sl = min(boundary_sl, entry_price - buffer)
+        sl = max(sl, entry_price - max_dist)
         tp1 = meta.equilibrium
         tp2 = meta.equilibrium + (meta.range_high - meta.equilibrium) * 0.5
         tp3 = meta.range_high - buffer
-        sl = max(sl, entry_price - atr * Config.MAX_SL_ATR_MULTIPLIER)
     else:
-        sl = meta.range_high + buffer
+        boundary_sl = meta.range_high + buffer
+        sl = max(boundary_sl, entry_price + buffer)
+        sl = min(sl, entry_price + max_dist)
         tp1 = meta.equilibrium
         tp2 = meta.equilibrium - (meta.equilibrium - meta.range_low) * 0.5
         tp3 = meta.range_low + buffer
-        sl = min(sl, entry_price + atr * Config.MAX_SL_ATR_MULTIPLIER)
 
     r = abs(entry_price - sl)
     if r > 0:

@@ -133,12 +133,78 @@ class TradeManager:
             error_logger.warning("ADX fetch failed for %s: %s", symbol, exc)
             return 0.0
 
-    def _check_range_hard_exits(self, trade: dict[str, Any], price: float) -> bool:
-        """Range kill rules: ADX breakout, range boundary violation, time stop."""
+    def _fetch_entry_tf_last_closed_close(self, symbol: str, trade: dict[str, Any]) -> Optional[float]:
+        """Return the close of the last fully closed entry-TF candle."""
+        metadata = self.db.parse_trade_metadata(trade)
+        tf = str(metadata.get("entry_timeframe") or Config.ENTRY_TIMEFRAME)
+        try:
+            df = self.exchange.fetch_historical_candles(symbol, tf, limit=5)
+            if df.empty or len(df) < 2:
+                return None
+            return safe_float(df.iloc[-2]["close"])
+        except Exception as exc:
+            error_logger.warning(
+                "Failed to fetch closed bar for %s (%s): %s", symbol, tf, exc
+            )
+            return None
+
+    def _check_range_boundary_breakout(self, trade: dict[str, Any]) -> bool:
+        """
+        Exit only when a bar CLOSES beyond the range boundary on a bar AFTER entry.
+        Avoids immediate exit on the entry candle or intra-bar wicks.
+        """
+        if self._range_bars_elapsed(trade) < 1:
+            return False
+
         metadata = self.db.parse_trade_metadata(trade)
         atr = safe_float(metadata.get("atr_at_entry"))
         range_high = safe_float(metadata.get("range_high"))
         range_low = safe_float(metadata.get("range_low"))
+        if atr <= 0 or range_high <= 0 or range_low <= 0:
+            return False
+
+        close = self._fetch_entry_tf_last_closed_close(trade["symbol"], trade)
+        if close is None or close <= 0:
+            return False
+
+        breakout_buffer = atr * Config.RANGE_BREAKOUT_ATR_MULT
+        side = str(trade.get("side", "LONG")).upper()
+
+        if side == "LONG" and close < range_low - breakout_buffer:
+            trade_logger.info(
+                "[%s] RANGE boundary breakout exit (LONG) | close=%.6f range_low=%.6f buffer=%.6f",
+                trade.get("symbol"),
+                close,
+                range_low,
+                breakout_buffer,
+            )
+            self._close_position(
+                trade,
+                quantity=self._remaining_close_quantity(trade),
+                reason="RANGE_BOUNDARY_BREAKOUT",
+            )
+            return True
+
+        if side == "SHORT" and close > range_high + breakout_buffer:
+            trade_logger.info(
+                "[%s] RANGE boundary breakout exit (SHORT) | close=%.6f range_high=%.6f buffer=%.6f",
+                trade.get("symbol"),
+                close,
+                range_high,
+                breakout_buffer,
+            )
+            self._close_position(
+                trade,
+                quantity=self._remaining_close_quantity(trade),
+                reason="RANGE_BOUNDARY_BREAKOUT",
+            )
+            return True
+
+        return False
+
+    def _check_range_hard_exits(self, trade: dict[str, Any], price: float) -> bool:
+        """Range kill rules: ADX breakout, range boundary violation, time stop."""
+        metadata = self.db.parse_trade_metadata(trade)
 
         if self._range_bars_elapsed(trade) >= Config.RANGE_TIME_STOP_BARS:
             trade_logger.info(
@@ -153,22 +219,8 @@ class TradeManager:
             )
             return True
 
-        if atr > 0 and range_high > 0 and range_low > 0:
-            breakout_buffer = atr * Config.RANGE_BREAKOUT_ATR_MULT
-            if price > range_high + breakout_buffer or price < range_low - breakout_buffer:
-                trade_logger.info(
-                    "[%s] RANGE boundary breakout exit | price=%.6f range=[%.6f, %.6f]",
-                    trade.get("symbol"),
-                    price,
-                    range_low,
-                    range_high,
-                )
-                self._close_position(
-                    trade,
-                    quantity=self._remaining_close_quantity(trade),
-                    reason="RANGE_BOUNDARY_BREAKOUT",
-                )
-                return True
+        if self._check_range_boundary_breakout(trade):
+            return True
 
         adx_15m = self._fetch_confirm_adx(trade["symbol"])
         if adx_15m >= Config.RANGE_EXIT_ADX_15M:
