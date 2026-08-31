@@ -520,9 +520,33 @@ def check_opposing_liquidity_rr(
     return True, "rr_ok"
 
 
+def is_multi_confluence(confluence_type: str) -> bool:
+    """True when two or more SMC retest confluences are stacked (e.g. SWEEP+OB)."""
+    if not confluence_type:
+        return False
+    hits = [part.strip() for part in str(confluence_type).split("+") if part.strip()]
+    return len(hits) >= 2
+
+
+def effective_smc_min_score(confluence_type: str, macro_trend: str) -> float:
+    """
+    Tiered SMC score floor: multi-confluence setups may use a lower threshold
+    because stacked structure retests carry higher historical edge.
+    """
+    if is_multi_confluence(confluence_type):
+        min_score = Config.MULTI_CONFLUENCE_MIN_SCORE
+    else:
+        min_score = Config.STRATEGY_MIN_SCORE
+        if macro_trend == "NEUTRAL" and Config.ALLOW_NEUTRAL_MACRO_SETUPS:
+            min_score = max(min_score, Config.NEUTRAL_MACRO_MIN_SCORE)
+    return min_score
+
+
 def size_multiplier_for_score(score: float) -> float:
     if score >= Config.SCORE_FULL_SIZE:
         return 1.0
     if score >= Config.STRATEGY_MIN_SCORE:
+        return Config.HALF_SIZE_MULTIPLIER
+    if score >= Config.MULTI_CONFLUENCE_MIN_SCORE:
         return Config.HALF_SIZE_MULTIPLIER
     return 0.0

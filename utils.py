@@ -31,6 +31,36 @@ def round_step_size(value: float, step_size: float, precision: int) -> float:
     return round(rounded, precision)
 
 
+def round_step_size_up(value: float, step_size: float, precision: int) -> float:
+    """Ceil a value to the next valid exchange step size."""
+    if step_size <= 0:
+        return round(value, precision)
+    if value <= 0:
+        return round(step_size, precision)
+    rounded = math.ceil(value / step_size - 1e-12) * step_size
+    return round(rounded, precision)
+
+
+def amount_to_precision(
+    quantity: float, step_size: float, quantity_precision: int
+) -> float:
+    """
+    CCXT-compatible quantity precision: floor to step size and decimal precision.
+    """
+    return round_step_size(quantity, step_size, quantity_precision)
+
+
+def minimum_order_quantity(
+    entry_price: float, min_qty: float, min_notional: float, step_size: float, precision: int
+) -> float:
+    """Smallest valid quantity satisfying Binance min_qty and min_notional."""
+    if entry_price <= 0:
+        return round_step_size_up(min_qty, step_size, precision)
+    notional_qty = min_notional / entry_price
+    raw_min = max(min_qty, notional_qty)
+    return round_step_size_up(raw_min, step_size, precision)
+
+
 def escape_html(text: object) -> str:
     """Escape dynamic text for Telegram HTML parse mode."""
     return html.escape(str(text), quote=False)

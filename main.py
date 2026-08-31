@@ -16,6 +16,7 @@ from bot_controller import BotController
 from config import Config
 from critical_alerts import CriticalAlertService
 from constants import is_range_strategy
+from smc_engine import effective_smc_min_score
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from exceptions import DatabaseError, ExchangeError, ExchangeRateLimitError, OrderExecutionError
@@ -102,10 +103,17 @@ def _validate_candidate(candidate: dict[str, Any]) -> tuple[bool, str, dict[str,
         return False, f"invalid ATR ({atr})", {}
     if price <= 0:
         return False, f"invalid price ({price})", {}
-    if score < (Config.RANGE_MIN_SCORE if is_range_strategy(strategy) else Config.STRATEGY_MIN_SCORE):
-        min_required = (
-            Config.RANGE_MIN_SCORE if is_range_strategy(strategy) else Config.STRATEGY_MIN_SCORE
+    if is_range_strategy(strategy):
+        min_required = Config.RANGE_MIN_SCORE
+    else:
+        structure = candidate.get("structure_metadata") or {}
+        confluence = str(
+            candidate.get("confluence") or structure.get("confluence_type", "")
         )
+        macro = str(candidate.get("macro_trend") or structure.get("macro_trend", "NEUTRAL"))
+        min_required = effective_smc_min_score(confluence, macro)
+
+    if score < min_required:
         return False, f"score {score:.1f} below minimum {min_required:.1f}", {}
 
     normalized = {

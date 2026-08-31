@@ -56,6 +56,8 @@ class TradeManager:
             if not active_trades:
                 return
 
+            self.exchange.ensure_positions_cached()
+
             for trade in active_trades:
                 symbol = trade["symbol"]
                 position_side = trade.get("side", "LONG")
@@ -609,21 +611,47 @@ class TradeManager:
 
         outcome = "WIN" if safe_float(trade.get("pnl")) > 0 else "LOSS"
         strategy = str(trade.get("strategy", ""))
+        pnl = safe_float(trade.get("pnl"))
+        reason_upper = reason.upper()
+
+        soft_exit = reason in (
+            "RANGE_TIME_STOP",
+            "RANGE_BOUNDARY_BREAKOUT",
+        ) and pnl >= 0
+
         if is_range_strategy(strategy):
-            outcome = "LOSS" if safe_float(trade.get("pnl")) < 0 else outcome
-            self.db.set_symbol_cooldown(
-                symbol,
-                Config.RANGE_COOLDOWN_MINUTES,
-                reason="RANGE_CLOSE",
-            )
-        elif "STOP" in reason.upper():
+            if reason == "STOP_LOSS" or (pnl < 0 and "STOP" in reason_upper):
+                self.db.set_symbol_cooldown(
+                    symbol,
+                    Config.RANGE_COOLDOWN_MINUTES,
+                    reason="RANGE_STOP_LOSS",
+                )
+            elif soft_exit:
+                self.db.set_symbol_cooldown(
+                    symbol,
+                    Config.RANGE_COOLDOWN_SOFT_MINUTES,
+                    reason="RANGE_SOFT_EXIT",
+                )
+            else:
+                self.db.set_symbol_cooldown(
+                    symbol,
+                    Config.RANGE_COOLDOWN_MINUTES,
+                    reason="RANGE_CLOSE",
+                )
+        elif reason == "STOP_LOSS" or (pnl < 0 and "STOP" in reason_upper):
             outcome = "LOSS"
             self.db.set_symbol_cooldown(
                 symbol,
                 Config.SYMBOL_COOLDOWN_MINUTES,
                 reason="STOP_LOSS",
             )
-        elif safe_float(trade.get("pnl")) > 0:
+        elif soft_exit:
+            self.db.set_symbol_cooldown(
+                symbol,
+                Config.SYMBOL_COOLDOWN_SOFT_MINUTES,
+                reason="SOFT_EXIT",
+            )
+        elif pnl > 0:
             outcome = "WIN"
 
         self.db.record_signal_outcome(trade_id, outcome)

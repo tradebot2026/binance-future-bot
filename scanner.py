@@ -21,6 +21,7 @@ from exchange import BinanceExchangeManager
 from logger import error_logger, scanner_logger, signal_logger
 from range_engine import evaluate_range_setup
 from smc_engine import (
+    effective_smc_min_score,
     evaluate_confluence_gate,
     score_setup,
     validate_retest_entry,
@@ -148,6 +149,8 @@ class MarketScanner:
         self.trend_tf = Config.TREND_TIMEFRAME
         self.candle_limit = Config.CANDLE_FETCH_LIMIT
         self._hub = getattr(exchange, "_market_data", None)
+        self._scan_priority: list[str] = []
+        self._near_miss_scores: dict[str, float] = {}
 
     def _scan_gate_open(self) -> tuple[bool, str]:
         if self._hub:
@@ -197,11 +200,14 @@ class MarketScanner:
                 tradable.append((symbol, volume_24h))
 
             tradable.sort(key=lambda item: item[1], reverse=True)
-            symbols = [s for s, _ in tradable[: Config.MAX_SCAN_UNIVERSE]]
+            symbols = self._prioritize_symbols(
+                [s for s, _ in tradable[: Config.MAX_SCAN_UNIVERSE]]
+            )
             scanner_logger.info(
-                "Universe filtered: %s tradable (top %s by volume).",
+                "Universe filtered: %s tradable (top %s by volume, %s priority).",
                 len(symbols),
                 Config.MAX_SCAN_UNIVERSE,
+                min(len(self._scan_priority), len(symbols)),
             )
             return symbols, price_map
         except Exception as exc:
@@ -223,6 +229,105 @@ class MarketScanner:
                     raise exc
                 time.sleep(0.5)
         return pd.DataFrame()
+
+    def _prioritize_symbols(self, symbols: list[str]) -> list[str]:
+        """Rescan near-miss symbols (65-69 prior cycle) before the rest of the universe."""
+        if not self._scan_priority:
+            return symbols
+        priority_set = set(self._scan_priority)
+        front = [s for s in self._scan_priority if s in symbols]
+        rest = [s for s in symbols if s not in priority_set]
+        return front + rest
+
+    def _note_near_miss(self, symbol: str, score: float) -> None:
+        if Config.NEAR_MISS_SCORE_MIN <= score <= Config.NEAR_MISS_SCORE_MAX:
+            prev = self._near_miss_scores.get(symbol, 0.0)
+            if score >= prev:
+                self._near_miss_scores[symbol] = score
+
+    def _finalize_scan_priority(self) -> None:
+        ranked = sorted(
+            self._near_miss_scores.items(),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        self._scan_priority = [
+            symbol for symbol, _ in ranked[: Config.NEAR_MISS_PRIORITY_MAX]
+        ]
+        if self._scan_priority:
+            scanner_logger.info(
+                "Near-miss priority queue updated (%s symbols).",
+                len(self._scan_priority),
+            )
+        self._near_miss_scores.clear()
+
+    def _pick_directional_candidate(
+        self,
+        symbol: str,
+        long_candidate: Dict[str, Any],
+        short_candidate: Dict[str, Any],
+        long_score: float,
+        short_score: float,
+        *,
+        win_margin: float,
+        resolve_margin: float,
+        min_score_fn: Any,
+    ) -> Dict[str, Any]:
+        """Pick LONG/SHORT winner or resolve equilibrium in neutral/choppy regimes."""
+        neutral = {"symbol": symbol, "score": 0.0, "action": "NEUTRAL"}
+
+        if long_score <= 0 and short_score <= 0:
+            return neutral
+
+        if long_score > 0 and short_score <= 0:
+            return long_candidate
+        if short_score > 0 and long_score <= 0:
+            return short_candidate
+
+        gap = abs(long_score - short_score)
+        winner = long_candidate if long_score >= short_score else short_candidate
+        winner_score = max(long_score, short_score)
+        loser_score = min(long_score, short_score)
+
+        if gap >= win_margin:
+            signal_logger.info(
+                "Direction winner | %s LONG=%.1f SHORT=%.1f gap=%.1f",
+                symbol,
+                long_score,
+                short_score,
+                gap,
+            )
+            return long_candidate if long_score > short_score else short_candidate
+
+        if (
+            Config.ENABLE_DIRECTION_EQUILIBRIUM_RESOLVE
+            and gap >= resolve_margin
+            and winner.get("macro_trend", "NEUTRAL") == "NEUTRAL"
+        ):
+            confluence = str(winner.get("confluence", ""))
+            min_required = min_score_fn(confluence, "NEUTRAL")
+            if winner_score >= min_required:
+                signal_logger.info(
+                    "Equilibrium resolved | %s %s score=%.1f vs %.1f gap=%.1f min=%.1f",
+                    symbol,
+                    winner.get("action"),
+                    winner_score,
+                    loser_score,
+                    gap,
+                    min_required,
+                )
+                return winner
+
+        self._note_near_miss(symbol, winner_score)
+        signal_logger.info(
+            "Equilibrium skip | %s LONG=%.1f SHORT=%.1f gap=%.1f (<%.1f)",
+            symbol,
+            long_score,
+            short_score,
+            gap,
+            resolve_margin,
+        )
+        return neutral
 
     def _fetch_symbol_timeframes(self, symbol: str) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
         """Fetch entry/confirm/trend candles with small pauses between requests."""
@@ -284,11 +389,12 @@ class MarketScanner:
             return neutral
 
         score = score_setup(action, latest, previous, gate.structure, gate.structure.macro_trend)
-        min_score = Config.STRATEGY_MIN_SCORE
-        if gate.structure.macro_trend == "NEUTRAL" and Config.ALLOW_NEUTRAL_MACRO_SETUPS:
-            min_score = max(min_score, Config.NEUTRAL_MACRO_MIN_SCORE)
+        min_score = effective_smc_min_score(
+            gate.structure.confluence_type, gate.structure.macro_trend
+        )
 
         if score < min_score:
+            self._note_near_miss(symbol, score)
             reason = f"score_below_min_{score:.1f}_required_{min_score:.1f}"
             self.db.log_signal_rejection(symbol, action, score, [reason])
             signal_logger.info(
@@ -366,21 +472,16 @@ class MarketScanner:
             long_score = safe_float(long_candidate.get("score"))
             short_score = safe_float(short_candidate.get("score"))
 
-            if long_score <= 0 and short_score <= 0:
-                return neutral
-
-            if abs(long_score - short_score) < 5.0:
-                signal_logger.info(
-                    "Equilibrium | %s LONG=%.1f SHORT=%.1f — skipped.",
-                    symbol,
-                    long_score,
-                    short_score,
-                )
-                return neutral
-
-            if long_score > short_score:
-                return long_candidate
-            return short_candidate
+            return self._pick_directional_candidate(
+                symbol,
+                long_candidate,
+                short_candidate,
+                long_score,
+                short_score,
+                win_margin=Config.DIRECTION_WIN_MARGIN,
+                resolve_margin=Config.DIRECTION_EQUILIBRIUM_MIN_MARGIN,
+                min_score_fn=effective_smc_min_score,
+            )
 
         except Exception as exc:
             error_logger.error("Evaluation failed for %s: %s", symbol, exc)
@@ -420,9 +521,14 @@ class MarketScanner:
             result = self.evaluate_single_symbol(symbol, price_map=price_map)
             scanned += 1
 
+            result_score = safe_float(result.get("score"))
+            result_confluence = str(result.get("confluence", ""))
+            result_macro = str(result.get("macro_trend", "NEUTRAL"))
+            min_required = effective_smc_min_score(result_confluence, result_macro)
+
             if (
                 result.get("action") not in (None, "NEUTRAL")
-                and safe_float(result.get("score")) >= Config.STRATEGY_MIN_SCORE
+                and result_score >= min_required
             ):
                 candidates.append(result)
                 self.db.log_signal(
@@ -468,6 +574,7 @@ class MarketScanner:
                 rejection_stats.get("neutral", 0),
             )
 
+        self._finalize_scan_priority()
         scanner_logger.info("Scan finished in %.2fs.", time.time() - started)
         return top
 
@@ -553,11 +660,20 @@ class MarketScanner:
             )
             long_score = safe_float(long_c.get("score"))
             short_score = safe_float(short_c.get("score"))
-            if long_score <= 0 and short_score <= 0:
-                return neutral
-            if abs(long_score - short_score) < 3.0:
-                return neutral
-            return long_c if long_score > short_score else short_c
+
+            def _range_min_score(_confluence: str, _macro: str) -> float:
+                return Config.RANGE_MIN_SCORE
+
+            return self._pick_directional_candidate(
+                symbol,
+                long_c,
+                short_c,
+                long_score,
+                short_score,
+                win_margin=Config.DIRECTION_EQUILIBRIUM_MIN_MARGIN,
+                resolve_margin=Config.DIRECTION_EQUILIBRIUM_MIN_MARGIN,
+                min_score_fn=_range_min_score,
+            )
         except Exception as exc:
             error_logger.error("Range evaluation failed for %s: %s", symbol, exc)
             return neutral
@@ -629,5 +745,6 @@ class MarketScanner:
                 "RANGE scan complete — no candidates (scanned=%s).", scanned
             )
 
+        self._finalize_scan_priority()
         scanner_logger.info("RANGE scan finished in %.2fs.", time.time() - started)
         return top

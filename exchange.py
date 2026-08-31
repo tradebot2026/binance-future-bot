@@ -8,7 +8,7 @@ from __future__ import annotations
 import random
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional
 
 import pandas as pd
@@ -18,7 +18,7 @@ from binance.exceptions import BinanceAPIException, BinanceOrderException
 from config import Config
 from exceptions import ExchangeError, ExchangeRateLimitError, OrderExecutionError
 from logger import error_logger, system_logger, trade_logger
-from utils import round_step_size, safe_float
+from utils import amount_to_precision, round_step_size, safe_float
 
 
 @dataclass
@@ -56,6 +56,19 @@ class BalanceCache:
 
     def invalidate(self) -> None:
         self.updated_at = 0.0
+
+
+@dataclass
+class PositionCache:
+    """TTL cache for bulk futures_position_information REST responses."""
+
+    positions: list[dict[str, Any]] = field(default_factory=list)
+    unrealized_pnl_total: float = 0.0
+    updated_at: float = 0.0
+    ttl_seconds: int = Config.POSITION_CACHE_TTL_SECONDS
+
+    def is_valid(self) -> bool:
+        return self.updated_at > 0 and (time.monotonic() - self.updated_at) < self.ttl_seconds
 
 
 class RateLimiter:
@@ -113,6 +126,9 @@ class BinanceExchangeManager:
         self._leverage_cache: dict[str, int] = {}
         self._rate_limiter = RateLimiter(Config.MIN_REQUEST_INTERVAL_MS)
         self._balance_cache = BalanceCache()
+        self._position_cache = PositionCache()
+        self._position_refresh_lock = threading.Lock()
+        self._position_backoff_until: float = 0.0
         self._critical_alerts: Any = None
         self._market_data: Any = None
         self._full_init_done = False
@@ -357,6 +373,67 @@ class BinanceExchangeManager:
 
     def invalidate_balance_cache(self) -> None:
         self._balance_cache.invalidate()
+
+    def invalidate_position_cache(self) -> None:
+        self._position_cache.updated_at = 0.0
+
+    def _parse_open_positions(self, raw_positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        open_positions: list[dict[str, Any]] = []
+        unrealized_total = 0.0
+        for pos in raw_positions:
+            quantity = abs(safe_float(pos.get("positionAmt")))
+            if quantity <= 0:
+                continue
+            unrealized = safe_float(pos.get("unRealizedProfit"))
+            unrealized_total += unrealized
+            open_positions.append(
+                {
+                    "symbol": str(pos.get("symbol", "")),
+                    "positionSide": str(pos.get("positionSide", "")),
+                    "quantity": quantity,
+                    "entry_price": safe_float(pos.get("entryPrice")),
+                    "unrealized_pnl": unrealized,
+                }
+            )
+        self._position_cache.positions = open_positions
+        self._position_cache.unrealized_pnl_total = unrealized_total
+        self._position_cache.updated_at = time.monotonic()
+        return open_positions
+
+    def _refresh_positions_cache(self, force: bool = False) -> list[dict[str, Any]]:
+        """
+        Bulk-fetch open positions at most once per POSITION_CACHE_TTL_SECONDS.
+        On -1003, backs off and serves the last cached snapshot if available.
+        """
+        now = time.monotonic()
+        if not force and self._position_cache.is_valid():
+            return self._position_cache.positions
+
+        if now < self._position_backoff_until:
+            return self._position_cache.positions
+
+        with self._position_refresh_lock:
+            if not force and self._position_cache.is_valid():
+                return self._position_cache.positions
+
+            try:
+                raw = self._throttled_call(self.client.futures_position_information)
+                return self._parse_open_positions(raw or [])
+            except ExchangeRateLimitError as exc:
+                self._position_backoff_until = now + Config.POSITION_CACHE_BACKOFF_SECONDS
+                error_logger.warning(
+                    "Position cache refresh rate-limited — using stale cache for %ss: %s",
+                    Config.POSITION_CACHE_BACKOFF_SECONDS,
+                    exc,
+                )
+                return self._position_cache.positions
+            except Exception as exc:
+                error_logger.error("Failed to refresh position cache: %s", exc)
+                return self._position_cache.positions
+
+    def ensure_positions_cached(self, force: bool = False) -> None:
+        """Warm position cache once per monitor/risk cycle."""
+        self._refresh_positions_cache(force=force)
 
     def get_futures_balance(self, force_refresh: bool = False) -> float:
         """
@@ -608,50 +685,22 @@ class BinanceExchangeManager:
 
     # ---------------- Positions ----------------
 
-    def fetch_open_positions(self) -> list[dict[str, Any]]:
+    def fetch_open_positions(self, force_refresh: bool = False) -> list[dict[str, Any]]:
         """Alias for get_all_open_positions — live exchange state."""
-        return self.get_all_open_positions()
+        return self.get_all_open_positions(force_refresh=force_refresh)
 
-    def get_open_positions_count(self) -> int:
+    def get_open_positions_count(self, force_refresh: bool = False) -> int:
         """Count non-zero hedge-mode positions on the exchange."""
-        return len(self.fetch_open_positions())
+        return len(self.get_all_open_positions(force_refresh=force_refresh))
 
-    def get_all_open_positions(self) -> list[dict[str, Any]]:
-        """Return all non-zero hedge-mode positions from the exchange."""
-        try:
-            positions = self._throttled_call(self.client.futures_position_information)
-            open_positions: list[dict[str, Any]] = []
-            for pos in positions:
-                quantity = abs(safe_float(pos.get("positionAmt")))
-                if quantity <= 0:
-                    continue
-                open_positions.append(
-                    {
-                        "symbol": str(pos.get("symbol", "")),
-                        "positionSide": str(pos.get("positionSide", "")),
-                        "quantity": quantity,
-                        "entry_price": safe_float(pos.get("entryPrice")),
-                        "unrealized_pnl": safe_float(pos.get("unRealizedProfit")),
-                    }
-                )
-            return open_positions
-        except Exception as exc:
-            error_logger.error("Failed to fetch all open positions: %s", exc)
-            return []
+    def get_all_open_positions(self, force_refresh: bool = False) -> list[dict[str, Any]]:
+        """Return cached non-zero hedge-mode positions (REST refresh throttled)."""
+        return self._refresh_positions_cache(force=force_refresh)
 
-    def get_unrealized_pnl_total(self) -> float:
-        """Sum mark-to-market PnL across all open exchange positions."""
-        try:
-            positions = self._throttled_call(self.client.futures_position_information)
-            total = 0.0
-            for pos in positions:
-                if abs(safe_float(pos.get("positionAmt"))) <= 0:
-                    continue
-                total += safe_float(pos.get("unRealizedProfit"))
-            return total
-        except Exception as exc:
-            error_logger.error("Failed to fetch unrealized PnL: %s", exc)
-            return 0.0
+    def get_unrealized_pnl_total(self, force_refresh: bool = False) -> float:
+        """Sum unrealized PnL from the shared position cache."""
+        self._refresh_positions_cache(force=force_refresh)
+        return self._position_cache.unrealized_pnl_total
 
     def get_fill_price_from_order(
         self, symbol: str, order_response: dict[str, Any], fallback: float
@@ -690,33 +739,20 @@ class BinanceExchangeManager:
         return fallback
 
     def has_open_position(self, symbol: str, position_side: str) -> bool:
-        try:
-            positions = self._throttled_call(
-                self.client.futures_position_information,
-                symbol=symbol,
-            )
-            for pos in positions:
-                if pos.get("positionSide") == position_side:
-                    if safe_float(pos.get("positionAmt")) != 0.0:
-                        return True
-            return False
-        except Exception as exc:
-            error_logger.error("Position check failed for %s: %s", symbol, exc)
-            return False
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        for pos in self._refresh_positions_cache():
+            if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
+                return safe_float(pos.get("quantity")) > 0
+        return False
 
     def get_position_quantity(self, symbol: str, position_side: str) -> float:
-        try:
-            positions = self._throttled_call(
-                self.client.futures_position_information,
-                symbol=symbol,
-            )
-            for pos in positions:
-                if pos.get("positionSide") == position_side:
-                    return abs(safe_float(pos.get("positionAmt")))
-            return 0.0
-        except Exception as exc:
-            error_logger.error("Position size fetch failed for %s: %s", symbol, exc)
-            return 0.0
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        for pos in self._refresh_positions_cache():
+            if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
+                return safe_float(pos.get("quantity"))
+        return 0.0
 
     # ---------------- Orders ----------------
 
@@ -730,7 +766,7 @@ class BinanceExchangeManager:
         reduce_only: bool = False,
     ) -> Optional[dict[str, Any]]:
         rules = self.get_symbol_rules(symbol)
-        clean_qty = round_step_size(
+        clean_qty = amount_to_precision(
             quantity, rules.step_size, rules.quantity_precision
         )
         if clean_qty < rules.min_qty:
@@ -766,6 +802,7 @@ class BinanceExchangeManager:
                 **self.recv_window_param,
             )
             self.invalidate_balance_cache()
+            self.invalidate_position_cache()
             trade_logger.info(
                 "Order filled | %s | %s %s | qty=%s | reduce_only=%s",
                 symbol,
@@ -820,4 +857,5 @@ class BinanceExchangeManager:
             quantity=quantity,
         )
         self.invalidate_balance_cache()
+        self.invalidate_position_cache()
         return response

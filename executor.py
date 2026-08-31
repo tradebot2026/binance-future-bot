@@ -25,7 +25,13 @@ from smc_engine import (
     compute_structural_sl,
     size_multiplier_for_score,
 )
-from utils import round_step_size, safe_float, utc_now
+from utils import (
+    amount_to_precision,
+    minimum_order_quantity,
+    round_step_size,
+    safe_float,
+    utc_now,
+)
 
 
 class TradeExecutor:
@@ -104,10 +110,50 @@ class TradeExecutor:
             return 0.0
 
         quantity = risk_amount / sl_distance
-        quantity = round_step_size(quantity, rules.step_size, rules.quantity_precision)
+        quantity = amount_to_precision(quantity, rules.step_size, rules.quantity_precision)
+
+        min_valid_qty = minimum_order_quantity(
+            entry_price,
+            rules.min_qty,
+            rules.min_notional,
+            rules.step_size,
+            rules.quantity_precision,
+        )
+        max_notional = balance * Config.MAX_POSITION_VALUE_MULTIPLIER
+
+        if quantity <= 0 or quantity < rules.min_qty:
+            bumped_risk = min_valid_qty * sl_distance
+            bumped_notional = min_valid_qty * entry_price
+            if (
+                min_valid_qty >= rules.min_qty
+                and bumped_notional >= rules.min_notional
+                and bumped_notional <= max_notional
+                and bumped_risk <= risk_amount * Config.MIN_NOTIONAL_RISK_TOLERANCE
+            ):
+                trade_logger.info(
+                    "Quantity bumped to exchange minimum | raw=%.8f -> min=%.8f | "
+                    "notional=$%.2f risk=$%.2f (budget=$%.2f)",
+                    quantity,
+                    min_valid_qty,
+                    bumped_notional,
+                    bumped_risk,
+                    risk_amount,
+                )
+                quantity = min_valid_qty
+            else:
+                trade_logger.warning(
+                    "Quantity %.8f below min_qty %.8f and minimum bump disallowed "
+                    "(notional=$%.2f max=$%.2f risk=$%.2f budget=$%.2f).",
+                    quantity,
+                    rules.min_qty,
+                    min_valid_qty * entry_price,
+                    max_notional,
+                    min_valid_qty * sl_distance,
+                    risk_amount,
+                )
+                return 0.0
 
         notional = quantity * entry_price
-        max_notional = balance * Config.MAX_POSITION_VALUE_MULTIPLIER
         if notional > max_notional:
             trade_logger.warning(
                 "Position size capped: notional $%.2f exceeds limit $%.2f.",
@@ -116,17 +162,25 @@ class TradeExecutor:
             )
             return 0.0
 
-        if quantity < rules.min_qty:
-            trade_logger.warning(
-                "Quantity %.8f below min_qty %.8f.", quantity, rules.min_qty
-            )
-            return 0.0
-
         if notional < rules.min_notional:
-            trade_logger.warning(
-                "Notional $%.2f below minimum $%.2f.", notional, rules.min_notional
-            )
-            return 0.0
+            if (
+                min_valid_qty > quantity
+                and (min_valid_qty * entry_price) <= max_notional
+                and (min_valid_qty * sl_distance)
+                <= risk_amount * Config.MIN_NOTIONAL_RISK_TOLERANCE
+            ):
+                quantity = min_valid_qty
+                notional = quantity * entry_price
+                trade_logger.info(
+                    "Notional bumped to minimum | qty=%.8f notional=$%.2f",
+                    quantity,
+                    notional,
+                )
+            else:
+                trade_logger.warning(
+                    "Notional $%.2f below minimum $%.2f.", notional, rules.min_notional
+                )
+                return 0.0
 
         return quantity
 
