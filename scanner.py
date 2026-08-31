@@ -151,6 +151,7 @@ class MarketScanner:
         self._hub = getattr(exchange, "_market_data", None)
         self._scan_priority: list[str] = []
         self._near_miss_scores: dict[str, float] = {}
+        self._last_universe_symbols: list[str] = []
 
     def _scan_gate_open(self) -> tuple[bool, str]:
         if self._hub:
@@ -181,19 +182,28 @@ class MarketScanner:
                 book = book_map.get(symbol, {})
                 bid = safe_float(book.get("bidPrice"))
                 ask = safe_float(book.get("askPrice"))
-                if bid <= 0 or ask <= 0:
-                    continue
+                last_price = safe_float(ticker.get("lastPrice"))
 
-                spread_pct = ((ask - bid) / bid) * 100.0
-                if spread_pct > Config.MAX_SPREAD_PERCENT:
+                if bid > 0 and ask > 0:
+                    spread_pct = ((ask - bid) / bid) * 100.0
+                    if spread_pct > Config.MAX_SPREAD_PERCENT:
+                        continue
+                    if last_price <= 0:
+                        last_price = (bid + ask) / 2.0
+                elif Config.SCAN_WS_ONLY:
+                    high = safe_float(ticker.get("highPrice"))
+                    low = safe_float(ticker.get("lowPrice"))
+                    if last_price <= 0:
+                        continue
+                    if high > 0 and low > 0:
+                        range_pct = ((high - low) / last_price) * 100.0
+                        if range_pct > Config.MAX_SPREAD_PERCENT * 25:
+                            continue
+                else:
                     continue
-
                 if self.db.is_blacklisted(symbol):
                     continue
 
-                last_price = safe_float(ticker.get("lastPrice"))
-                if last_price <= 0:
-                    last_price = (bid + ask) / 2.0
                 if last_price > 0:
                     price_map[symbol] = last_price
 
@@ -217,18 +227,78 @@ class MarketScanner:
     def _fetch_candles_with_retry(
         self, symbol: str, timeframe: str, limit: int
     ) -> pd.DataFrame:
-        for attempt in range(1, Config.MAX_RETRIES + 1):
-            try:
-                df = self.exchange.fetch_historical_candles(symbol, timeframe, limit=limit)
-                if not df.empty and len(df) >= MIN_ANALYZER_BARS:
-                    return df
-            except ExchangeRateLimitError:
-                raise
-            except Exception as exc:
-                if attempt == Config.MAX_RETRIES:
-                    raise exc
-                time.sleep(0.5)
+        try:
+            df = self.exchange.fetch_historical_candles(
+                symbol, timeframe, limit=limit, allow_rest=False
+            )
+            if not df.empty and len(df) >= MIN_ANALYZER_BARS:
+                return df
+        except ExchangeRateLimitError:
+            return pd.DataFrame()
+        except Exception as exc:
+            error_logger.warning(
+                "WS candle cache miss for %s %s: %s", symbol, timeframe, exc
+            )
         return pd.DataFrame()
+
+    def _prepare_scan_universe(self) -> tuple[List[str], dict[str, float]]:
+        """Build universe, subscribe WS klines, bootstrap REST seed (outside scan mode)."""
+        symbols, price_map = self.get_tradable_symbols()
+        if not symbols:
+            return [], {}
+
+        timeframes = [self.entry_tf, self.confirm_tf, self.trend_tf]
+        if self._hub:
+            self._hub.subscribe_kline_streams(symbols, timeframes)
+
+        return symbols, price_map
+
+    def bootstrap_next_batch(self, batch_size: int = 9) -> int:
+        """REST-seed missing kline buffers between scan cycles (never during evaluation)."""
+        if self.exchange.in_scan_mode:
+            return 0
+        if not self.exchange._rest_reads_allowed():
+            return 0
+
+        symbols = self._last_universe_symbols
+        if not symbols:
+            symbols, _ = self.get_tradable_symbols()
+            self._last_universe_symbols = symbols
+
+        timeframes = [self.entry_tf, self.confirm_tf, self.trend_tf]
+        hub = self._hub
+        if hub and symbols:
+            hub.subscribe_kline_streams(symbols, timeframes)
+        pending: list[tuple[str, str]] = []
+        limit = Config.CANDLE_FETCH_LIMIT
+        hub = self._hub
+        for symbol in self._last_universe_symbols:
+            for tf in timeframes:
+                if hub:
+                    cached = hub.get_candles_cached_only(symbol, tf, limit)
+                    if cached.empty or len(cached) < MIN_ANALYZER_BARS:
+                        pending.append((symbol, tf))
+                if len(pending) >= batch_size:
+                    break
+            if len(pending) >= batch_size:
+                break
+
+        if not pending or not hub:
+            return 0
+
+        seeded = 0
+        for symbol, tf in pending[:batch_size]:
+            df = self.exchange.rest_fetch_klines_df(symbol, tf, limit)
+            if not df.empty:
+                hub.seed_klines_from_dataframe(symbol, tf, df)
+                seeded += 1
+        if seeded:
+            scanner_logger.info(
+                "Inter-cycle REST bootstrap seeded %s/%s kline series.",
+                seeded,
+                len(pending[:batch_size]),
+            )
+        return seeded
 
     def _prioritize_symbols(self, symbols: list[str]) -> list[str]:
         """Rescan near-miss symbols (65-69 prior cycle) before the rest of the universe."""
@@ -499,7 +569,8 @@ class MarketScanner:
             Config.SCAN_PAIR_DELAY_SECONDS,
         )
         started = time.time()
-        symbols, price_map = self.get_tradable_symbols()
+        symbols, price_map = self._prepare_scan_universe()
+        self._last_universe_symbols = symbols
         if not symbols:
             scanner_logger.warning("No tradable symbols found.")
             return []
@@ -508,49 +579,50 @@ class MarketScanner:
         rejection_stats: Counter[str] = Counter()
         scanned = 0
 
-        for symbol in symbols:
-            if time.time() - started > Config.SCAN_TIMEOUT_SEC:
-                scanner_logger.warning(
-                    "Scan timeout after %ss — returning partial results (%s/%s scanned).",
-                    Config.SCAN_TIMEOUT_SEC,
-                    scanned,
-                    len(symbols),
-                )
-                break
+        with self.exchange.scan_context():
+            for symbol in symbols:
+                if time.time() - started > Config.SCAN_TIMEOUT_SEC:
+                    scanner_logger.warning(
+                        "Scan timeout after %ss — returning partial results (%s/%s scanned).",
+                        Config.SCAN_TIMEOUT_SEC,
+                        scanned,
+                        len(symbols),
+                    )
+                    break
 
-            result = self.evaluate_single_symbol(symbol, price_map=price_map)
-            scanned += 1
+                result = self.evaluate_single_symbol(symbol, price_map=price_map)
+                scanned += 1
 
-            result_score = safe_float(result.get("score"))
-            result_confluence = str(result.get("confluence", ""))
-            result_macro = str(result.get("macro_trend", "NEUTRAL"))
-            min_required = effective_smc_min_score(result_confluence, result_macro)
+                result_score = safe_float(result.get("score"))
+                result_confluence = str(result.get("confluence", ""))
+                result_macro = str(result.get("macro_trend", "NEUTRAL"))
+                min_required = effective_smc_min_score(result_confluence, result_macro)
 
-            if (
-                result.get("action") not in (None, "NEUTRAL")
-                and result_score >= min_required
-            ):
-                candidates.append(result)
-                self.db.log_signal(
-                    {
-                        "symbol": result["symbol"],
-                        "timeframe": self.entry_tf,
-                        "direction": result["action"],
-                        "score": result["score"],
-                                "strategy": result.get("strategy", STRATEGY_SMC_TREND),
-                        "reason": (
-                            f"macro={result.get('macro_trend')}|"
-                            f"confluence={result.get('confluence')}"
-                        ),
-                        "accepted": True,
-                        "structure_metadata": result.get("structure_metadata"),
-                    }
-                )
-            elif result.get("action") == "NEUTRAL":
-                rejection_stats["neutral"] += 1
+                if (
+                    result.get("action") not in (None, "NEUTRAL")
+                    and result_score >= min_required
+                ):
+                    candidates.append(result)
+                    self.db.log_signal(
+                        {
+                            "symbol": result["symbol"],
+                            "timeframe": self.entry_tf,
+                            "direction": result["action"],
+                            "score": result["score"],
+                            "strategy": result.get("strategy", STRATEGY_SMC_TREND),
+                            "reason": (
+                                f"macro={result.get('macro_trend')}|"
+                                f"confluence={result.get('confluence')}"
+                            ),
+                            "accepted": True,
+                            "structure_metadata": result.get("structure_metadata"),
+                        }
+                    )
+                elif result.get("action") == "NEUTRAL":
+                    rejection_stats["neutral"] += 1
 
-            if Config.SCAN_PAIR_DELAY_SECONDS > 0:
-                time.sleep(Config.SCAN_PAIR_DELAY_SECONDS)
+                if Config.SCAN_PAIR_DELAY_SECONDS > 0:
+                    time.sleep(Config.SCAN_PAIR_DELAY_SECONDS)
 
         candidates.sort(key=lambda item: safe_float(item.get("score")), reverse=True)
         top = candidates[: Config.MAX_POSITIONS]
@@ -693,40 +765,42 @@ class MarketScanner:
             Config.SCAN_PAIR_DELAY_SECONDS,
         )
         started = time.time()
-        symbols, price_map = self.get_tradable_symbols()
+        symbols, price_map = self._prepare_scan_universe()
+        self._last_universe_symbols = symbols
         if not symbols:
             return []
 
         candidates: List[Dict[str, Any]] = []
         scanned = 0
 
-        for symbol in symbols:
-            if time.time() - started > Config.SCAN_TIMEOUT_SEC:
-                break
+        with self.exchange.scan_context():
+            for symbol in symbols:
+                if time.time() - started > Config.SCAN_TIMEOUT_SEC:
+                    break
 
-            result = self.evaluate_range_symbol(symbol, price_map=price_map)
-            scanned += 1
+                result = self.evaluate_range_symbol(symbol, price_map=price_map)
+                scanned += 1
 
-            if (
-                result.get("action") not in (None, "NEUTRAL")
-                and safe_float(result.get("score")) >= Config.RANGE_MIN_SCORE
-            ):
-                candidates.append(result)
-                self.db.log_signal(
-                    {
-                        "symbol": result["symbol"],
-                        "timeframe": self.entry_tf,
-                        "direction": result["action"],
-                        "score": result["score"],
-                        "strategy": STRATEGY_RANGE_REVERSION,
-                        "reason": f"edge={result.get('confluence')}|range_mode",
-                        "accepted": True,
-                        "structure_metadata": result.get("structure_metadata"),
-                    }
-                )
+                if (
+                    result.get("action") not in (None, "NEUTRAL")
+                    and safe_float(result.get("score")) >= Config.RANGE_MIN_SCORE
+                ):
+                    candidates.append(result)
+                    self.db.log_signal(
+                        {
+                            "symbol": result["symbol"],
+                            "timeframe": self.entry_tf,
+                            "direction": result["action"],
+                            "score": result["score"],
+                            "strategy": STRATEGY_RANGE_REVERSION,
+                            "reason": f"edge={result.get('confluence')}|range_mode",
+                            "accepted": True,
+                            "structure_metadata": result.get("structure_metadata"),
+                        }
+                    )
 
-            if Config.SCAN_PAIR_DELAY_SECONDS > 0:
-                time.sleep(Config.SCAN_PAIR_DELAY_SECONDS)
+                if Config.SCAN_PAIR_DELAY_SECONDS > 0:
+                    time.sleep(Config.SCAN_PAIR_DELAY_SECONDS)
 
         candidates.sort(key=lambda item: safe_float(item.get("score")), reverse=True)
         top = candidates[: Config.MAX_RANGE_POSITIONS]

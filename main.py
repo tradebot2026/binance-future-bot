@@ -464,6 +464,7 @@ def main(controller: Optional[BotController] = None) -> str:
             else:
                 allowed, gate_reason = _entries_allowed(scheduler, risk, db)
                 if allowed:
+                    scanner.bootstrap_next_batch(batch_size=Config.BOOTSTRAP_KLINE_BATCH_SIZE)
                     smc_candidates = scanner.scan_market()
                     _execute_candidates(
                         candidates=smc_candidates,

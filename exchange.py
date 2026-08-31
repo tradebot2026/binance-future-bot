@@ -8,8 +8,9 @@ from __future__ import annotations
 import random
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any, Generator, Optional
 
 import pandas as pd
 from binance.client import Client
@@ -129,6 +130,8 @@ class BinanceExchangeManager:
         self._position_cache = PositionCache()
         self._position_refresh_lock = threading.Lock()
         self._position_backoff_until: float = 0.0
+        self._scan_mode = False
+        self._scan_mode_lock = threading.Lock()
         self._critical_alerts: Any = None
         self._market_data: Any = None
         self._full_init_done = False
@@ -164,6 +167,31 @@ class BinanceExchangeManager:
         self._market_data = hub
         if hub and hasattr(self, "_startup_ban") and self._startup_ban.is_banned:
             hub.apply_startup_ban(self._startup_ban)
+
+    @contextmanager
+    def scan_context(self) -> Generator[None, None, None]:
+        """Block REST reads during market scan / strategy evaluation loops."""
+        with self._scan_mode_lock:
+            self._scan_mode = True
+        try:
+            yield
+        finally:
+            with self._scan_mode_lock:
+                self._scan_mode = False
+
+    @property
+    def in_scan_mode(self) -> bool:
+        with self._scan_mode_lock:
+            return self._scan_mode
+
+    def _rest_reads_allowed(self) -> bool:
+        if self._scan_mode and Config.SCAN_WS_ONLY:
+            return False
+        if self._market_data:
+            blocked, _ = self._market_data.is_rest_blocked()
+            if blocked:
+                return False
+        return True
 
     def check_startup_ban(self) -> Any:
         from market_data_hub import BanStatus, check_binance_ban_status
@@ -213,7 +241,20 @@ class BinanceExchangeManager:
         message = str(exc.message).lower()
         return "429" in message or "418" in message or "rate limit" in message
 
-    def _throttled_call(self, func: Any, *args: Any, **kwargs: Any) -> Any:
+    def _throttled_call(
+        self, func: Any, *args: Any, allow_during_scan: bool = False, **kwargs: Any
+    ) -> Any:
+        if self._market_data:
+            blocked, reason = self._market_data.is_rest_blocked()
+            if blocked:
+                error_logger.warning("REST call blocked (ban active): %s", reason)
+                raise ExchangeRateLimitError(reason)
+
+        if self._scan_mode and Config.SCAN_WS_ONLY and not allow_during_scan:
+            raise ExchangeError(
+                "REST API call rejected during scan cycle — use WebSocket cache."
+            )
+
         last_error: Optional[Exception] = None
         for attempt in range(1, Config.MAX_RETRIES + 1):
             if Config.ENABLE_STRICT_RATE_LIMIT:
@@ -223,9 +264,15 @@ class BinanceExchangeManager:
             except BinanceAPIException as exc:
                 last_error = exc
                 if self._is_rate_limit_error(exc):
-                    if exc.code == -1003 and self._market_data:
-                        self._market_data.handle_rate_limit_error(exc)
+                    if exc.code == -1003:
+                        if self._market_data:
+                            self._market_data.handle_rate_limit_error(exc)
                         raise ExchangeRateLimitError(str(exc.message)) from exc
+
+                    if self._market_data:
+                        blocked, _ = self._market_data.is_rest_blocked()
+                        if blocked:
+                            raise ExchangeRateLimitError(str(exc.message)) from exc
 
                     sleep_seconds = self._backoff_seconds(attempt)
                     error_logger.warning(
@@ -401,15 +448,25 @@ class BinanceExchangeManager:
         return open_positions
 
     def _refresh_positions_cache(self, force: bool = False) -> list[dict[str, Any]]:
-        """
-        Bulk-fetch open positions at most once per POSITION_CACHE_TTL_SECONDS.
-        On -1003, backs off and serves the last cached snapshot if available.
-        """
+        """Prefer user-data WebSocket; REST refresh only when allowed and TTL expired."""
         now = time.monotonic()
+
+        if self._market_data and not self._market_data.user_stream_is_stale():
+            ws_positions = self._market_data.get_ws_positions()
+            self._position_cache.positions = ws_positions
+            self._position_cache.unrealized_pnl_total = (
+                self._market_data.get_ws_unrealized_pnl_total()
+            )
+            self._position_cache.updated_at = now
+            return ws_positions
+
         if not force and self._position_cache.is_valid():
             return self._position_cache.positions
 
         if now < self._position_backoff_until:
+            return self._position_cache.positions
+
+        if not self._rest_reads_allowed():
             return self._position_cache.positions
 
         with self._position_refresh_lock:
@@ -422,8 +479,7 @@ class BinanceExchangeManager:
             except ExchangeRateLimitError as exc:
                 self._position_backoff_until = now + Config.POSITION_CACHE_BACKOFF_SECONDS
                 error_logger.warning(
-                    "Position cache refresh rate-limited — using stale cache for %ss: %s",
-                    Config.POSITION_CACHE_BACKOFF_SECONDS,
+                    "Position REST refresh blocked/rate-limited — stale cache: %s",
                     exc,
                 )
                 return self._position_cache.positions
@@ -472,9 +528,16 @@ class BinanceExchangeManager:
     # ---------------- Market data ----------------
 
     def fetch_historical_candles(
-        self, symbol: str, timeframe: str, limit: int | None = None
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int | None = None,
+        *,
+        allow_rest: Optional[bool] = None,
     ) -> pd.DataFrame:
         fetch_limit = limit or Config.CANDLE_FETCH_LIMIT
+        if allow_rest is None:
+            allow_rest = self._rest_reads_allowed()
 
         def _rest_fetch() -> pd.DataFrame:
             klines = self._throttled_call(
@@ -510,11 +573,21 @@ class BinanceExchangeManager:
 
         if self._market_data:
             try:
+                if not allow_rest:
+                    return self._market_data.get_candles_cached_only(
+                        symbol, timeframe, fetch_limit
+                    )
                 return self._market_data.get_candles(
-                    symbol, timeframe, fetch_limit, _rest_fetch
+                    symbol,
+                    timeframe,
+                    fetch_limit,
+                    _rest_fetch,
+                    allow_rest=True,
                 )
             except ExchangeRateLimitError:
-                raise
+                return self._market_data.get_candles_cached_only(
+                    symbol, timeframe, fetch_limit
+                )
             except Exception as exc:
                 error_logger.error(
                     "Cached candle fetch failed for %s %s: %s",
@@ -522,21 +595,52 @@ class BinanceExchangeManager:
                     timeframe,
                     exc,
                 )
-                return pd.DataFrame()
+                return self._market_data.get_candles_cached_only(
+                    symbol, timeframe, fetch_limit
+                )
+
+        if not allow_rest:
+            return pd.DataFrame()
 
         try:
             return _rest_fetch()
+        except ExchangeRateLimitError:
+            return pd.DataFrame()
         except Exception as exc:
             error_logger.error(
                 "Failed to fetch candles for %s %s: %s", symbol, timeframe, exc
             )
             return pd.DataFrame()
 
+    def rest_fetch_klines_df(
+        self, symbol: str, timeframe: str, limit: int
+    ) -> pd.DataFrame:
+        """REST kline fetch for bootstrap only (outside scan loops)."""
+        return self.fetch_historical_candles(
+            symbol, timeframe, limit=limit, allow_rest=True
+        )
+
+    def bootstrap_scan_candles(self, symbols: list[str], timeframes: list[str]) -> int:
+        """Seed WS kline buffers via REST before scan evaluation (not during scan)."""
+        if not self._market_data or self.in_scan_mode:
+            return 0
+        if not self._rest_reads_allowed():
+            return 0
+        return self._market_data.bootstrap_candles(
+            symbols,
+            timeframes,
+            Config.CANDLE_FETCH_LIMIT,
+            self.rest_fetch_klines_df,
+        )
+
     def get_market_price(self, symbol: str) -> Optional[float]:
         if self._market_data:
             cached = self._market_data.get_price(symbol)
             if cached is not None and cached > 0:
                 return cached
+
+        if not self._rest_reads_allowed():
+            return None
 
         for attempt in range(1, Config.MAX_RETRIES + 1):
             try:
@@ -593,11 +697,16 @@ class BinanceExchangeManager:
             return 0.0
 
     def get_futures_ticker_map(self) -> dict[str, dict[str, Any]]:
-        """Return futures tickers from WebSocket cache, REST fallback if stale."""
+        """Return futures tickers from WebSocket cache; REST fallback only when allowed."""
         if self._market_data and not self._market_data.ws_is_stale():
             cached = self._market_data.get_ticker_map()
             if cached:
                 return cached
+
+        if not self._rest_reads_allowed():
+            if self._market_data:
+                return self._market_data.get_ticker_map()
+            return {}
 
         try:
             tickers = self._throttled_call(self.client.futures_ticker)
@@ -606,7 +715,9 @@ class BinanceExchangeManager:
                 self._market_data.seed_tickers_from_rest(result)
             return result
         except ExchangeRateLimitError:
-            raise
+            if self._market_data:
+                return self._market_data.get_ticker_map()
+            return {}
         except Exception as exc:
             error_logger.error("Failed to fetch futures ticker map: %s", exc)
             if self._market_data:
@@ -614,9 +725,15 @@ class BinanceExchangeManager:
             return {}
 
     def get_book_ticker_map(self) -> dict[str, dict[str, Any]]:
-        """Return book tickers with TTL cache (single REST refresh)."""
+        """Return book tickers — WS/stale cache during scan; REST only when allowed."""
+        allow_rest = self._rest_reads_allowed()
         if self._market_data:
-            return self._market_data.get_book_ticker_map(self._fetch_book_ticker_map_rest)
+            return self._market_data.get_book_ticker_map(
+                self._fetch_book_ticker_map_rest if allow_rest else None,
+                allow_rest=allow_rest,
+            )
+        if not allow_rest:
+            return {}
         return self._fetch_book_ticker_map_rest()
 
     def _fetch_book_ticker_map_rest(self) -> dict[str, dict[str, Any]]:
@@ -741,6 +858,10 @@ class BinanceExchangeManager:
     def has_open_position(self, symbol: str, position_side: str) -> bool:
         symbol = symbol.upper()
         position_side = position_side.upper()
+        if self._market_data and not self._market_data.user_stream_is_stale():
+            qty = self._market_data.get_ws_position_quantity(symbol, position_side)
+            if qty is not None:
+                return qty > 0
         for pos in self._refresh_positions_cache():
             if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
                 return safe_float(pos.get("quantity")) > 0
@@ -749,6 +870,10 @@ class BinanceExchangeManager:
     def get_position_quantity(self, symbol: str, position_side: str) -> float:
         symbol = symbol.upper()
         position_side = position_side.upper()
+        if self._market_data and not self._market_data.user_stream_is_stale():
+            qty = self._market_data.get_ws_position_quantity(symbol, position_side)
+            if qty is not None:
+                return qty
         for pos in self._refresh_positions_cache():
             if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
                 return safe_float(pos.get("quantity"))

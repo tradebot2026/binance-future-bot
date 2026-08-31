@@ -1,7 +1,7 @@
 """
-Binance Futures WebSocket + REST cache hub.
-Streams live miniTicker data and caches historical candles per bar period
-to minimize REST calls and prevent -1003 IP bans.
+Binance Futures WebSocket hub — primary data plane.
+Streams miniTicker, klines, and user-data (positions/PnL).
+REST is fallback-only outside scan cycles and never during IP bans.
 """
 
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 import threading
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Optional
@@ -38,6 +39,7 @@ TIMEFRAME_SECONDS: dict[str, int] = {
 }
 
 _BAN_UNTIL_RE = re.compile(r"banned until\s+(\d+)", re.IGNORECASE)
+_KLINE_MULTIPLEX_CHUNK = 180
 
 
 @dataclass
@@ -62,46 +64,8 @@ class _CandleCacheEntry:
     fetched_at: float = field(default_factory=time.monotonic)
 
 
-def parse_ban_until_ms(message: str) -> Optional[int]:
-    match = _BAN_UNTIL_RE.search(message or "")
-    if not match:
-        return None
-    try:
-        return int(match.group(1))
-    except ValueError:
-        return None
-
-
-def check_binance_ban_status(client: Client) -> BanStatus:
-    """
-    Lightweight startup connectivity check.
-    Returns ban details without retry spam if IP is temporarily blocked.
-    """
-    try:
-        client.futures_ping()
-        return BanStatus(is_banned=False, message="API reachable")
-    except BinanceAPIException as exc:
-        message = str(exc.message)
-        if exc.code in (-1003, 418):
-            until_ms = parse_ban_until_ms(message)
-            until_iso = ""
-            if until_ms:
-                until_iso = datetime.fromtimestamp(
-                    until_ms / 1000.0, tz=timezone.utc
-                ).strftime("%Y-%m-%d %H:%M:%S UTC")
-            return BanStatus(
-                is_banned=True,
-                message=message,
-                banned_until_ms=until_ms,
-                banned_until_iso=until_iso,
-            )
-        return BanStatus(is_banned=False, message=message)
-    except Exception as exc:
-        return BanStatus(is_banned=False, message=str(exc))
-
-
 class MarketDataHub:
-    """In-memory price/ticker cache (WebSocket) + bar-aligned candle cache (REST)."""
+    """In-memory WebSocket cache: tickers, klines, positions, unrealized PnL."""
 
     def __init__(self, client: Client) -> None:
         self.client = client
@@ -110,13 +74,22 @@ class MarketDataHub:
         self._book_tickers: dict[str, dict[str, Any]] = {}
         self._book_fetched_at: float = 0.0
         self._candles: dict[tuple[str, str, int], _CandleCacheEntry] = {}
+        self._kline_bars: dict[tuple[str, str], deque[dict[str, Any]]] = {}
         self._scan_halted_until: float = 0.0
         self._scan_halt_reason: str = ""
+        self._rest_blocked_until: float = 0.0
+        self._rest_block_reason: str = ""
         self._ban_status: Optional[BanStatus] = None
         self._ws_manager: Optional[ThreadedWebsocketManager] = None
-        self._ws_conn_key: Optional[str] = None
+        self._ticker_conn_key: Optional[str] = None
+        self._user_conn_key: Optional[str] = None
+        self._kline_conn_keys: list[str] = []
+        self._subscribed_kline_streams: set[str] = set()
         self._ws_running = False
         self._last_ticker_event_at: float = 0.0
+        self._last_user_event_at: float = 0.0
+        self._positions: list[dict[str, Any]] = []
+        self._unrealized_pnl_total: float = 0.0
 
     # ---------------- Lifecycle ----------------
 
@@ -130,50 +103,120 @@ class MarketDataHub:
                 testnet=Config.USE_TESTNET,
             )
             self._ws_manager.start()
-            self._ws_conn_key = self._ws_manager.start_futures_multiplex_socket(
-                callback=self._on_ws_message,
+            self._ticker_conn_key = self._ws_manager.start_futures_multiplex_socket(
+                callback=self._on_ticker_message,
                 streams=["!miniTicker@arr"],
+            )
+            self._user_conn_key = self._ws_manager.start_futures_user_socket(
+                callback=self._on_user_message,
             )
             self._ws_running = True
             system_logger.info(
-                "WebSocket miniTicker stream started (!miniTicker@arr)."
+                "WebSocket streams started (miniTicker + user data)."
             )
         except Exception as exc:
-            error_logger.error("Failed to start WebSocket stream: %s", exc)
+            error_logger.error("Failed to start WebSocket streams: %s", exc)
 
     def stop(self) -> None:
         if self._ws_manager is None:
             return
         try:
-            if self._ws_conn_key:
-                self._ws_manager.stop_socket(self._ws_conn_key)
+            for key in self._kline_conn_keys:
+                try:
+                    self._ws_manager.stop_socket(key)
+                except Exception:
+                    pass
+            if self._user_conn_key:
+                self._ws_manager.stop_socket(self._user_conn_key)
+            if self._ticker_conn_key:
+                self._ws_manager.stop_socket(self._ticker_conn_key)
             self._ws_manager.stop()
         except Exception as exc:
             error_logger.warning("WebSocket shutdown error: %s", exc)
         finally:
             self._ws_running = False
             self._ws_manager = None
-            self._ws_conn_key = None
+            self._ticker_conn_key = None
+            self._user_conn_key = None
+            self._kline_conn_keys.clear()
 
     def apply_startup_ban(self, ban: BanStatus) -> None:
         if not ban.is_banned:
             return
         self._ban_status = ban
+        self.block_rest_for_ban(ban.message, ban.banned_until_ms)
         halt_seconds = Config.RATE_LIMIT_HALT_SECONDS
         if ban.seconds_remaining > 0:
             halt_seconds = max(halt_seconds, ban.seconds_remaining)
         self.halt_scanning(halt_seconds, f"IP banned: {ban.message}")
 
-    # ---------------- WebSocket handler ----------------
+    # ---------------- REST ban gate ----------------
 
-    def _on_ws_message(self, message: dict[str, Any]) -> None:
+    def block_rest_for_ban(
+        self, message: str, banned_until_ms: Optional[int] = None
+    ) -> None:
+        until_ms = banned_until_ms or parse_ban_until_ms(message)
+        halt_seconds = Config.RATE_LIMIT_HALT_SECONDS
+        if until_ms:
+            remaining = max((until_ms / 1000.0) - time.time(), 0.0)
+            halt_seconds = max(halt_seconds, int(remaining))
+            until_iso = datetime.fromtimestamp(
+                until_ms / 1000.0, tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%S UTC")
+            self._ban_status = BanStatus(
+                is_banned=True,
+                message=message,
+                banned_until_ms=int(until_ms),
+                banned_until_iso=until_iso,
+            )
+        with self._lock:
+            self._rest_blocked_until = max(
+                self._rest_blocked_until, time.time() + halt_seconds
+            )
+            self._rest_block_reason = message
+        self.halt_scanning(halt_seconds, message)
+        error_logger.critical(
+            "ALL REST API calls blocked for ~%ss | %s", halt_seconds, message
+        )
+
+    def is_rest_blocked(self) -> tuple[bool, str]:
+        with self._lock:
+            if time.time() < self._rest_blocked_until:
+                remaining = int(self._rest_blocked_until - time.time())
+                reason = self._rest_block_reason or "rate_limit_ban"
+                return True, f"{reason} (REST resumes in ~{remaining}s)"
+            return False, ""
+
+    def handle_rate_limit_error(self, exc: Exception) -> None:
+        message = str(exc)
+        until_ms = parse_ban_until_ms(message)
+        self.block_rest_for_ban(message, until_ms)
+
+    # ---------------- Scan halt ----------------
+
+    def halt_scanning(self, seconds: int, reason: str) -> None:
+        until = time.monotonic() + max(seconds, 0)
+        with self._lock:
+            self._scan_halted_until = max(self._scan_halted_until, until)
+            self._scan_halt_reason = reason
+
+    def is_scan_halted(self) -> tuple[bool, str]:
+        with self._lock:
+            if time.monotonic() < self._scan_halted_until:
+                remaining = int(self._scan_halted_until - time.monotonic())
+                reason = self._scan_halt_reason or "rate_limit_halt"
+                return True, f"{reason} (resumes in ~{remaining}s)"
+            return False, ""
+
+    def get_ban_status(self) -> Optional[BanStatus]:
+        return self._ban_status
+
+    # ---------------- WebSocket handlers ----------------
+
+    def _on_ticker_message(self, message: dict[str, Any]) -> None:
         try:
             payload = message.get("data", message)
-            if isinstance(payload, list):
-                rows = payload
-            else:
-                rows = [payload]
-
+            rows = payload if isinstance(payload, list) else [payload]
             now = time.monotonic()
             with self._lock:
                 for row in rows:
@@ -198,49 +241,164 @@ class MarketDataHub:
                     }
                 self._last_ticker_event_at = now
         except Exception as exc:
-            error_logger.warning("WebSocket message parse error: %s", exc)
+            error_logger.warning("Ticker WS parse error: %s", exc)
 
-    # ---------------- Scan halt / ban recovery ----------------
+    def _on_user_message(self, message: dict[str, Any]) -> None:
+        try:
+            event = message.get("e")
+            if event == "ACCOUNT_UPDATE":
+                account = message.get("a", {})
+                positions_raw = account.get("P", [])
+                parsed: list[dict[str, Any]] = []
+                unrealized_total = 0.0
+                for pos in positions_raw:
+                    quantity = abs(safe_float(pos.get("pa")))
+                    if quantity <= 0:
+                        continue
+                    upnl = safe_float(pos.get("up"))
+                    unrealized_total += upnl
+                    parsed.append(
+                        {
+                            "symbol": str(pos.get("s", "")).upper(),
+                            "positionSide": str(pos.get("ps", "")),
+                            "quantity": quantity,
+                            "entry_price": safe_float(pos.get("ep")),
+                            "unrealized_pnl": upnl,
+                        }
+                    )
+                with self._lock:
+                    self._positions = parsed
+                    self._unrealized_pnl_total = unrealized_total
+                    self._last_user_event_at = time.monotonic()
+            elif event in ("ORDER_TRADE_UPDATE", "ACCOUNT_CONFIG_UPDATE"):
+                self._last_user_event_at = time.monotonic()
+        except Exception as exc:
+            error_logger.warning("User WS parse error: %s", exc)
 
-    def halt_scanning(self, seconds: int, reason: str) -> None:
-        until = time.monotonic() + max(seconds, 0)
-        with self._lock:
-            self._scan_halted_until = max(self._scan_halted_until, until)
-            self._scan_halt_reason = reason
-        error_logger.critical(
-            "Scanning halted for %ss | reason=%s", seconds, reason
+    def _on_kline_multiplex(self, message: dict[str, Any]) -> None:
+        payload = message.get("data", message)
+        if isinstance(payload, dict):
+            self._on_kline_message(payload)
+
+    def _on_kline_message(self, message: dict[str, Any]) -> None:
+        try:
+            kline = message.get("k") or message
+            symbol = str(kline.get("s", message.get("s", ""))).upper()
+            interval = str(kline.get("i", ""))
+            if not symbol or not interval:
+                return
+
+            row = {
+                "timestamp": pd.to_datetime(int(kline["t"]), unit="ms"),
+                "open": safe_float(kline.get("o")),
+                "high": safe_float(kline.get("h")),
+                "low": safe_float(kline.get("l")),
+                "close": safe_float(kline.get("c")),
+                "volume": safe_float(kline.get("v")),
+                "open_ms": int(kline["t"]),
+                "closed": bool(kline.get("x")),
+            }
+            key = (symbol, interval)
+            with self._lock:
+                bars = self._kline_bars.setdefault(
+                    key, deque(maxlen=Config.WS_KLINE_BUFFER_LIMIT)
+                )
+                if bars and bars[-1]["open_ms"] == row["open_ms"]:
+                    bars[-1] = row
+                elif row["closed"] or not bars:
+                    if bars and bars[-1]["open_ms"] == row["open_ms"]:
+                        bars[-1] = row
+                    else:
+                        bars.append(row)
+                else:
+                    bars.append(row)
+                self._sync_candles_from_klines(symbol, interval)
+        except Exception as exc:
+            error_logger.warning("Kline WS parse error: %s", exc)
+
+    def _sync_candles_from_klines(self, symbol: str, interval: str) -> None:
+        """Rebuild bar-aligned candle cache entry from WS kline buffer."""
+        key = (symbol, interval)
+        bars = self._kline_bars.get(key)
+        if not bars:
+            return
+        limit = Config.CANDLE_FETCH_LIMIT
+        rows = list(bars)[-limit:]
+        if len(rows) < 10:
+            return
+        df = pd.DataFrame(rows)[["timestamp", "open", "high", "low", "close", "volume"]]
+        bar_open_ms = self._current_bar_open_ms(interval)
+        cache_key = (symbol, interval, limit)
+        self._candles[cache_key] = _CandleCacheEntry(
+            dataframe=df.copy(),
+            last_bar_open_ms=bar_open_ms,
         )
 
-    def is_scan_halted(self) -> tuple[bool, str]:
+    def subscribe_kline_streams(
+        self, symbols: list[str], intervals: list[str]
+    ) -> None:
+        """Subscribe WS kline streams for scan universe (multiplex, chunked)."""
+        if not self._ws_manager or not self._ws_running:
+            return
+
+        new_streams: list[str] = []
+        for symbol in symbols:
+            sym = symbol.lower()
+            for interval in intervals:
+                stream = f"{sym}@kline_{interval}"
+                if stream not in self._subscribed_kline_streams:
+                    new_streams.append(stream)
+                    self._subscribed_kline_streams.add(stream)
+
+        if not new_streams:
+            return
+
+        for i in range(0, len(new_streams), _KLINE_MULTIPLEX_CHUNK):
+            chunk = new_streams[i : i + _KLINE_MULTIPLEX_CHUNK]
+            try:
+                conn_key = self._ws_manager.start_futures_multiplex_socket(
+                    callback=self._on_kline_multiplex,
+                    streams=chunk,
+                )
+                self._kline_conn_keys.append(conn_key)
+            except Exception as exc:
+                error_logger.error("Kline WS subscribe failed: %s", exc)
+
+        system_logger.info(
+            "Subscribed %s new kline WS streams (%s total).",
+            len(new_streams),
+            len(self._subscribed_kline_streams),
+        )
+
+    def seed_klines_from_dataframe(
+        self, symbol: str, interval: str, df: pd.DataFrame
+    ) -> None:
+        """Seed WS kline buffer from a one-time REST bootstrap (outside scan loops)."""
+        if df.empty:
+            return
+        symbol = symbol.upper()
+        key = (symbol, interval)
         with self._lock:
-            if time.monotonic() < self._scan_halted_until:
-                remaining = int(self._scan_halted_until - time.monotonic())
-                reason = self._scan_halt_reason or "rate_limit_halt"
-                return True, f"{reason} (resumes in ~{remaining}s)"
-            return False, ""
+            bars: deque[dict[str, Any]] = deque(maxlen=Config.WS_KLINE_BUFFER_LIMIT)
+            for _, row in df.iterrows():
+                ts = row["timestamp"]
+                open_ms = int(pd.Timestamp(ts).timestamp() * 1000)
+                bars.append(
+                    {
+                        "timestamp": ts,
+                        "open": safe_float(row.get("open")),
+                        "high": safe_float(row.get("high")),
+                        "low": safe_float(row.get("low")),
+                        "close": safe_float(row.get("close")),
+                        "volume": safe_float(row.get("volume")),
+                        "open_ms": open_ms,
+                        "closed": True,
+                    }
+                )
+            self._kline_bars[key] = bars
+            self._sync_candles_from_klines(symbol, interval)
 
-    def handle_rate_limit_error(self, exc: Exception) -> None:
-        message = str(exc)
-        until_ms = parse_ban_until_ms(message)
-        halt_seconds = Config.RATE_LIMIT_HALT_SECONDS
-        if until_ms:
-            remaining = (until_ms - int(time.time() * 1000)) // 1000
-            halt_seconds = max(halt_seconds, remaining)
-            until_iso = datetime.fromtimestamp(
-                until_ms / 1000.0, tz=timezone.utc
-            ).strftime("%Y-%m-%d %H:%M:%S UTC")
-            self._ban_status = BanStatus(
-                is_banned=True,
-                message=message,
-                banned_until_ms=until_ms,
-                banned_until_iso=until_iso,
-            )
-        self.halt_scanning(halt_seconds, message)
-
-    def get_ban_status(self) -> Optional[BanStatus]:
-        return self._ban_status
-
-    # ---------------- Ticker cache ----------------
+    # ---------------- Ticker / book ----------------
 
     def get_price(self, symbol: str) -> Optional[float]:
         symbol = symbol.upper()
@@ -260,11 +418,17 @@ class MarketDataHub:
             return True
         return (time.monotonic() - self._last_ticker_event_at) > Config.WS_STALE_SECONDS
 
+    def user_stream_is_stale(self) -> bool:
+        if self._last_user_event_at <= 0:
+            return True
+        return (time.monotonic() - self._last_user_event_at) > Config.WS_USER_STALE_SECONDS
+
     def get_book_ticker_map(
         self,
-        rest_fetcher: Callable[[], dict[str, dict[str, Any]]],
+        rest_fetcher: Optional[Callable[[], dict[str, dict[str, Any]]]] = None,
+        *,
+        allow_rest: bool = True,
     ) -> dict[str, dict[str, Any]]:
-        """Return cached book tickers; refresh via REST at most once per TTL."""
         now = time.monotonic()
         with self._lock:
             if (
@@ -273,8 +437,8 @@ class MarketDataHub:
             ):
                 return dict(self._book_tickers)
 
-        halted, _ = self.is_scan_halted()
-        if halted:
+        blocked, _ = self.is_rest_blocked()
+        if blocked or not allow_rest or rest_fetcher is None:
             with self._lock:
                 return dict(self._book_tickers)
 
@@ -289,49 +453,6 @@ class MarketDataHub:
             error_logger.warning("Book ticker REST refresh failed: %s", exc)
             with self._lock:
                 return dict(self._book_tickers)
-
-    # ---------------- Candle cache ----------------
-
-    @staticmethod
-    def _current_bar_open_ms(timeframe: str) -> int:
-        tf_sec = TIMEFRAME_SECONDS.get(timeframe, 300)
-        now_ms = int(time.time() * 1000)
-        bar_ms = tf_sec * 1000
-        return (now_ms // bar_ms) * bar_ms
-
-    def get_candles(
-        self,
-        symbol: str,
-        timeframe: str,
-        limit: int,
-        rest_fetcher: Callable[[], pd.DataFrame],
-    ) -> pd.DataFrame:
-        """Return cached candles; refetch REST only when a new bar opens."""
-        key = (symbol.upper(), timeframe, int(limit))
-        bar_open_ms = self._current_bar_open_ms(timeframe)
-        cached: Optional[_CandleCacheEntry] = None
-
-        with self._lock:
-            cached = self._candles.get(key)
-            if cached and cached.last_bar_open_ms == bar_open_ms and not cached.dataframe.empty:
-                return cached.dataframe.copy()
-
-        halted, _ = self.is_scan_halted()
-        if halted and cached is not None:
-            return cached.dataframe.copy()
-
-        df = rest_fetcher()
-        if df.empty:
-            if cached is not None:
-                return cached.dataframe.copy()
-            return pd.DataFrame()
-
-        with self._lock:
-            self._candles[key] = _CandleCacheEntry(
-                dataframe=df.copy(),
-                last_bar_open_ms=bar_open_ms,
-            )
-        return df.copy()
 
     def seed_tickers_from_rest(self, ticker_map: dict[str, dict[str, Any]]) -> None:
         now = time.monotonic()
@@ -350,6 +471,132 @@ class MarketDataHub:
                     "updated_at": now,
                 }
 
+    # ---------------- Positions (user stream) ----------------
+
+    def get_ws_positions(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._positions)
+
+    def get_ws_unrealized_pnl_total(self) -> float:
+        with self._lock:
+            return self._unrealized_pnl_total
+
+    def get_ws_position_quantity(self, symbol: str, position_side: str) -> Optional[float]:
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        with self._lock:
+            for pos in self._positions:
+                if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
+                    return safe_float(pos.get("quantity"))
+        return None
+
+    # ---------------- Candles ----------------
+
+    @staticmethod
+    def _current_bar_open_ms(timeframe: str) -> int:
+        tf_sec = TIMEFRAME_SECONDS.get(timeframe, 300)
+        now_ms = int(time.time() * 1000)
+        bar_ms = tf_sec * 1000
+        return (now_ms // bar_ms) * bar_ms
+
+    def get_candles_cached_only(
+        self, symbol: str, timeframe: str, limit: int
+    ) -> pd.DataFrame:
+        """WebSocket / memory cache ONLY — never calls REST."""
+        symbol = symbol.upper()
+        key = (symbol, timeframe, int(limit))
+        with self._lock:
+            cached = self._candles.get(key)
+            if cached and not cached.dataframe.empty:
+                return cached.dataframe.copy()
+
+            kline_key = (symbol, timeframe)
+            bars = self._kline_bars.get(kline_key)
+            if bars and len(bars) >= 10:
+                rows = list(bars)[-limit:]
+                df = pd.DataFrame(rows)[
+                    ["timestamp", "open", "high", "low", "close", "volume"]
+                ]
+                return df.copy()
+
+        return pd.DataFrame()
+
+    def get_candles(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        rest_fetcher: Optional[Callable[[], pd.DataFrame]] = None,
+        *,
+        allow_rest: bool = True,
+    ) -> pd.DataFrame:
+        """Return cached candles; optional REST refresh when allowed and not banned."""
+        cached = self.get_candles_cached_only(symbol, timeframe, limit)
+        bar_open_ms = self._current_bar_open_ms(timeframe)
+        key = (symbol.upper(), timeframe, int(limit))
+
+        with self._lock:
+            entry = self._candles.get(key)
+            if (
+                entry
+                and entry.last_bar_open_ms == bar_open_ms
+                and not entry.dataframe.empty
+            ):
+                return entry.dataframe.copy()
+
+        blocked, _ = self.is_rest_blocked()
+        if blocked or not allow_rest or rest_fetcher is None:
+            return cached
+
+        df = rest_fetcher()
+        if df.empty:
+            return cached
+
+        with self._lock:
+            self._candles[key] = _CandleCacheEntry(
+                dataframe=df.copy(),
+                last_bar_open_ms=bar_open_ms,
+            )
+        self.seed_klines_from_dataframe(symbol, timeframe, df)
+        return df.copy()
+
+    def bootstrap_candles(
+        self,
+        symbols: list[str],
+        intervals: list[str],
+        limit: int,
+        rest_fetcher: Callable[[str, str, int], pd.DataFrame],
+    ) -> int:
+        """
+        One-time REST seed for kline buffers (outside scan loops only).
+        Returns count of successful seeds.
+        """
+        blocked, reason = self.is_rest_blocked()
+        if blocked:
+            system_logger.warning("Bootstrap skipped — REST blocked: %s", reason)
+            return 0
+
+        seeded = 0
+        for symbol in symbols:
+            for interval in intervals:
+                key = (symbol.upper(), interval, limit)
+                with self._lock:
+                    if key in self._candles and not self._candles[key].dataframe.empty:
+                        continue
+                df = rest_fetcher(symbol, interval, limit)
+                if not df.empty:
+                    self.seed_klines_from_dataframe(symbol, interval, df)
+                    bar_open_ms = self._current_bar_open_ms(interval)
+                    with self._lock:
+                        self._candles[key] = _CandleCacheEntry(
+                            dataframe=df.copy(),
+                            last_bar_open_ms=bar_open_ms,
+                        )
+                    seeded += 1
+                if Config.INIT_REST_DELAY_SECONDS > 0:
+                    time.sleep(Config.INIT_REST_DELAY_SECONDS)
+        return seeded
+
     def format_ban_message(self, ban: BanStatus) -> str:
         if ban.banned_until_iso:
             return (
@@ -357,10 +604,44 @@ class MarketDataHub:
                 f"Until: {ban.banned_until_iso}\n"
                 f"Remaining: ~{ban.seconds_remaining}s\n"
                 f"Detail: {ban.message}\n\n"
-                f"<i>Scanning paused; position monitoring continues.</i>"
+                f"<i>Scanning paused; position monitoring uses WS cache.</i>"
             )
         return (
             f"🚫 <b>Binance rate limit / IP ban detected</b>\n\n"
             f"{ban.message}\n\n"
-            f"<i>Scanning paused for {Config.RATE_LIMIT_HALT_SECONDS}s.</i>"
+            f"<i>REST paused for {Config.RATE_LIMIT_HALT_SECONDS}s.</i>"
         )
+
+
+def parse_ban_until_ms(message: str) -> Optional[int]:
+    match = _BAN_UNTIL_RE.search(message or "")
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except ValueError:
+        return None
+
+
+def check_binance_ban_status(client: Client) -> BanStatus:
+    try:
+        client.futures_ping()
+        return BanStatus(is_banned=False, message="API reachable")
+    except BinanceAPIException as exc:
+        message = str(exc.message)
+        if exc.code in (-1003, 418):
+            until_ms = parse_ban_until_ms(message)
+            until_iso = ""
+            if until_ms:
+                until_iso = datetime.fromtimestamp(
+                    until_ms / 1000.0, tz=timezone.utc
+                ).strftime("%Y-%m-%d %H:%M:%S UTC")
+            return BanStatus(
+                is_banned=True,
+                message=message,
+                banned_until_ms=until_ms,
+                banned_until_iso=until_iso,
+            )
+        return BanStatus(is_banned=False, message=message)
+    except Exception as exc:
+        return BanStatus(is_banned=False, message=str(exc))

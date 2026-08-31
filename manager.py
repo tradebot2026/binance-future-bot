@@ -124,7 +124,7 @@ class TradeManager:
             import ta
 
             df = self.exchange.fetch_historical_candles(
-                symbol, Config.CONFIRM_TIMEFRAME, limit=80
+                symbol, Config.CONFIRM_TIMEFRAME, limit=80, allow_rest=False
             )
             if df.empty or len(df) < 20:
                 return 0.0
@@ -140,7 +140,9 @@ class TradeManager:
         metadata = self.db.parse_trade_metadata(trade)
         tf = str(metadata.get("entry_timeframe") or Config.ENTRY_TIMEFRAME)
         try:
-            df = self.exchange.fetch_historical_candles(symbol, tf, limit=5)
+            df = self.exchange.fetch_historical_candles(
+                symbol, tf, limit=5, allow_rest=False
+            )
             if df.empty or len(df) < 2:
                 return None
             return safe_float(df.iloc[-2]["close"])
