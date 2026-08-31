@@ -264,6 +264,28 @@ class TradeExecutor:
             error_logger.error("Execution aborted: invalid action %s.", action)
             return None
 
+        with self.exchange.execution_context():
+            return self._execute_trade_inner(
+                symbol,
+                action,
+                atr,
+                current_price,
+                strategy,
+                score,
+                structure_metadata,
+            )
+
+    def _execute_trade_inner(
+        self,
+        symbol: str,
+        action: str,
+        atr: float,
+        current_price: float,
+        strategy: str = "DEFAULT",
+        score: float = 0.0,
+        structure_metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Execute entry under high-priority REST path (not blocked by scan loops)."""
         on_cooldown, cooldown_reason = self.db.is_symbol_on_cooldown(symbol)
         if on_cooldown:
             trade_logger.info(

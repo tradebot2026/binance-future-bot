@@ -126,12 +126,17 @@ class BinanceExchangeManager:
         self._symbol_rules_cache: dict[str, SymbolRules] = {}
         self._leverage_cache: dict[str, int] = {}
         self._rate_limiter = RateLimiter(Config.MIN_REQUEST_INTERVAL_MS)
+        self._execution_rate_limiter = RateLimiter(
+            Config.EXECUTION_MIN_REQUEST_INTERVAL_MS
+        )
         self._balance_cache = BalanceCache()
         self._position_cache = PositionCache()
         self._position_refresh_lock = threading.Lock()
         self._position_backoff_until: float = 0.0
         self._scan_mode = False
         self._scan_mode_lock = threading.Lock()
+        self._execution_depth = 0
+        self._execution_lock = threading.Lock()
         self._critical_alerts: Any = None
         self._market_data: Any = None
         self._full_init_done = False
@@ -179,10 +184,25 @@ class BinanceExchangeManager:
             with self._scan_mode_lock:
                 self._scan_mode = False
 
+    @contextmanager
+    def execution_context(self) -> Generator[None, None, None]:
+        """High-priority path for live orders — bypasses scan REST guards."""
+        with self._execution_lock:
+            self._execution_depth += 1
+        try:
+            yield
+        finally:
+            with self._execution_lock:
+                self._execution_depth = max(0, self._execution_depth - 1)
+
     @property
     def in_scan_mode(self) -> bool:
         with self._scan_mode_lock:
             return self._scan_mode
+
+    def _is_execution_priority(self) -> bool:
+        with self._execution_lock:
+            return self._execution_depth > 0
 
     def _scan_ws_only(self) -> bool:
         return bool(getattr(Config, "SCAN_WS_ONLY", True))
@@ -244,24 +264,46 @@ class BinanceExchangeManager:
         message = str(exc.message).lower()
         return "429" in message or "418" in message or "rate limit" in message
 
-    def _throttled_call(
-        self, func: Any, *args: Any, allow_during_scan: bool = False, **kwargs: Any
-    ) -> Any:
+    def _rest_block_applies(self, execution_priority: bool) -> tuple[bool, str]:
+        """Scan halts block all REST; IP bans block even execution-priority calls."""
         if self._market_data:
             blocked, reason = self._market_data.is_rest_blocked()
             if blocked:
-                error_logger.warning("REST call blocked (ban active): %s", reason)
-                raise ExchangeRateLimitError(reason)
+                if execution_priority:
+                    ban = self._market_data.get_ban_status()
+                    if ban and ban.is_banned and ban.seconds_remaining > 0:
+                        return True, reason
+                    return False, ""
+                return True, reason
+        return False, ""
 
-        if self._scan_mode and self._scan_ws_only() and not allow_during_scan:
+    def _throttled_call(
+        self,
+        func: Any,
+        *args: Any,
+        allow_during_scan: bool = False,
+        execution_priority: bool = False,
+        **kwargs: Any,
+    ) -> Any:
+        priority = (
+            execution_priority or allow_during_scan or self._is_execution_priority()
+        )
+
+        blocked, reason = self._rest_block_applies(priority)
+        if blocked:
+            error_logger.warning("REST call blocked (ban active): %s", reason)
+            raise ExchangeRateLimitError(reason)
+
+        if self._scan_mode and self._scan_ws_only() and not priority:
             raise ExchangeError(
                 "REST API call rejected during scan cycle — use WebSocket cache."
             )
 
+        limiter = self._execution_rate_limiter if priority else self._rate_limiter
         last_error: Optional[Exception] = None
         for attempt in range(1, Config.MAX_RETRIES + 1):
             if Config.ENABLE_STRICT_RATE_LIMIT:
-                self._rate_limiter.wait()
+                limiter.wait()
             try:
                 return func(*args, **kwargs)
             except BinanceAPIException as exc:
@@ -758,24 +800,27 @@ class BinanceExchangeManager:
 
         target_leverage = Config.MAX_LEVERAGE
         try:
-            if Config.AUTO_DETECT_MAX_LEVERAGE:
-                brackets = self._throttled_call(
-                    self.client.futures_leverage_bracket,
-                    symbol=symbol,
-                    **self.recv_window_param,
-                )
-                if brackets and isinstance(brackets, list):
-                    max_exchange_leverage = int(
-                        brackets[0]["brackets"][0]["initialLeverage"]
+            with self.execution_context():
+                if Config.AUTO_DETECT_MAX_LEVERAGE:
+                    brackets = self._throttled_call(
+                        self.client.futures_leverage_bracket,
+                        symbol=symbol,
+                        **self.recv_window_param,
+                        execution_priority=True,
                     )
-                    target_leverage = min(Config.MAX_LEVERAGE, max_exchange_leverage)
+                    if brackets and isinstance(brackets, list):
+                        max_exchange_leverage = int(
+                            brackets[0]["brackets"][0]["initialLeverage"]
+                        )
+                        target_leverage = min(Config.MAX_LEVERAGE, max_exchange_leverage)
 
-            self._throttled_call(
-                self.client.futures_change_leverage,
-                symbol=symbol,
-                leverage=target_leverage,
-                **self.recv_window_param,
-            )
+                self._throttled_call(
+                    self.client.futures_change_leverage,
+                    symbol=symbol,
+                    leverage=target_leverage,
+                    **self.recv_window_param,
+                    execution_priority=True,
+                )
             with self._rules_lock:
                 self._leverage_cache[symbol] = target_leverage
             system_logger.info("Leverage set for %s: %sx", symbol, target_leverage)
@@ -789,12 +834,14 @@ class BinanceExchangeManager:
                 fallback,
             )
             try:
-                self._throttled_call(
-                    self.client.futures_change_leverage,
-                    symbol=symbol,
-                    leverage=fallback,
-                    **self.recv_window_param,
-                )
+                with self.execution_context():
+                    self._throttled_call(
+                        self.client.futures_change_leverage,
+                        symbol=symbol,
+                        leverage=fallback,
+                        **self.recv_window_param,
+                        execution_priority=True,
+                    )
                 with self._rules_lock:
                     self._leverage_cache[symbol] = fallback
                 return fallback
@@ -833,11 +880,13 @@ class BinanceExchangeManager:
         order_id = order_response.get("orderId")
         if order_id is not None:
             try:
-                order_info = self._throttled_call(
-                    self.client.futures_get_order,
-                    symbol=symbol,
-                    orderId=order_id,
-                )
+                with self.execution_context():
+                    order_info = self._throttled_call(
+                        self.client.futures_get_order,
+                        symbol=symbol,
+                        orderId=order_id,
+                        execution_priority=True,
+                    )
                 queried = safe_float(order_info.get("avgPrice"))
                 if queried > 0:
                     return queried
@@ -924,11 +973,13 @@ class BinanceExchangeManager:
             order_params["type"] = "MARKET"
 
         try:
-            response = self._throttled_call(
-                self.client.futures_create_order,
-                **order_params,
-                **self.recv_window_param,
-            )
+            with self.execution_context():
+                response = self._throttled_call(
+                    self.client.futures_create_order,
+                    **order_params,
+                    **self.recv_window_param,
+                    execution_priority=True,
+                )
             self.invalidate_balance_cache()
             self.invalidate_position_cache()
             trade_logger.info(

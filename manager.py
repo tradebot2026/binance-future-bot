@@ -500,11 +500,12 @@ class TradeManager:
             return False
 
         try:
-            response = self.exchange.close_position_quantity(
-                symbol=symbol,
-                position_side=position_side,
-                quantity=close_qty,
-            )
+            with self.exchange.execution_context():
+                response = self.exchange.close_position_quantity(
+                    symbol=symbol,
+                    position_side=position_side,
+                    quantity=close_qty,
+                )
         except OrderExecutionError as exc:
             error_logger.error("Close order failed for %s (%s): %s", symbol, reason, exc)
             return False

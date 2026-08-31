@@ -12,7 +12,12 @@ import pandas as pd
 
 from config import Config
 from constants import STRATEGY_RANGE_REVERSION
-from smc_engine import resolve_confirm_trend, resolve_macro_trend
+from smc_engine import (
+    resolve_confirm_trend,
+    resolve_macro_trend,
+    check_bearish_expansion_veto,
+    check_momentum_crash_veto,
+)
 from utils import safe_float
 
 
@@ -115,6 +120,30 @@ def evaluate_range_setup(
     if atr <= 0 or price <= 0:
         return RangeGateResult(False, ["invalid_atr_or_price"], meta)
 
+    crash_veto, crash_reason = check_momentum_crash_veto(action, df_entry, df_confirm)
+    if crash_veto:
+        return RangeGateResult(False, [crash_reason], meta)
+
+    if action == "LONG":
+        expanding, expand_reason = check_bearish_expansion_veto(df_entry, df_confirm)
+        if expanding:
+            return RangeGateResult(False, [expand_reason], meta)
+        if Config.REQUIRE_BULLISH_MTF_FOR_LONG:
+            if meta.macro_trend != "LONG":
+                return RangeGateResult(
+                    False,
+                    [f"range_long_requires_1h_bullish got_{meta.macro_trend}"],
+                    meta,
+                )
+            if meta.confirm_trend != "LONG":
+                return RangeGateResult(
+                    False,
+                    [f"range_long_requires_15m_bullish got_{meta.confirm_trend}"],
+                    meta,
+                )
+        elif meta.macro_trend == "SHORT":
+            return RangeGateResult(False, ["range_long_macro_bearish"], meta)
+
     edge_tol = atr * Config.RANGE_EDGE_ATR_TOLERANCE
     range_size = meta.range_high - meta.range_low
     if range_size <= 0:
@@ -140,7 +169,9 @@ def evaluate_range_setup(
             score += 10.0
             if rsi <= 42:
                 score += 5.0
-            if meta.confirm_trend in ("LONG", "NEUTRAL"):
+            if meta.confirm_trend == "LONG":
+                score += 5.0
+            elif meta.confirm_trend == "NEUTRAL" and not Config.REQUIRE_BULLISH_MTF_FOR_LONG:
                 score += 5.0
     else:
         near_high = price >= meta.range_high - edge_tol

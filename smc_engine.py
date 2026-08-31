@@ -178,6 +178,124 @@ def resolve_entry_trend(df_entry: pd.DataFrame) -> str:
     return "NEUTRAL"
 
 
+def _candle_bearish_drop_pct(row: pd.Series) -> float:
+    """Percent drop from open to close on a bearish candle."""
+    open_price = safe_float(row.get("open"))
+    close_price = safe_float(row.get("close"))
+    if open_price <= 0 or close_price >= open_price:
+        return 0.0
+    return ((open_price - close_price) / open_price) * 100.0
+
+
+def _is_bearish_expansion_candle(row: pd.Series, atr: float) -> bool:
+    """Large bearish body or range relative to ATR."""
+    if atr <= 0:
+        return False
+    open_price = safe_float(row.get("open"))
+    close_price = safe_float(row.get("close"))
+    if close_price >= open_price:
+        return False
+    body = open_price - close_price
+    candle_range = safe_float(row.get("high")) - safe_float(row.get("low"))
+    threshold = atr * Config.CRASH_BEARISH_BODY_ATR_MULT
+    return body >= threshold or candle_range >= threshold * 1.15
+
+
+def _candle_bullish_rise_pct(row: pd.Series) -> float:
+    """Percent rise from open to close on a bullish candle."""
+    open_price = safe_float(row.get("open"))
+    close_price = safe_float(row.get("close"))
+    if open_price <= 0 or close_price <= open_price:
+        return 0.0
+    return ((close_price - open_price) / open_price) * 100.0
+
+
+def _is_bullish_expansion_candle(row: pd.Series, atr: float) -> bool:
+    if atr <= 0:
+        return False
+    open_price = safe_float(row.get("open"))
+    close_price = safe_float(row.get("close"))
+    if close_price <= open_price:
+        return False
+    body = close_price - open_price
+    candle_range = safe_float(row.get("high")) - safe_float(row.get("low"))
+    threshold = atr * Config.CRASH_BEARISH_BODY_ATR_MULT
+    return body >= threshold or candle_range >= threshold * 1.15
+
+
+def check_momentum_crash_veto(
+    action: str,
+    df_entry: pd.DataFrame,
+    df_confirm: pd.DataFrame,
+) -> tuple[bool, str]:
+    """
+    Veto counter-trend entries during rapid sell-offs / pump-dumps.
+    Returns (vetoed, reason) — vetoed=True means reject the setup.
+    """
+    if not Config.ENABLE_MOMENTUM_CRASH_VETO:
+        return False, ""
+
+    if action == "LONG":
+        if not df_entry.empty:
+            row = df_entry.iloc[-1]
+            drop = _candle_bearish_drop_pct(row)
+            if drop >= Config.CRASH_VETO_DROP_PCT_5M:
+                return True, f"crash_veto_5m_drop_{drop:.2f}pct"
+            if _is_bearish_expansion_candle(row, safe_float(row.get("atr"))):
+                return True, "crash_veto_5m_bearish_expansion"
+
+        if not df_confirm.empty:
+            row = df_confirm.iloc[-1]
+            drop = _candle_bearish_drop_pct(row)
+            if drop >= Config.CRASH_VETO_DROP_PCT_15M:
+                return True, f"crash_veto_15m_drop_{drop:.2f}pct"
+            if _is_bearish_expansion_candle(row, safe_float(row.get("atr"))):
+                return True, "crash_veto_15m_bearish_expansion"
+
+    elif action == "SHORT":
+        if not df_entry.empty:
+            row = df_entry.iloc[-1]
+            rise = _candle_bullish_rise_pct(row)
+            if rise >= Config.CRASH_VETO_DROP_PCT_5M:
+                return True, f"crash_veto_5m_pump_{rise:.2f}pct"
+            if _is_bullish_expansion_candle(row, safe_float(row.get("atr"))):
+                return True, "crash_veto_5m_bullish_expansion"
+
+        if not df_confirm.empty:
+            row = df_confirm.iloc[-1]
+            rise = _candle_bullish_rise_pct(row)
+            if rise >= Config.CRASH_VETO_DROP_PCT_15M:
+                return True, f"crash_veto_15m_pump_{rise:.2f}pct"
+            if _is_bullish_expansion_candle(row, safe_float(row.get("atr"))):
+                return True, "crash_veto_15m_bullish_expansion"
+
+    return False, ""
+
+
+def check_bearish_expansion_veto(
+    df_entry: pd.DataFrame,
+    df_confirm: pd.DataFrame,
+) -> tuple[bool, str]:
+    """Veto LONG when 5m/15m structure is actively breaking down."""
+    if not Config.ENABLE_MOMENTUM_CRASH_VETO:
+        return False, ""
+
+    for label, df in (("5m", df_entry), ("15m", df_confirm)):
+        if df.empty or len(df) < 3:
+            continue
+        latest = df.iloc[-1]
+        if bool(latest.get("break_low")):
+            return True, f"bearish_expansion_{label}_break_low"
+        if bool(latest.get("bos_bearish")) or bool(latest.get("choch_bearish")):
+            return True, f"bearish_expansion_{label}_structure_break"
+        if bool(latest.get("trend_bearish")):
+            closes = [safe_float(df.iloc[i]["close"]) for i in range(-3, 0)]
+            if closes[0] > closes[1] > closes[2]:
+                return True, f"bearish_expansion_{label}_lower_closes"
+
+    return False, ""
+
+
 def is_pd_zone_acceptable(
     action: str,
     pd_zone: str,
@@ -216,6 +334,16 @@ def check_mtf_alignment(
     confirm: str,
     entry_trend: str = "NEUTRAL",
 ) -> tuple[bool, str]:
+    if action == "LONG" and Config.REQUIRE_BULLISH_MTF_FOR_LONG:
+        if macro != "LONG" or confirm != "LONG":
+            return False, f"strict_long_mtf macro={macro} confirm={confirm}"
+        return True, "strict_bullish_mtf"
+
+    if action == "SHORT" and Config.REQUIRE_BEARISH_MTF_FOR_SHORT:
+        if macro != "SHORT" or confirm != "SHORT":
+            return False, f"strict_short_mtf macro={macro} confirm={confirm}"
+        return True, "strict_bearish_mtf"
+
     if macro in ("LONG", "SHORT"):
         if macro != action:
             return False, f"macro_{macro}_opposes_{action}"
@@ -256,6 +384,10 @@ def evaluate_confluence_gate(
     entry_trend = resolve_entry_trend(df_entry)
     structure.macro_trend = macro
     structure.confirm_trend = confirm
+
+    crash_veto, crash_reason = check_momentum_crash_veto(action, df_entry, df_confirm)
+    if crash_veto:
+        reasons.append(crash_reason)
 
     mtf_ok, mtf_reason = check_mtf_alignment(action, macro, confirm, entry_trend)
     if not mtf_ok:
