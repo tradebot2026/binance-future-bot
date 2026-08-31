@@ -184,8 +184,11 @@ class BinanceExchangeManager:
         with self._scan_mode_lock:
             return self._scan_mode
 
+    def _scan_ws_only(self) -> bool:
+        return bool(getattr(Config, "SCAN_WS_ONLY", True))
+
     def _rest_reads_allowed(self) -> bool:
-        if self._scan_mode and Config.SCAN_WS_ONLY:
+        if self._scan_mode and self._scan_ws_only():
             return False
         if self._market_data:
             blocked, _ = self._market_data.is_rest_blocked()
@@ -250,7 +253,7 @@ class BinanceExchangeManager:
                 error_logger.warning("REST call blocked (ban active): %s", reason)
                 raise ExchangeRateLimitError(reason)
 
-        if self._scan_mode and Config.SCAN_WS_ONLY and not allow_during_scan:
+        if self._scan_mode and self._scan_ws_only() and not allow_during_scan:
             raise ExchangeError(
                 "REST API call rejected during scan cycle — use WebSocket cache."
             )

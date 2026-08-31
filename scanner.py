@@ -190,7 +190,7 @@ class MarketScanner:
                         continue
                     if last_price <= 0:
                         last_price = (bid + ask) / 2.0
-                elif Config.SCAN_WS_ONLY:
+                elif getattr(Config, "SCAN_WS_ONLY", True):
                     high = safe_float(ticker.get("highPrice"))
                     low = safe_float(ticker.get("lowPrice"))
                     if last_price <= 0:
