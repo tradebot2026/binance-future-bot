@@ -48,7 +48,7 @@ def reconcile_positions(
     if recovered:
         system_logger.info("Recovered %s orphan fill(s) from disk into DB.", recovered)
 
-    exchange_positions = exchange.fetch_open_positions(force_refresh=True)
+    exchange_positions = exchange.fetch_open_positions(force_refresh=False)
     db_trades = db.get_open_trades()
 
     exchange_keys = {
@@ -264,7 +264,7 @@ def _purge_orphan_exchange_file(exchange: "BinanceExchangeManager") -> int:
 
     live_keys = {
         (pos["symbol"], pos["positionSide"])
-        for pos in exchange.fetch_open_positions(force_refresh=True)
+        for pos in exchange.fetch_open_positions(force_refresh=False)
     }
 
     kept: list[str] = []

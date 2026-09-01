@@ -209,10 +209,10 @@ class TelegramManager:
             from smc_engine import compute_premium_discount, resolve_macro_trend, resolve_confirm_trend
 
             df_trend = self.exchange.fetch_historical_candles(
-                btc_symbol, Config.TREND_TIMEFRAME, limit=Config.CANDLE_FETCH_LIMIT
+                btc_symbol, Config.TREND_TIMEFRAME, limit=Config.CANDLE_FETCH_LIMIT, allow_rest=False
             )
             df_confirm = self.exchange.fetch_historical_candles(
-                btc_symbol, Config.CONFIRM_TIMEFRAME, limit=Config.CANDLE_FETCH_LIMIT
+                btc_symbol, Config.CONFIRM_TIMEFRAME, limit=Config.CANDLE_FETCH_LIMIT, allow_rest=False
             )
             if df_trend.empty:
                 return "⚠️ Could not fetch BTC market data."
@@ -535,7 +535,7 @@ class TelegramManager:
             if not self.exchange:
                 self.bot.reply_to(message, "Exchange not attached.")
                 return
-            balance = self.exchange.get_futures_balance(force_refresh=True)
+            balance = self.exchange.get_futures_balance(force_refresh=False)
             self.bot.reply_to(message, f"💵 <b>Available balance:</b> ${balance:.2f}")
 
         @self.bot.message_handler(commands=["help"])

@@ -590,7 +590,7 @@ class TradeManager:
             },
         )
 
-        balance = self.exchange.get_futures_balance(force_refresh=True)
+        balance = self.exchange.get_futures_balance(force_refresh=False)
         self.db.record_closed_trade(
             date_str=utc_today_str(),
             current_balance=balance,

@@ -43,7 +43,7 @@ class DailyScheduler:
         self._last_limit_check_at = 0.0
         self._limit_check_interval = float(Config.BALANCE_CACHE_TTL_SECONDS)
 
-        self._initialize_trading_day(force_balance_refresh=True)
+        self._initialize_trading_day(force_balance_refresh=False)
 
     # ---------------- Public API ----------------
 
@@ -153,7 +153,7 @@ class DailyScheduler:
         system_logger.info("UTC day rollover detected: %s -> %s", self.today_str, current_day)
         self.today_str = current_day
         self._last_limit_check_at = 0.0
-        self._initialize_trading_day(force_balance_refresh=True)
+        self._initialize_trading_day(force_balance_refresh=False)
 
         if self.telegram:
             self.telegram.send_message(

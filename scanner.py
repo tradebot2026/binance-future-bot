@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -29,6 +30,21 @@ from smc_engine import (
 from utils import safe_float
 
 MIN_ANALYZER_BARS = 250
+
+
+@dataclass
+class UniverseFilterStats:
+    """Rejection counters for universe construction logging."""
+
+    total_tickers: int = 0
+    rejected_quote: int = 0
+    rejected_volume: int = 0
+    rejected_spread: int = 0
+    rejected_stagnant: int = 0
+    rejected_atr: int = 0
+    rejected_blacklist: int = 0
+    rejected_no_price: int = 0
+    candidates: list[tuple[str, float, float, float]] = field(default_factory=list)
 
 
 class MarketAnalyzer:
@@ -158,67 +174,167 @@ class MarketScanner:
             return self._hub.is_scan_halted()
         return False, ""
 
-    def get_tradable_symbols(self) -> tuple[List[str], dict[str, float]]:
-        """Filter universe by volume, spread, and blacklist (two bulk API calls)."""
-        tradable: List[tuple[str, float]] = []
-        price_map: dict[str, float] = {}
+    @staticmethod
+    def _is_usdt_perpetual(symbol: str) -> bool:
+        return symbol.endswith(Config.QUOTE_ASSET) and "_" not in symbol
 
-        try:
-            ticker_map = self.exchange.get_futures_ticker_map()
-            book_map = self.exchange.get_book_ticker_map()
-            if not ticker_map:
-                return [], {}
+    @staticmethod
+    def _compute_spread_pct(book: dict[str, Any]) -> Optional[float]:
+        """True bid-ask spread %; None when only a high/low proxy is available."""
+        if book.get("is_proxy"):
+            return None
+        bid = safe_float(book.get("bidPrice"))
+        ask = safe_float(book.get("askPrice"))
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        mid = (bid + ask) / 2.0
+        if mid <= 0:
+            return None
+        return ((ask - bid) / mid) * 100.0
 
-            self.db.cleanup_expired_blacklist()
+    @staticmethod
+    def _compute_24h_range_pct(ticker: dict[str, Any], last_price: float) -> float:
+        high = safe_float(ticker.get("highPrice"))
+        low = safe_float(ticker.get("lowPrice"))
+        if last_price <= 0 or high <= 0 or low <= 0 or high < low:
+            return 0.0
+        return ((high - low) / last_price) * 100.0
 
-            for symbol, ticker in ticker_map.items():
-                if not symbol.endswith(Config.QUOTE_ASSET) or "_" in symbol:
-                    continue
+    def _passes_atr_volatility_filter(self, symbol: str, last_price: float) -> bool:
+        """Optional WS-cached ATR filter — no REST."""
+        if not Config.ENABLE_UNIVERSE_ATR_FILTER or last_price <= 0:
+            return True
+        if not self._hub:
+            return True
 
-                volume_24h = safe_float(ticker.get("quoteVolume"))
-                if volume_24h < Config.MIN_24H_VOLUME_USDT:
-                    continue
+        limit = max(Config.UNIVERSE_ATR_LOOKBACK_BARS + 14, 30)
+        df = self._hub.get_candles_cached_only(symbol, self.entry_tf, limit)
+        if df.empty or len(df) < Config.UNIVERSE_ATR_LOOKBACK_BARS + 5:
+            return True
 
-                book = book_map.get(symbol, {})
+        window = df.tail(Config.UNIVERSE_ATR_LOOKBACK_BARS + 14)
+        atr_series = ta.volatility.average_true_range(
+            high=window["high"],
+            low=window["low"],
+            close=window["close"],
+            window=14,
+        )
+        atr = safe_float(atr_series.iloc[-1])
+        if atr <= 0:
+            return True
+        atr_pct = (atr / last_price) * 100.0
+        return atr_pct >= Config.MIN_UNIVERSE_ATR_PCT
+
+    def _build_universe_candidates(
+        self, ticker_map: dict[str, dict[str, Any]], book_map: dict[str, dict[str, Any]]
+    ) -> UniverseFilterStats:
+        stats = UniverseFilterStats(total_tickers=len(ticker_map))
+        self.db.cleanup_expired_blacklist()
+
+        for symbol, ticker in ticker_map.items():
+            if not self._is_usdt_perpetual(symbol):
+                stats.rejected_quote += 1
+                continue
+
+            volume_24h = safe_float(ticker.get("quoteVolume"))
+            if volume_24h < Config.MIN_24H_VOLUME_USDT:
+                stats.rejected_volume += 1
+                continue
+
+            last_price = safe_float(ticker.get("lastPrice"))
+            book = book_map.get(symbol, {})
+            spread_pct = self._compute_spread_pct(book)
+
+            if spread_pct is not None and spread_pct > Config.MAX_SPREAD_PERCENT:
+                stats.rejected_spread += 1
+                continue
+
+            if last_price <= 0:
                 bid = safe_float(book.get("bidPrice"))
                 ask = safe_float(book.get("askPrice"))
-                last_price = safe_float(ticker.get("lastPrice"))
+                if bid > 0 and ask > 0 and not book.get("is_proxy"):
+                    last_price = (bid + ask) / 2.0
+            if last_price <= 0:
+                stats.rejected_no_price += 1
+                continue
 
-                if bid > 0 and ask > 0:
-                    spread_pct = ((ask - bid) / bid) * 100.0
-                    if spread_pct > Config.MAX_SPREAD_PERCENT:
-                        continue
-                    if last_price <= 0:
-                        last_price = (bid + ask) / 2.0
-                elif getattr(Config, "SCAN_WS_ONLY", True):
-                    high = safe_float(ticker.get("highPrice"))
-                    low = safe_float(ticker.get("lowPrice"))
-                    if last_price <= 0:
-                        continue
-                    if high > 0 and low > 0:
-                        range_pct = ((high - low) / last_price) * 100.0
-                        if range_pct > Config.MAX_SPREAD_PERCENT * 25:
-                            continue
-                else:
-                    continue
-                if self.db.is_blacklisted(symbol):
-                    continue
+            range_pct = self._compute_24h_range_pct(ticker, last_price)
+            if range_pct < Config.MIN_24H_RANGE_PCT:
+                stats.rejected_stagnant += 1
+                continue
 
-                if last_price > 0:
-                    price_map[symbol] = last_price
+            if not self._passes_atr_volatility_filter(symbol, last_price):
+                stats.rejected_atr += 1
+                continue
 
-                tradable.append((symbol, volume_24h))
+            if self.db.is_blacklisted(symbol):
+                stats.rejected_blacklist += 1
+                continue
 
-            tradable.sort(key=lambda item: item[1], reverse=True)
-            symbols = self._prioritize_symbols(
-                [s for s, _ in tradable[: Config.MAX_SCAN_UNIVERSE]]
-            )
-            scanner_logger.info(
-                "Universe filtered: %s tradable (top %s by volume, %s priority).",
+            stats.candidates.append((symbol, volume_24h, spread_pct or 0.0, range_pct))
+
+        stats.candidates.sort(key=lambda row: row[1], reverse=True)
+        return stats
+
+    def _log_universe_selection(
+        self, symbols: list[str], stats: UniverseFilterStats
+    ) -> None:
+        preview_n = max(Config.UNIVERSE_LOG_SYMBOL_PREVIEW, 0)
+        preview = ", ".join(symbols[:preview_n]) if symbols else "none"
+        extra = ""
+        if len(symbols) > preview_n:
+            extra = f" (+{len(symbols) - preview_n} more)"
+
+        scanner_logger.info(
+            "Universe created: %s active high-volume pairs selected for scanning "
+            "(target %s-%s | tickers=%s | rejected: volume=%s spread=%s stagnant=%s "
+            "atr=%s blacklist=%s no_price=%s).",
+            len(symbols),
+            Config.MIN_SCAN_UNIVERSE,
+            Config.MAX_SCAN_UNIVERSE,
+            stats.total_tickers,
+            stats.rejected_volume,
+            stats.rejected_spread,
+            stats.rejected_stagnant,
+            stats.rejected_atr,
+            stats.rejected_blacklist,
+            stats.rejected_no_price,
+        )
+        scanner_logger.info("Universe pairs: %s%s", preview, extra)
+
+        if len(symbols) < Config.MIN_SCAN_UNIVERSE:
+            scanner_logger.warning(
+                "Universe below target minimum (%s/%s) — loosen filters or wait for WS book cache.",
                 len(symbols),
-                Config.MAX_SCAN_UNIVERSE,
-                min(len(self._scan_priority), len(symbols)),
+                Config.MIN_SCAN_UNIVERSE,
             )
+
+    def get_tradable_symbols(self) -> tuple[list[str], dict[str, float]]:
+        """
+        Build dynamic scan universe (50-80 pairs) from WS ticker/book cache only.
+        Filters: USDT-M volume, bid-ask spread, 24h range, optional ATR, blacklist.
+        """
+        try:
+            ticker_map = self.exchange.get_futures_ticker_map()
+            if not ticker_map:
+                scanner_logger.warning("Universe empty — WS ticker cache not ready.")
+                return [], {}
+
+            book_map = self.exchange.get_book_ticker_map()
+            stats = self._build_universe_candidates(ticker_map, book_map)
+
+            cap = Config.MAX_SCAN_UNIVERSE
+            selected = stats.candidates[:cap]
+            symbols = self._prioritize_symbols([row[0] for row in selected])
+
+            price_map: dict[str, float] = {}
+            for symbol in symbols:
+                ticker = ticker_map.get(symbol, {})
+                price = safe_float(ticker.get("lastPrice"))
+                if price > 0:
+                    price_map[symbol] = price
+
+            self._log_universe_selection(symbols, stats)
             return symbols, price_map
         except Exception as exc:
             error_logger.error("Failed to build tradable universe: %s", exc)

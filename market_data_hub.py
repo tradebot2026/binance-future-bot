@@ -82,6 +82,7 @@ class MarketDataHub:
         self._ban_status: Optional[BanStatus] = None
         self._ws_manager: Optional[ThreadedWebsocketManager] = None
         self._ticker_conn_key: Optional[str] = None
+        self._book_ticker_conn_key: Optional[str] = None
         self._user_conn_key: Optional[str] = None
         self._kline_conn_keys: list[str] = []
         self._subscribed_kline_streams: set[str] = set()
@@ -92,6 +93,52 @@ class MarketDataHub:
         self._unrealized_pnl_total: float = 0.0
         self._wallet_balances: dict[str, float] = {}
         self._ban_notice_logged: bool = False
+        self._ws_started_at: float = 0.0
+
+    def ws_is_running(self) -> bool:
+        return self._ws_running
+
+    def wait_until_ready(
+        self,
+        timeout_seconds: Optional[int] = None,
+        min_symbols: int = 30,
+    ) -> bool:
+        """
+        Block until miniTicker WS cache has enough symbols (startup warm-up).
+        Returns False on timeout — caller must NOT fall back to REST tickers.
+        """
+        timeout = timeout_seconds or Config.WS_STARTUP_WAIT_SECONDS
+        deadline = time.monotonic() + max(timeout, 1)
+        while time.monotonic() < deadline:
+            count = len(self.get_ticker_map())
+            if count >= min_symbols:
+                system_logger.info(
+                    "WebSocket ticker cache ready (%s symbols).", count
+                )
+                return True
+            time.sleep(0.5)
+        count = len(self.get_ticker_map())
+        if count > 0:
+            system_logger.warning(
+                "WebSocket warm-up partial — %s symbols (wanted >= %s).",
+                count,
+                min_symbols,
+            )
+            return True
+        system_logger.warning(
+            "WebSocket ticker cache empty after %ss — REST ticker fallback disabled.",
+            timeout,
+        )
+        return False
+
+    def is_ws_warming_up(self) -> bool:
+        if not self._ws_running:
+            return False
+        if self._ws_started_at <= 0:
+            return True
+        if self._last_ticker_event_at <= 0:
+            return (time.monotonic() - self._ws_started_at) < Config.WS_WARMUP_SECONDS
+        return False
 
     def get_rest_block_remaining_seconds(self) -> int:
         with self._lock:
@@ -116,13 +163,20 @@ class MarketDataHub:
                 callback=self._on_ticker_message,
                 streams=["!miniTicker@arr"],
             )
+            if Config.ENABLE_WS_BOOK_STREAM:
+                self._book_ticker_conn_key = self._ws_manager.start_futures_multiplex_socket(
+                    callback=self._on_book_ticker_message,
+                    streams=["!bookTicker@arr"],
+                )
             self._user_conn_key = self._ws_manager.start_futures_user_socket(
                 callback=self._on_user_message,
             )
             self._ws_running = True
-            system_logger.info(
-                "WebSocket streams started (miniTicker + user data)."
-            )
+            self._ws_started_at = time.monotonic()
+            streams = "miniTicker + user data"
+            if Config.ENABLE_WS_BOOK_STREAM:
+                streams += " + bookTicker"
+            system_logger.info("WebSocket streams started (%s).", streams)
         except Exception as exc:
             error_logger.error("Failed to start WebSocket streams: %s", exc)
 
@@ -137,6 +191,8 @@ class MarketDataHub:
                     pass
             if self._user_conn_key:
                 self._ws_manager.stop_socket(self._user_conn_key)
+            if self._book_ticker_conn_key:
+                self._ws_manager.stop_socket(self._book_ticker_conn_key)
             if self._ticker_conn_key:
                 self._ws_manager.stop_socket(self._ticker_conn_key)
             self._ws_manager.stop()
@@ -146,8 +202,44 @@ class MarketDataHub:
             self._ws_running = False
             self._ws_manager = None
             self._ticker_conn_key = None
+            self._book_ticker_conn_key = None
             self._user_conn_key = None
             self._kline_conn_keys.clear()
+
+    def _on_book_ticker_message(self, message: dict[str, Any]) -> None:
+        try:
+            payload = message.get("data", message)
+            rows = payload if isinstance(payload, list) else [payload]
+            now = time.monotonic()
+            with self._lock:
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    symbol = str(row.get("s", "")).upper()
+                    if not symbol:
+                        continue
+                    bid = safe_float(row.get("b"))
+                    ask = safe_float(row.get("a"))
+                    if bid <= 0 or ask <= 0:
+                        continue
+                    self._book_tickers[symbol] = {
+                        "symbol": symbol,
+                        "bidPrice": bid,
+                        "askPrice": ask,
+                        "is_proxy": False,
+                        "updated_at": now,
+                    }
+                self._book_fetched_at = now
+        except Exception as exc:
+            error_logger.warning("Book ticker WS parse error: %s", exc)
+
+    def get_ws_book_ticker_map(self) -> dict[str, dict[str, Any]]:
+        with self._lock:
+            return dict(self._book_tickers)
+
+    def has_ws_book_data(self) -> bool:
+        with self._lock:
+            return len(self._book_tickers) > 0
 
     def apply_startup_ban(self, ban: BanStatus) -> None:
         if not ban.is_banned:
@@ -165,7 +257,7 @@ class MarketDataHub:
         self, message: str, banned_until_ms: Optional[int] = None
     ) -> None:
         until_ms = banned_until_ms or parse_ban_until_ms(message)
-        halt_seconds = Config.RATE_LIMIT_HALT_SECONDS
+        halt_seconds = max(Config.REST_BAN_MIN_SLEEP_SECONDS, Config.RATE_LIMIT_HALT_SECONDS)
         if until_ms:
             remaining = max((until_ms / 1000.0) - time.time(), 0.0)
             halt_seconds = max(halt_seconds, int(remaining))
@@ -453,11 +545,21 @@ class MarketDataHub:
             return dict(self._tickers)
 
     def ws_is_stale(self) -> bool:
+        if not self._ws_running:
+            return True
+        if self.is_ws_warming_up():
+            return False
         if self._last_ticker_event_at <= 0:
             return True
         return (time.monotonic() - self._last_ticker_event_at) > Config.WS_STALE_SECONDS
 
     def user_stream_is_stale(self) -> bool:
+        if not self._ws_running:
+            return True
+        if self._ws_started_at > 0 and self._last_user_event_at <= 0:
+            warming = (time.monotonic() - self._ws_started_at) < Config.WS_WARMUP_SECONDS
+            if warming:
+                return False
         if self._last_user_event_at <= 0:
             return True
         return (time.monotonic() - self._last_user_event_at) > Config.WS_USER_STALE_SECONDS

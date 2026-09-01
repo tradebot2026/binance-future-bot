@@ -151,6 +151,7 @@ class BinanceExchangeManager:
         self._critical_alerts: Any = None
         self._market_data: Any = None
         self._full_init_done = False
+        self._ws_rest_ready = False
 
         ban = self.check_startup_ban()
         if ban.is_banned:
@@ -160,13 +161,12 @@ class BinanceExchangeManager:
                 ban.message,
             )
             system_logger.warning(
-                "Deferring account/symbol REST init until ban expires (~%ss).",
+                "Deferring ALL REST init until ban expires (~%ss). WebSocket-only mode.",
                 ban.seconds_remaining,
             )
             if ban.seconds_remaining > 0:
-                self._rest_token_bucket.trigger_hard_stop(float(ban.seconds_remaining))
-        else:
-            self.ensure_initialized()
+                halt = max(float(ban.seconds_remaining), float(Config.REST_BAN_MIN_SLEEP_SECONDS))
+                self._rest_token_bucket.trigger_hard_stop(halt)
 
         mode = "TESTNET" if self.testnet else "MAINNET"
         strict = "ON" if Config.ENABLE_STRICT_RATE_LIMIT else "OFF"
@@ -185,6 +185,29 @@ class BinanceExchangeManager:
         self._market_data = hub
         if hub and hasattr(self, "_startup_ban") and self._startup_ban.is_banned:
             hub.apply_startup_ban(self._startup_ban)
+
+    def mark_ws_rest_ready(self) -> None:
+        """Called after WebSocket cache warm-up — allows deferred REST init."""
+        self._ws_rest_ready = True
+
+    def _rest_gate_open(self, execution_priority: bool = False) -> tuple[bool, str]:
+        """Return False if REST must not be attempted."""
+        if (
+            Config.DEFER_REST_UNTIL_WS_READY
+            and not execution_priority
+            and not self._ws_rest_ready
+        ):
+            return False, "deferred_until_ws_ready"
+        if self._market_data:
+            blocked, reason = self._market_data.is_rest_blocked()
+            if blocked:
+                if execution_priority:
+                    ban = self._market_data.get_ban_status()
+                    if ban and ban.is_banned and ban.seconds_remaining > 0:
+                        return False, reason
+                    return True, ""
+                return False, reason
+        return True, ""
 
     @contextmanager
     def scan_context(self) -> Generator[None, None, None]:
@@ -220,17 +243,29 @@ class BinanceExchangeManager:
     def _scan_ws_only(self) -> bool:
         return bool(getattr(Config, "SCAN_WS_ONLY", True))
 
+    def _background_ws_only(self) -> bool:
+        """Scan/monitor/risk paths must not hit REST when this is enabled."""
+        return bool(Config.BACKGROUND_WS_ONLY) and not self._is_execution_priority()
+
     def _rest_reads_allowed(self) -> bool:
+        if self._background_ws_only():
+            return False
         if self._scan_mode and self._scan_ws_only():
             return False
-        if self._market_data:
-            blocked, _ = self._market_data.is_rest_blocked()
-            if blocked:
-                return False
-        return True
+        allowed, _ = self._rest_gate_open()
+        return allowed
+
+    def _rest_block_applies(self, execution_priority: bool) -> tuple[bool, str]:
+        allowed, reason = self._rest_gate_open(execution_priority)
+        if not allowed:
+            return True, reason
+        if self._rest_token_bucket.is_hard_stopped() and not execution_priority:
+            remaining = int(self._rest_token_bucket.hard_stop_remaining())
+            return True, f"REST hard-stop (~{remaining}s remaining)"
+        return False, ""
 
     def check_startup_ban(self) -> Any:
-        from market_data_hub import BanStatus, check_binance_ban_status
+        from market_data_hub import check_binance_ban_status
 
         self._startup_ban = check_binance_ban_status(self.client)
         return self._startup_ban
@@ -248,14 +283,14 @@ class BinanceExchangeManager:
         if self._full_init_done:
             return True
 
+        allowed, reason = self._rest_gate_open()
+        if not allowed:
+            system_logger.debug("Deferred REST init: %s", reason)
+            return False
+
         ban = self.get_startup_ban_status()
         if ban and ban.is_banned:
-            if self._market_data:
-                halted, _ = self._market_data.is_scan_halted()
-                if halted:
-                    return False
-            else:
-                return False
+            return False
 
         self._init_rest_pause()
         self._configure_account()
@@ -263,6 +298,37 @@ class BinanceExchangeManager:
         self.refresh_symbol_rules()
         self._full_init_done = True
         return True
+
+    def _apply_rate_limit_halt(self, exc: BinanceAPIException) -> int:
+        """Hard-stop all REST for ban duration — no retries."""
+        from market_data_hub import parse_ban_until_ms
+
+        halt_seconds = max(Config.REST_BAN_MIN_SLEEP_SECONDS, Config.RATE_LIMIT_HALT_SECONDS)
+        until_ms = parse_ban_until_ms(str(exc.message))
+        if until_ms:
+            halt_seconds = max(halt_seconds, int((until_ms / 1000.0) - time.time()))
+        self._rest_token_bucket.trigger_hard_stop(float(halt_seconds))
+        already_blocked = False
+        if self._market_data:
+            already_blocked = self._market_data.is_rest_blocked()[0]
+            self._market_data.handle_rate_limit_error(exc)
+        if not already_blocked and self._rest_block_log.should_log("rate_limit_halt"):
+            error_logger.warning(
+                "REST hard-stop for ~%ss after rate limit (code=%s). WebSocket-only until clear.",
+                halt_seconds,
+                exc.code,
+            )
+        if (
+            not already_blocked
+            and self._critical_alerts
+            and exc.code in (-1003, 418, 429)
+        ):
+            self._critical_alerts.notify(
+                "RATE_LIMIT",
+                f"Binance IP/rate limit — REST halted ~{halt_seconds}s",
+                exc=exc,
+            )
+        return halt_seconds
 
     # ---------------- Internal helpers ----------------
 
@@ -276,19 +342,6 @@ class BinanceExchangeManager:
             return True
         message = str(exc.message).lower()
         return "429" in message or "418" in message or "rate limit" in message
-
-    def _rest_block_applies(self, execution_priority: bool) -> tuple[bool, str]:
-        """Scan halts block all REST; IP bans block even execution-priority calls."""
-        if self._market_data:
-            blocked, reason = self._market_data.is_rest_blocked()
-            if blocked:
-                if execution_priority:
-                    ban = self._market_data.get_ban_status()
-                    if ban and ban.is_banned and ban.seconds_remaining > 0:
-                        return True, reason
-                    return False, ""
-                return True, reason
-        return False, ""
 
     def _throttled_call(
         self,
@@ -317,18 +370,11 @@ class BinanceExchangeManager:
                 "REST API call rejected during scan cycle — use WebSocket cache."
             )
 
-        if self._rest_token_bucket.is_hard_stopped() and not priority:
-            remaining = self._rest_token_bucket.hard_stop_remaining()
-            raise ExchangeRateLimitError(
-                f"REST hard-stop active (~{int(remaining)}s remaining)"
-            )
-
         call_weight = weight_for_call(func)
-        if Config.ENABLE_STRICT_RATE_LIMIT and not self._rest_token_bucket.is_hard_stopped():
+        if Config.ENABLE_STRICT_RATE_LIMIT:
             self._rest_token_bucket.acquire(call_weight)
 
         limiter = self._execution_rate_limiter if priority else self._rate_limiter
-        last_error: Optional[Exception] = None
         network_retries = max(Config.REST_NETWORK_MAX_RETRIES, 1)
         for attempt in range(1, network_retries + 1):
             if Config.ENABLE_STRICT_RATE_LIMIT:
@@ -336,27 +382,8 @@ class BinanceExchangeManager:
             try:
                 return func(*args, **kwargs)
             except BinanceAPIException as exc:
-                last_error = exc
                 if self._is_rate_limit_error(exc):
-                    halt_seconds = Config.RATE_LIMIT_HALT_SECONDS
-                    if exc.code == -1003:
-                        from market_data_hub import parse_ban_until_ms
-
-                        until_ms = parse_ban_until_ms(str(exc.message))
-                        if until_ms:
-                            halt_seconds = max(
-                                halt_seconds,
-                                int((until_ms / 1000.0) - time.time()),
-                            )
-                    self._rest_token_bucket.trigger_hard_stop(halt_seconds)
-                    if self._market_data:
-                        self._market_data.handle_rate_limit_error(exc)
-                    if self._critical_alerts and exc.code == -1003:
-                        self._critical_alerts.notify(
-                            "RATE_LIMIT",
-                            f"Binance IP/rate limit — REST halted ~{halt_seconds}s",
-                            exc=exc,
-                        )
+                    self._apply_rate_limit_halt(exc)
                     raise ExchangeRateLimitError(str(exc.message)) from exc
                 if self._critical_alerts and exc.code in (-1021, -2015, -2014):
                     self._critical_alerts.notify(
@@ -366,7 +393,6 @@ class BinanceExchangeManager:
                     )
                 raise ExchangeError(str(exc.message)) from exc
             except (ConnectionError, TimeoutError, OSError) as exc:
-                last_error = exc
                 if attempt >= network_retries:
                     if self._critical_alerts:
                         self._critical_alerts.notify(
@@ -385,9 +411,8 @@ class BinanceExchangeManager:
                 )
                 time.sleep(sleep_seconds)
             except Exception as exc:
-                last_error = exc
                 raise ExchangeError(str(exc)) from exc
-        raise ExchangeError(str(last_error))
+        raise ExchangeError("REST call failed")
 
     def _parse_symbol_rules(self, symbol_data: dict[str, Any]) -> SymbolRules:
         filters = {item["filterType"]: item for item in symbol_data.get("filters", [])}
@@ -528,7 +553,7 @@ class BinanceExchangeManager:
         if now < self._position_backoff_until:
             return self._position_cache.positions
 
-        if not self._rest_reads_allowed():
+        if not Config.ENABLE_REST_POSITION_POLL or not self._rest_reads_allowed():
             return self._position_cache.positions
 
         with self._position_refresh_lock:
@@ -569,10 +594,14 @@ class BinanceExchangeManager:
                 return ws_balance
 
         now = time.monotonic()
+        poll_interval = float(Config.BALANCE_REST_POLL_SECONDS)
+
+        if force_refresh and not self._is_execution_priority():
+            force_refresh = False
+
         if not force_refresh and self._balance_cache.is_valid():
             return self._balance_cache.value
 
-        poll_interval = float(Config.BALANCE_REST_POLL_SECONDS)
         if (
             not force_refresh
             and self._last_balance_rest_at > 0
@@ -583,7 +612,7 @@ class BinanceExchangeManager:
         if now < self._balance_rest_backoff_until:
             return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
 
-        if not self._rest_reads_allowed():
+        if not Config.ENABLE_REST_BALANCE_POLL or not self._rest_reads_allowed():
             return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
 
         try:
@@ -622,7 +651,10 @@ class BinanceExchangeManager:
     ) -> pd.DataFrame:
         fetch_limit = limit or Config.CANDLE_FETCH_LIMIT
         if allow_rest is None:
-            allow_rest = self._rest_reads_allowed()
+            if self.in_scan_mode or self._background_ws_only():
+                allow_rest = False
+            else:
+                allow_rest = self._rest_reads_allowed()
 
         def _rest_fetch() -> pd.DataFrame:
             klines = self._throttled_call(
@@ -724,7 +756,7 @@ class BinanceExchangeManager:
             if cached is not None and cached > 0:
                 return cached
 
-        if not self._rest_reads_allowed():
+        if not Config.ENABLE_REST_PRICE_FALLBACK or not self._rest_reads_allowed():
             return None
 
         try:
@@ -775,11 +807,19 @@ class BinanceExchangeManager:
             return 0.0
 
     def get_futures_ticker_map(self) -> dict[str, dict[str, Any]]:
-        """Return futures tickers from WebSocket cache; REST fallback only when allowed."""
-        if self._market_data and not self._market_data.ws_is_stale():
+        """Return futures tickers from WebSocket cache — REST fallback disabled by default."""
+        if self._market_data:
             cached = self._market_data.get_ticker_map()
             if cached:
                 return cached
+            if (
+                self._market_data.ws_is_running()
+                and not Config.ENABLE_REST_TICKER_FALLBACK
+            ):
+                return cached
+
+        if not Config.ENABLE_REST_TICKER_FALLBACK:
+            return self._market_data.get_ticker_map() if self._market_data else {}
 
         if not self._rest_reads_allowed():
             if self._market_data:
@@ -797,13 +837,16 @@ class BinanceExchangeManager:
                 return self._market_data.get_ticker_map()
             return {}
         except Exception as exc:
-            error_logger.error("Failed to fetch futures ticker map: %s", exc)
+            if self._rest_block_log.should_log("ticker_map_failed"):
+                error_logger.error("Failed to fetch futures ticker map: %s", exc)
             if self._market_data:
                 return self._market_data.get_ticker_map()
             return {}
 
     def get_book_ticker_map(self) -> dict[str, dict[str, Any]]:
         """Return book tickers — WS proxy by default; REST only when explicitly allowed."""
+        if self._market_data and self._market_data.has_ws_book_data():
+            return self._market_data.get_ws_book_ticker_map()
         allow_rest = self._rest_reads_allowed() and not Config.USE_WS_BOOK_PROXY
         if self._market_data:
             if Config.USE_WS_BOOK_PROXY:
@@ -839,6 +882,7 @@ class BinanceExchangeManager:
                 "symbol": str(symbol).upper(),
                 "bidPrice": bid,
                 "askPrice": ask,
+                "is_proxy": True,
             }
         return proxy
 

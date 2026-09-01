@@ -413,6 +413,30 @@ def main(controller: Optional[BotController] = None) -> str:
     critical_alerts = CriticalAlertService(db)
     exchange.attach_critical_alerts(critical_alerts)
 
+    startup_ban = exchange.get_startup_ban_status()
+    if startup_ban and startup_ban.is_banned:
+        market_data.apply_startup_ban(startup_ban)
+
+    market_data.start()
+    system_logger.info(
+        "Market data hub online (websocket=%s). Warming ticker cache…",
+        Config.ENABLE_WEBSOCKET_STREAMS,
+    )
+
+    if Config.ENABLE_WEBSOCKET_STREAMS and not (startup_ban and startup_ban.is_banned):
+        market_data.wait_until_ready(timeout_seconds=Config.WS_STARTUP_WAIT_SECONDS)
+        exchange.mark_ws_rest_ready()
+
+    if startup_ban and startup_ban.is_banned:
+        ban_msg = market_data.format_ban_message(startup_ban)
+        error_logger.critical("Startup ban check: %s", startup_ban.message)
+        system_logger.warning(
+            "Binance IP ban active — WebSocket-only until ban expires (~%ss).",
+            startup_ban.seconds_remaining,
+        )
+    elif not exchange._full_init_done:
+        exchange.ensure_initialized()
+
     scheduler = DailyScheduler(exchange, db, telegram=None, controller=controller)
     risk = RiskManager(exchange, db)
 
@@ -426,21 +450,8 @@ def main(controller: Optional[BotController] = None) -> str:
     scheduler.telegram = tg
     critical_alerts.attach_telegram(tg)
 
-    startup_ban = exchange.get_startup_ban_status()
     if startup_ban and startup_ban.is_banned:
-        ban_msg = market_data.format_ban_message(startup_ban)
-        error_logger.critical("Startup ban check: %s", startup_ban.message)
-        system_logger.warning(
-            "Binance IP ban active — scanning halted until ban expires (~%ss).",
-            startup_ban.seconds_remaining,
-        )
-        tg.send_message(ban_msg)
-
-    market_data.start()
-    system_logger.info(
-        "Market data hub online (websocket=%s, candle_cache=bar-aligned).",
-        Config.ENABLE_WEBSOCKET_STREAMS,
-    )
+        tg.send_message(market_data.format_ban_message(startup_ban))
 
     manager = TradeManager(
         exchange=exchange,
@@ -482,13 +493,15 @@ def main(controller: Optional[BotController] = None) -> str:
             if _wait_for_rest_unblock(market_data, controller):
                 continue
 
-            # Step 0b — Complete deferred exchange init once ban/halt clears
-            exchange.ensure_initialized()
+            # Step 0b — One-time deferred REST init (never retried aggressively in loop)
+            if not exchange._full_init_done and not market_data.is_rest_blocked()[0]:
+                exchange.ensure_initialized()
 
             # Step 1 — Periodic DB/exchange reconciliation (every 15 min)
             now_mono = time.monotonic()
             if now_mono - last_reconciliation >= Config.RECONCILIATION_INTERVAL_SECONDS:
-                reconcile_positions(exchange, db, tg, context="periodic")
+                if not market_data.is_rest_blocked()[0]:
+                    reconcile_positions(exchange, db, tg, context="periodic")
                 db.cleanup_expired_cooldowns()
                 last_reconciliation = now_mono
 
