@@ -148,6 +148,8 @@ class BinanceExchangeManager:
         self._scan_mode_lock = threading.Lock()
         self._execution_depth = 0
         self._execution_lock = threading.Lock()
+        self._bootstrap_depth = 0
+        self._bootstrap_lock = threading.Lock()
         self._critical_alerts: Any = None
         self._market_data: Any = None
         self._full_init_done = False
@@ -231,10 +233,32 @@ class BinanceExchangeManager:
             with self._execution_lock:
                 self._execution_depth = max(0, self._execution_depth - 1)
 
+    @contextmanager
+    def bootstrap_context(self) -> Generator[None, None, None]:
+        """
+        Allow one-time REST kline seeding outside scan cycles only.
+        Used when symbols are first subscribed to WS kline streams.
+        """
+        if self.in_scan_mode:
+            raise ExchangeError(
+                "Kline bootstrap REST is forbidden during active scan cycle."
+            )
+        with self._bootstrap_lock:
+            self._bootstrap_depth += 1
+        try:
+            yield
+        finally:
+            with self._bootstrap_lock:
+                self._bootstrap_depth = max(0, self._bootstrap_depth - 1)
+
     @property
     def in_scan_mode(self) -> bool:
         with self._scan_mode_lock:
             return self._scan_mode
+
+    def _is_bootstrap_priority(self) -> bool:
+        with self._bootstrap_lock:
+            return self._bootstrap_depth > 0
 
     def _is_execution_priority(self) -> bool:
         with self._execution_lock:
@@ -245,6 +269,8 @@ class BinanceExchangeManager:
 
     def _background_ws_only(self) -> bool:
         """Scan/monitor/risk paths must not hit REST when this is enabled."""
+        if self._is_bootstrap_priority():
+            return False
         return bool(Config.BACKGROUND_WS_ONLY) and not self._is_execution_priority()
 
     def _rest_reads_allowed(self) -> bool:
@@ -735,6 +761,19 @@ class BinanceExchangeManager:
         """REST kline fetch for bootstrap only (outside scan loops)."""
         return self.fetch_historical_candles(
             symbol, timeframe, limit=limit, allow_rest=True
+        )
+
+    def fetch_bootstrap_klines_df(
+        self, symbol: str, timeframe: str, limit: int | None = None
+    ) -> pd.DataFrame:
+        """One-time REST kline fetch — must run inside bootstrap_context()."""
+        if not self._is_bootstrap_priority():
+            raise ExchangeError(
+                "fetch_bootstrap_klines_df requires exchange.bootstrap_context()"
+            )
+        fetch_limit = limit or Config.CANDLE_FETCH_LIMIT
+        return self.fetch_historical_candles(
+            symbol, timeframe, limit=fetch_limit, allow_rest=True
         )
 
     def bootstrap_scan_candles(self, symbols: list[str], timeframes: list[str]) -> int:

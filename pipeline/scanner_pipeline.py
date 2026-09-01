@@ -58,6 +58,7 @@ class StrategyScannerPipeline:
         return False, ""
 
     def _subscribe_klines(self, symbols: list[str]) -> None:
+        """Subscribe WS kline streams only — no REST (bootstrap runs outside scan loop)."""
         if not self._hub or not symbols:
             return
         timeframes = [

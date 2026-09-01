@@ -11,6 +11,7 @@ from config import Config
 from core.regime_router import RegimeRouter
 from core.types import MarketSnapshot, RegimeLabel
 from exchange import BinanceExchangeManager
+from indicators.market_analyzer import MIN_ANALYZER_BARS
 from utils import safe_float
 
 
@@ -79,9 +80,12 @@ class SnapshotFactory:
 
     def _fetch_candles(self, symbol: str, timeframe: str) -> pd.DataFrame:
         try:
-            return self.exchange.fetch_historical_candles(
+            df = self.exchange.fetch_historical_candles(
                 symbol, timeframe, limit=self.candle_limit, allow_rest=False
             )
+            if df.empty or len(df) < MIN_ANALYZER_BARS:
+                return pd.DataFrame()
+            return df
         except Exception:
             return pd.DataFrame()
 

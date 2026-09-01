@@ -93,6 +93,7 @@ class MarketDataHub:
         self._user_conn_key: Optional[str] = None
         self._kline_conn_keys: list[str] = []
         self._subscribed_kline_streams: set[str] = set()
+        self._bootstrapped_pairs: set[tuple[str, str]] = set()
         self._ws_running = False
         self._last_ticker_event_at: float = 0.0
         self._last_user_event_at: float = 0.0
@@ -663,6 +664,95 @@ class MarketDataHub:
             len(new_streams),
             len(self._subscribed_kline_streams),
         )
+
+    def subscribe_and_bootstrap_klines(
+        self,
+        symbols: list[str],
+        intervals: list[str],
+        rest_fetcher: Optional[Callable[[str, str, int], pd.DataFrame]] = None,
+    ) -> int:
+        """
+        Subscribe WS kline streams, then one-time REST bootstrap for new pairs.
+        Must be called outside scan_context (via exchange.bootstrap_context()).
+        """
+        self.subscribe_kline_streams(symbols, intervals)
+        if not rest_fetcher or not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP:
+            return 0
+        return self.bootstrap_klines_on_subscribe(symbols, intervals, rest_fetcher)
+
+    def bootstrap_klines_on_subscribe(
+        self,
+        symbols: list[str],
+        intervals: list[str],
+        rest_fetcher: Callable[[str, str, int], pd.DataFrame],
+    ) -> int:
+        """
+        One-time REST historical kline load per (symbol, interval) into WS cache.
+        Skips pairs already bootstrapped or with sufficient cached bars.
+        """
+        blocked, reason = self.is_rest_blocked()
+        if blocked:
+            system_logger.warning(
+                "Kline startup bootstrap skipped — REST blocked: %s", reason
+            )
+            return 0
+
+        limit = Config.CANDLE_FETCH_LIMIT
+        min_bars = max(Config.WS_KLINE_BOOTSTRAP_MIN_BARS, 10)
+        pending: list[tuple[str, str]] = []
+
+        for symbol in symbols:
+            sym = symbol.upper()
+            for interval in intervals:
+                pair = (sym, interval)
+                if pair in self._bootstrapped_pairs:
+                    continue
+                cached = self.get_candles_cached_only(sym, interval, limit)
+                if not cached.empty and len(cached) >= min_bars:
+                    self._bootstrapped_pairs.add(pair)
+                    continue
+                pending.append(pair)
+
+        if not pending:
+            return 0
+
+        system_logger.info(
+            "One-time kline bootstrap starting — %s series to seed (limit=%s bars).",
+            len(pending),
+            limit,
+        )
+
+        seeded = 0
+        failed = 0
+        for sym, interval in pending:
+            try:
+                df = rest_fetcher(sym, interval, limit)
+                if df.empty or len(df) < min_bars:
+                    failed += 1
+                    continue
+                self.seed_klines_from_dataframe(sym, interval, df)
+                self._bootstrapped_pairs.add((sym, interval))
+                seeded += 1
+            except Exception as exc:
+                failed += 1
+                error_logger.warning(
+                    "Kline bootstrap failed for %s %s: %s", sym, interval, exc
+                )
+
+            delay = Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS
+            if delay > 0:
+                time.sleep(delay)
+
+        system_logger.info(
+            "One-time kline bootstrap complete — seeded=%s failed=%s pending_was=%s.",
+            seeded,
+            failed,
+            len(pending),
+        )
+        return seeded
+
+    def is_kline_bootstrapped(self, symbol: str, interval: str) -> bool:
+        return (symbol.upper(), interval) in self._bootstrapped_pairs
 
     def seed_klines_from_dataframe(
         self, symbol: str, interval: str, df: pd.DataFrame

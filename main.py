@@ -44,6 +44,35 @@ except ImportError:
     SCANNER_AVAILABLE = False
 
 
+def _bootstrap_scan_universe_at_startup(
+    scanner: Any,
+    exchange: BinanceExchangeManager,
+    market_data: Any,
+) -> None:
+    """One-time REST kline seed for scan universe — runs before the 15s trading loop."""
+    try:
+        symbols, _ = scanner.get_tradable_symbols()
+        if not symbols:
+            system_logger.warning(
+                "Startup kline bootstrap skipped — tradable universe empty."
+            )
+            return
+        timeframes = [
+            Config.ENTRY_TIMEFRAME,
+            Config.CONFIRM_TIMEFRAME,
+            Config.TREND_TIMEFRAME,
+        ]
+        expected = len(symbols) * len(timeframes)
+        seeded = scanner.ensure_scan_klines_ready(symbols)
+        system_logger.info(
+            "Startup kline bootstrap finished — %s/%s symbol series ready.",
+            seeded,
+            expected,
+        )
+    except Exception as exc:
+        error_logger.error("Startup kline bootstrap failed: %s", exc)
+
+
 def _wait_for_rest_unblock(
     market_data: Any,
     controller: BotController,
@@ -472,6 +501,13 @@ def main(controller: Optional[BotController] = None) -> str:
 
     reconcile_positions_at_startup(exchange, db, tg)
 
+    if (
+        scanner is not None
+        and Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
+        and not market_data.is_rest_blocked()[0]
+    ):
+        _bootstrap_scan_universe_at_startup(scanner, exchange, market_data)
+
     monitor_stop = threading.Event()
     _start_position_monitor(manager, monitor_stop)
 
@@ -519,10 +555,12 @@ def main(controller: Optional[BotController] = None) -> str:
             else:
                 allowed, gate_reason = _entries_allowed(scheduler, risk, db)
                 if allowed:
-                    if Config.ENABLE_REST_KLINE_BOOTSTRAP:
-                        scanner.bootstrap_next_batch(
-                            batch_size=Config.BOOTSTRAP_KLINE_BATCH_SIZE
-                        )
+                    if (
+                        Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
+                        and not market_data.is_rest_blocked()[0]
+                    ):
+                        scanner.ensure_scan_klines_ready()
+
                     if Config.USE_UNIFIED_SCAN_PIPELINE:
                         unified = scanner.scan_unified()
                         _execute_candidates(

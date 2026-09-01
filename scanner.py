@@ -225,8 +225,30 @@ class MarketScanner:
             )
         return pd.DataFrame()
 
+    def ensure_scan_klines_ready(self, symbols: Optional[list[str]] = None) -> int:
+        """
+        One-time REST kline seed for scan universe — runs outside scan_context.
+        Skips pairs already bootstrapped; safe to call before each scan batch.
+        """
+        if not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP or not self._hub:
+            return 0
+        if self.exchange.in_scan_mode:
+            return 0
+        if symbols is None:
+            symbols, _ = self.get_tradable_symbols()
+        if not symbols:
+            return 0
+
+        timeframes = [self.entry_tf, self.confirm_tf, self.trend_tf]
+        with self.exchange.bootstrap_context():
+            return self._hub.subscribe_and_bootstrap_klines(
+                symbols,
+                timeframes,
+                self.exchange.fetch_bootstrap_klines_df,
+            )
+
     def _prepare_scan_universe(self) -> tuple[List[str], dict[str, float]]:
-        """Build universe, subscribe WS klines, bootstrap REST seed (outside scan mode)."""
+        """Build universe and subscribe WS klines (REST bootstrap via ensure_scan_klines_ready)."""
         symbols, price_map = self.get_tradable_symbols()
         if not symbols:
             return [], {}
