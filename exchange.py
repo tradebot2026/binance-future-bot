@@ -16,6 +16,11 @@ import pandas as pd
 from binance.client import Client
 from binance.exceptions import BinanceAPIException, BinanceOrderException
 
+from rest_rate_guard import (
+    RestBlockLogSuppressor,
+    build_default_token_bucket,
+    weight_for_call,
+)
 from config import Config
 from exceptions import ExchangeError, ExchangeRateLimitError, OrderExecutionError
 from logger import error_logger, system_logger, trade_logger
@@ -129,7 +134,13 @@ class BinanceExchangeManager:
         self._execution_rate_limiter = RateLimiter(
             Config.EXECUTION_MIN_REQUEST_INTERVAL_MS
         )
+        self._rest_token_bucket = build_default_token_bucket()
+        self._rest_block_log = RestBlockLogSuppressor(
+            Config.REST_BLOCK_LOG_INTERVAL_SECONDS
+        )
         self._balance_cache = BalanceCache()
+        self._balance_rest_backoff_until: float = 0.0
+        self._last_balance_rest_at: float = 0.0
         self._position_cache = PositionCache()
         self._position_refresh_lock = threading.Lock()
         self._position_backoff_until: float = 0.0
@@ -152,6 +163,8 @@ class BinanceExchangeManager:
                 "Deferring account/symbol REST init until ban expires (~%ss).",
                 ban.seconds_remaining,
             )
+            if ban.seconds_remaining > 0:
+                self._rest_token_bucket.trigger_hard_stop(float(ban.seconds_remaining))
         else:
             self.ensure_initialized()
 
@@ -291,7 +304,12 @@ class BinanceExchangeManager:
 
         blocked, reason = self._rest_block_applies(priority)
         if blocked:
-            error_logger.warning("REST call blocked (ban active): %s", reason)
+            if self._market_data:
+                remaining = self._market_data.get_rest_block_remaining_seconds()
+                if remaining > 0:
+                    self._rest_token_bucket.trigger_hard_stop(float(remaining))
+            if self._rest_block_log.should_log(reason):
+                error_logger.warning("REST call blocked (ban active): %s", reason)
             raise ExchangeRateLimitError(reason)
 
         if self._scan_mode and self._scan_ws_only() and not priority:
@@ -299,9 +317,20 @@ class BinanceExchangeManager:
                 "REST API call rejected during scan cycle — use WebSocket cache."
             )
 
+        if self._rest_token_bucket.is_hard_stopped() and not priority:
+            remaining = self._rest_token_bucket.hard_stop_remaining()
+            raise ExchangeRateLimitError(
+                f"REST hard-stop active (~{int(remaining)}s remaining)"
+            )
+
+        call_weight = weight_for_call(func)
+        if Config.ENABLE_STRICT_RATE_LIMIT and not self._rest_token_bucket.is_hard_stopped():
+            self._rest_token_bucket.acquire(call_weight)
+
         limiter = self._execution_rate_limiter if priority else self._rate_limiter
         last_error: Optional[Exception] = None
-        for attempt in range(1, Config.MAX_RETRIES + 1):
+        network_retries = max(Config.REST_NETWORK_MAX_RETRIES, 1)
+        for attempt in range(1, network_retries + 1):
             if Config.ENABLE_STRICT_RATE_LIMIT:
                 limiter.wait()
             try:
@@ -309,36 +338,26 @@ class BinanceExchangeManager:
             except BinanceAPIException as exc:
                 last_error = exc
                 if self._is_rate_limit_error(exc):
+                    halt_seconds = Config.RATE_LIMIT_HALT_SECONDS
                     if exc.code == -1003:
-                        if self._market_data:
-                            self._market_data.handle_rate_limit_error(exc)
-                        raise ExchangeRateLimitError(str(exc.message)) from exc
+                        from market_data_hub import parse_ban_until_ms
 
-                    if self._market_data:
-                        blocked, _ = self._market_data.is_rest_blocked()
-                        if blocked:
-                            raise ExchangeRateLimitError(str(exc.message)) from exc
-
-                    sleep_seconds = self._backoff_seconds(attempt)
-                    error_logger.warning(
-                        "Rate limit hit (code=%s). Backoff %.1fs (attempt %s/%s).",
-                        exc.code,
-                        sleep_seconds,
-                        attempt,
-                        Config.MAX_RETRIES,
-                    )
-                    time.sleep(sleep_seconds)
-                    if attempt == Config.MAX_RETRIES:
-                        if self._market_data:
-                            self._market_data.handle_rate_limit_error(exc)
-                        if self._critical_alerts:
-                            self._critical_alerts.notify(
-                                "RATE_LIMIT",
-                                f"Binance rate limit exhausted after {Config.MAX_RETRIES} retries",
-                                exc=exc,
+                        until_ms = parse_ban_until_ms(str(exc.message))
+                        if until_ms:
+                            halt_seconds = max(
+                                halt_seconds,
+                                int((until_ms / 1000.0) - time.time()),
                             )
-                        raise ExchangeRateLimitError(str(exc.message)) from exc
-                    continue
+                    self._rest_token_bucket.trigger_hard_stop(halt_seconds)
+                    if self._market_data:
+                        self._market_data.handle_rate_limit_error(exc)
+                    if self._critical_alerts and exc.code == -1003:
+                        self._critical_alerts.notify(
+                            "RATE_LIMIT",
+                            f"Binance IP/rate limit — REST halted ~{halt_seconds}s",
+                            exc=exc,
+                        )
+                    raise ExchangeRateLimitError(str(exc.message)) from exc
                 if self._critical_alerts and exc.code in (-1021, -2015, -2014):
                     self._critical_alerts.notify(
                         "API_DISCONNECT",
@@ -348,16 +367,7 @@ class BinanceExchangeManager:
                 raise ExchangeError(str(exc.message)) from exc
             except (ConnectionError, TimeoutError, OSError) as exc:
                 last_error = exc
-                sleep_seconds = self._backoff_seconds(attempt)
-                error_logger.warning(
-                    "Network error on API call (attempt %s/%s): %s — retry in %.1fs",
-                    attempt,
-                    Config.MAX_RETRIES,
-                    exc,
-                    sleep_seconds,
-                )
-                time.sleep(sleep_seconds)
-                if attempt == Config.MAX_RETRIES:
+                if attempt >= network_retries:
                     if self._critical_alerts:
                         self._critical_alerts.notify(
                             "API_DISCONNECT",
@@ -365,11 +375,18 @@ class BinanceExchangeManager:
                             exc=exc,
                         )
                     raise ExchangeError(str(exc)) from exc
+                sleep_seconds = self._backoff_seconds(attempt)
+                error_logger.warning(
+                    "Network error on API call (attempt %s/%s): %s — retry in %.1fs",
+                    attempt,
+                    network_retries,
+                    exc,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
             except Exception as exc:
                 last_error = exc
-                if attempt == Config.MAX_RETRIES:
-                    raise ExchangeError(str(exc)) from exc
-                time.sleep(self._backoff_seconds(attempt))
+                raise ExchangeError(str(exc)) from exc
         raise ExchangeError(str(last_error))
 
     def _parse_symbol_rules(self, symbol_data: dict[str, Any]) -> SymbolRules:
@@ -523,10 +540,11 @@ class BinanceExchangeManager:
                 return self._parse_open_positions(raw or [])
             except ExchangeRateLimitError as exc:
                 self._position_backoff_until = now + Config.POSITION_CACHE_BACKOFF_SECONDS
-                error_logger.warning(
-                    "Position REST refresh blocked/rate-limited — stale cache: %s",
-                    exc,
-                )
+                if self._rest_block_log.should_log("position_refresh_blocked"):
+                    error_logger.warning(
+                        "Position REST refresh blocked — using WS/stale cache: %s",
+                        exc,
+                    )
                 return self._position_cache.positions
             except Exception as exc:
                 error_logger.error("Failed to refresh position cache: %s", exc)
@@ -539,36 +557,58 @@ class BinanceExchangeManager:
     def get_futures_balance(self, force_refresh: bool = False) -> float:
         """
         Return available USDT balance.
-        Uses in-memory cache unless force_refresh=True or TTL expired.
+        Prefers user-data WebSocket wallet updates; REST polls at most every
+        BALANCE_REST_POLL_SECONDS and never retries aggressively during bans.
         """
+        quote = Config.QUOTE_ASSET
+
+        if self._market_data and not self._market_data.user_stream_is_stale():
+            ws_balance = self._market_data.get_ws_wallet_balance(quote)
+            if ws_balance > 0:
+                self._balance_cache.set(ws_balance)
+                return ws_balance
+
+        now = time.monotonic()
         if not force_refresh and self._balance_cache.is_valid():
             return self._balance_cache.value
 
-        for attempt in range(1, Config.MAX_RETRIES + 1):
-            try:
-                account_info = self._throttled_call(
-                    self.client.futures_account,
-                    **self.recv_window_param,
-                )
-                for asset in account_info.get("assets", []):
-                    if asset.get("asset") == Config.QUOTE_ASSET:
-                        balance = safe_float(asset.get("availableBalance"))
-                        if balance <= 0:
-                            balance = safe_float(asset.get("crossWalletBalance"))
-                        self._balance_cache.set(balance)
-                        return balance
-                return 0.0
-            except Exception as exc:
-                error_logger.warning(
-                    "Balance fetch failed (attempt %s/%s): %s",
-                    attempt,
-                    Config.MAX_RETRIES,
-                    exc,
-                )
-                time.sleep(min(2 ** attempt, 10))
+        poll_interval = float(Config.BALANCE_REST_POLL_SECONDS)
+        if (
+            not force_refresh
+            and self._last_balance_rest_at > 0
+            and (now - self._last_balance_rest_at) < poll_interval
+        ):
+            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
 
-        error_logger.error("All balance fetch attempts exhausted.")
-        return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+        if now < self._balance_rest_backoff_until:
+            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+
+        if not self._rest_reads_allowed():
+            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+
+        try:
+            account_info = self._throttled_call(
+                self.client.futures_account,
+                **self.recv_window_param,
+            )
+            self._last_balance_rest_at = now
+            for asset in account_info.get("assets", []):
+                if asset.get("asset") == quote:
+                    balance = safe_float(asset.get("availableBalance"))
+                    if balance <= 0:
+                        balance = safe_float(asset.get("crossWalletBalance"))
+                    self._balance_cache.set(balance)
+                    return balance
+            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+        except ExchangeRateLimitError:
+            self._balance_rest_backoff_until = now + poll_interval
+            self._last_balance_rest_at = now
+            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+        except Exception as exc:
+            self._balance_rest_backoff_until = now + min(poll_interval, 120.0)
+            if self._rest_block_log.should_log("balance_fetch_failed"):
+                error_logger.warning("Balance REST fetch failed (cached fallback): %s", exc)
+            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
 
     # ---------------- Market data ----------------
 
@@ -687,26 +727,19 @@ class BinanceExchangeManager:
         if not self._rest_reads_allowed():
             return None
 
-        for attempt in range(1, Config.MAX_RETRIES + 1):
-            try:
-                ticker = self._throttled_call(
-                    self.client.futures_symbol_ticker,
-                    symbol=symbol,
-                )
-                price = safe_float(ticker.get("price"))
-                return price if price > 0 else None
-            except ExchangeRateLimitError:
-                raise
-            except Exception as exc:
-                error_logger.warning(
-                    "Price fetch failed for %s (attempt %s/%s): %s",
-                    symbol,
-                    attempt,
-                    Config.MAX_RETRIES,
-                    exc,
-                )
-                time.sleep(min(2 ** attempt, 5))
-        return None
+        try:
+            ticker = self._throttled_call(
+                self.client.futures_symbol_ticker,
+                symbol=symbol,
+            )
+            price = safe_float(ticker.get("price"))
+            return price if price > 0 else None
+        except ExchangeRateLimitError:
+            return None
+        except Exception as exc:
+            if self._rest_block_log.should_log(f"price_fetch_{symbol}"):
+                error_logger.warning("Price fetch failed for %s: %s", symbol, exc)
+            return None
 
     def get_book_spread_percent(self, symbol: str) -> Optional[float]:
         """Bid/ask spread % via cached bookTicker map when available."""
@@ -770,9 +803,11 @@ class BinanceExchangeManager:
             return {}
 
     def get_book_ticker_map(self) -> dict[str, dict[str, Any]]:
-        """Return book tickers — WS/stale cache during scan; REST only when allowed."""
-        allow_rest = self._rest_reads_allowed()
+        """Return book tickers — WS proxy by default; REST only when explicitly allowed."""
+        allow_rest = self._rest_reads_allowed() and not Config.USE_WS_BOOK_PROXY
         if self._market_data:
+            if Config.USE_WS_BOOK_PROXY:
+                return self._build_book_proxy_from_tickers()
             return self._market_data.get_book_ticker_map(
                 self._fetch_book_ticker_map_rest if allow_rest else None,
                 allow_rest=allow_rest,
@@ -780,6 +815,32 @@ class BinanceExchangeManager:
         if not allow_rest:
             return {}
         return self._fetch_book_ticker_map_rest()
+
+    def _build_book_proxy_from_tickers(self) -> dict[str, dict[str, Any]]:
+        """Synthetic bid/ask from WS miniTicker high/low/last (zero REST)."""
+        ticker_map: dict[str, dict[str, Any]] = {}
+        if self._market_data:
+            ticker_map = self._market_data.get_ticker_map()
+        if not ticker_map:
+            return {}
+
+        proxy: dict[str, dict[str, Any]] = {}
+        for symbol, row in ticker_map.items():
+            last = safe_float(row.get("lastPrice"))
+            high = safe_float(row.get("highPrice"))
+            low = safe_float(row.get("lowPrice"))
+            if last <= 0:
+                continue
+            bid = low if low > 0 else last
+            ask = high if high > 0 else last
+            if bid > ask:
+                bid, ask = ask, bid
+            proxy[str(symbol).upper()] = {
+                "symbol": str(symbol).upper(),
+                "bidPrice": bid,
+                "askPrice": ask,
+            }
+        return proxy
 
     def _fetch_book_ticker_map_rest(self) -> dict[str, dict[str, Any]]:
         try:

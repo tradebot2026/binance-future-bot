@@ -44,6 +44,37 @@ except ImportError:
     SCANNER_AVAILABLE = False
 
 
+def _wait_for_rest_unblock(
+    market_data: Any,
+    controller: BotController,
+) -> bool:
+    """
+    If Binance REST/IP ban is active, sleep until it clears.
+    Returns True if REST is still blocked (caller should skip this iteration).
+    """
+    if market_data is None:
+        return False
+
+    blocked, _ = market_data.is_rest_blocked()
+    if not blocked:
+        return False
+
+    remaining = market_data.get_rest_block_remaining_seconds()
+    if remaining <= 0:
+        return False
+
+    market_data.log_ban_pause_once(remaining)
+    deadline = time.monotonic() + remaining
+    while time.monotonic() < deadline and not controller.is_shutdown_requested():
+        blocked, _ = market_data.is_rest_blocked()
+        if not blocked:
+            system_logger.info("REST ban cleared — resuming trading loop.")
+            return False
+        time.sleep(min(30.0, deadline - time.monotonic()))
+
+    return market_data.is_rest_blocked()[0]
+
+
 def _startup_banner() -> None:
     mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
     system_logger.info("=" * 60)
@@ -322,17 +353,24 @@ def _handle_loop_error(
     if isinstance(exc, ExchangeRateLimitError):
         if tg and market_data:
             ban = market_data.get_ban_status()
-            if ban and ban.is_banned:
-                tg.send_message(market_data.format_ban_message(ban))
+            if ban and ban.is_banned and ban.seconds_remaining > 60:
+                if not getattr(_handle_loop_error, "_ban_alert_sent", False):
+                    tg.send_message(market_data.format_ban_message(ban))
+                    _handle_loop_error._ban_alert_sent = True
             else:
                 halted, reason = market_data.is_scan_halted()
-                if halted:
+                if halted and market_data.get_rest_block_remaining_seconds() <= 60:
                     tg.send_message(
                         "🚫 <b>Binance rate limit</b>\n\n"
                         f"{reason}\n\n"
                         "<i>Scanning paused; position monitoring continues.</i>"
                     )
-        sleep_for = Config.RATE_LIMIT_HALT_SECONDS
+        if market_data and not market_data.is_rest_blocked()[0]:
+            _handle_loop_error._ban_alert_sent = False
+        sleep_for = max(
+            market_data.get_rest_block_remaining_seconds() if market_data else 0,
+            Config.RATE_LIMIT_HALT_SECONDS,
+        )
     elif isinstance(exc, (ExchangeError, DatabaseError)):
         sleep_for = min(Config.RESTART_DELAY_SECONDS * 2, 90)
     else:
@@ -440,7 +478,11 @@ def main(controller: Optional[BotController] = None) -> str:
         loop_started = time.monotonic()
 
         try:
-            # Step 0 — Complete deferred exchange init once ban/halt clears
+            # Step 0 — If IP ban active, pause silently until REST is allowed again
+            if _wait_for_rest_unblock(market_data, controller):
+                continue
+
+            # Step 0b — Complete deferred exchange init once ban/halt clears
             exchange.ensure_initialized()
 
             # Step 1 — Periodic DB/exchange reconciliation (every 15 min)
@@ -464,7 +506,10 @@ def main(controller: Optional[BotController] = None) -> str:
             else:
                 allowed, gate_reason = _entries_allowed(scheduler, risk, db)
                 if allowed:
-                    scanner.bootstrap_next_batch(batch_size=Config.BOOTSTRAP_KLINE_BATCH_SIZE)
+                    if Config.ENABLE_REST_KLINE_BOOTSTRAP:
+                        scanner.bootstrap_next_batch(
+                            batch_size=Config.BOOTSTRAP_KLINE_BATCH_SIZE
+                        )
                     smc_candidates = scanner.scan_market()
                     _execute_candidates(
                         candidates=smc_candidates,

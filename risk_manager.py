@@ -89,7 +89,7 @@ class RiskManager:
         self._reference_balance = 0.0
         # Only closed trades after this timestamp count toward consecutive-loss blocks.
         self._consecutive_loss_reset_at = utc_now().isoformat()
-        balance = self.exchange.get_futures_balance(force_refresh=True)
+        balance = self.exchange.get_futures_balance(force_refresh=False)
         if balance > 0:
             self._reference_balance = balance
         system_logger.info(
@@ -263,7 +263,7 @@ class RiskManager:
         if metrics.realized_pnl > self._peak_realized_pnl:
             self._peak_realized_pnl = metrics.realized_pnl
 
-        balance = self.exchange.get_futures_balance(force_refresh=True)
+        balance = self.exchange.get_futures_balance(force_refresh=False)
         if balance > 0 and self._reference_balance <= 0:
             self._reference_balance = balance
 

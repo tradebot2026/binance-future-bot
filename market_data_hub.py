@@ -90,8 +90,17 @@ class MarketDataHub:
         self._last_user_event_at: float = 0.0
         self._positions: list[dict[str, Any]] = []
         self._unrealized_pnl_total: float = 0.0
+        self._wallet_balances: dict[str, float] = {}
+        self._ban_notice_logged: bool = False
 
-    # ---------------- Lifecycle ----------------
+    def get_rest_block_remaining_seconds(self) -> int:
+        with self._lock:
+            return max(int(self._rest_blocked_until - time.time()), 0)
+
+    def get_ws_wallet_balance(self, asset: str = "USDT") -> float:
+        asset = asset.upper()
+        with self._lock:
+            return safe_float(self._wallet_balances.get(asset))
 
     def start(self) -> None:
         if not Config.ENABLE_WEBSOCKET_STREAMS or self._ws_running:
@@ -170,14 +179,17 @@ class MarketDataHub:
                 banned_until_iso=until_iso,
             )
         with self._lock:
+            was_active = time.time() < self._rest_blocked_until
             self._rest_blocked_until = max(
                 self._rest_blocked_until, time.time() + halt_seconds
             )
             self._rest_block_reason = message
         self.halt_scanning(halt_seconds, message)
-        error_logger.critical(
-            "ALL REST API calls blocked for ~%ss | %s", halt_seconds, message
-        )
+        if not was_active:
+            self._ban_notice_logged = False
+            error_logger.critical(
+                "ALL REST API calls blocked for ~%ss | %s", halt_seconds, message
+            )
 
     def is_rest_blocked(self) -> tuple[bool, str]:
         with self._lock:
@@ -185,7 +197,24 @@ class MarketDataHub:
                 remaining = int(self._rest_blocked_until - time.time())
                 reason = self._rest_block_reason or "rate_limit_ban"
                 return True, f"{reason} (REST resumes in ~{remaining}s)"
+            if self._ban_notice_logged:
+                self._ban_notice_logged = False
             return False, ""
+
+    def log_ban_pause_once(self, remaining_seconds: int) -> None:
+        """Log a single pause notice per ban window (avoids log spam)."""
+        with self._lock:
+            if self._ban_notice_logged:
+                return
+            self._ban_notice_logged = True
+        ban = self._ban_status
+        until = ban.banned_until_iso if ban and ban.banned_until_iso else "unknown"
+        system_logger.warning(
+            "Binance REST/IP ban active — main loop paused ~%ss (until %s). "
+            "Scanning and REST polling suspended; WebSocket cache only.",
+            remaining_seconds,
+            until,
+        )
 
     def handle_rate_limit_error(self, exc: Exception) -> None:
         message = str(exc)
@@ -248,6 +277,7 @@ class MarketDataHub:
             event = message.get("e")
             if event == "ACCOUNT_UPDATE":
                 account = message.get("a", {})
+                balances_raw = account.get("B", [])
                 positions_raw = account.get("P", [])
                 parsed: list[dict[str, Any]] = []
                 unrealized_total = 0.0
@@ -267,6 +297,15 @@ class MarketDataHub:
                         }
                     )
                 with self._lock:
+                    for bal in balances_raw:
+                        asset = str(bal.get("a", "")).upper()
+                        if not asset:
+                            continue
+                        cross_wallet = safe_float(bal.get("cw"))
+                        wallet = safe_float(bal.get("wb"))
+                        value = cross_wallet if cross_wallet > 0 else wallet
+                        if value > 0:
+                            self._wallet_balances[asset] = value
                     self._positions = parsed
                     self._unrealized_pnl_total = unrealized_total
                     self._last_user_event_at = time.monotonic()

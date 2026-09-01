@@ -255,6 +255,8 @@ class MarketScanner:
 
     def bootstrap_next_batch(self, batch_size: int = 9) -> int:
         """REST-seed missing kline buffers between scan cycles (never during evaluation)."""
+        if not Config.ENABLE_REST_KLINE_BOOTSTRAP:
+            return 0
         if self.exchange.in_scan_mode:
             return 0
         if not self.exchange._rest_reads_allowed():
