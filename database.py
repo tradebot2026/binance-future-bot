@@ -208,7 +208,22 @@ class DatabaseManager:
                     "CREATE INDEX IF NOT EXISTS idx_trades_closed_at ON trades(closed_at)"
                 )
                 cursor.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_critical_errors_ts ON critical_errors(timestamp)"
+                    """
+                    CREATE TABLE IF NOT EXISTS signal_conflicts (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        symbol TEXT,
+                        strategy TEXT,
+                        direction TEXT,
+                        score REAL,
+                        timestamp TEXT,
+                        reason TEXT,
+                        context TEXT
+                    )
+                    """
+                )
+
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_signal_conflicts_symbol ON signal_conflicts(symbol)"
                 )
 
                 conn.commit()
@@ -313,27 +328,139 @@ class DatabaseManager:
         """Kill-switch: pause RANGE entries after daily loss or consecutive SLs."""
         from constants import STRATEGY_RANGE_REVERSION
 
+        return self.is_strategy_entries_paused(
+            STRATEGY_RANGE_REVERSION, date_str=date_str, health_check=True
+        )
+
+    def is_global_entries_paused(self) -> tuple[bool, str]:
+        """Global daily circuit breaker from scheduler."""
+        from utils import utc_today_str
+
+        stats = self.get_daily_stats(utc_today_str()) or {}
+        if stats.get("status") == DAILY_STATUS_PAUSED:
+            return True, "Daily PnL limit reached — entries paused for today."
+        return False, ""
+
+    def is_strategy_entries_paused(
+        self,
+        strategy: str,
+        date_str: str | None = None,
+        health_check: bool = True,
+    ) -> tuple[bool, str]:
+        """Per-strategy kill-switch mirroring Range pattern."""
+        from config import Config
+        from constants import STRATEGY_RANGE_REVERSION, STRATEGY_SMC_TREND
+        from utils import utc_today_str
+
+        if date_str is None:
+            date_str = utc_today_str()
+
+        if not health_check:
+            return False, ""
+
+        limits = {
+            STRATEGY_RANGE_REVERSION: (
+                Config.RANGE_DAILY_MAX_LOSS_PERCENT,
+                Config.RANGE_MAX_CONSECUTIVE_LOSSES,
+            ),
+            STRATEGY_SMC_TREND: (
+                Config.SMC_DAILY_MAX_LOSS_PERCENT,
+                Config.SMC_MAX_CONSECUTIVE_LOSSES,
+            ),
+            "SMC_MULTITF": (
+                Config.SMC_DAILY_MAX_LOSS_PERCENT,
+                Config.SMC_MAX_CONSECUTIVE_LOSSES,
+            ),
+        }
+        daily_limit, consec_limit = limits.get(strategy.upper(), (0.0, 0))
+        if daily_limit <= 0 and consec_limit <= 0:
+            return False, ""
+
         stats = self.get_daily_stats(date_str) or {}
         start_balance = safe_float(stats.get("start_balance"))
-        range_pnl = self.get_strategy_daily_realized_pnl(date_str, STRATEGY_RANGE_REVERSION)
+        strategy_pnl = self.get_strategy_daily_realized_pnl(date_str, strategy)
 
-        if start_balance > 0:
-            range_pnl_pct = (range_pnl / start_balance) * 100.0
-            if range_pnl_pct <= -Config.RANGE_DAILY_MAX_LOSS_PERCENT:
+        if start_balance > 0 and daily_limit > 0:
+            pnl_pct = (strategy_pnl / start_balance) * 100.0
+            if pnl_pct <= -daily_limit:
                 return True, (
-                    f"Range daily loss limit hit ({range_pnl_pct:.2f}% <= "
-                    f"-{Config.RANGE_DAILY_MAX_LOSS_PERCENT:.2f}%)"
+                    f"{strategy} daily loss limit hit ({pnl_pct:.2f}% <= "
+                    f"-{daily_limit:.2f}%)"
                 )
 
-        consec = self.count_consecutive_strategy_losses(
-            STRATEGY_RANGE_REVERSION, Config.RANGE_MAX_CONSECUTIVE_LOSSES
-        )
-        if consec >= Config.RANGE_MAX_CONSECUTIVE_LOSSES:
-            return True, (
-                f"Range consecutive SL limit ({consec}/"
-                f"{Config.RANGE_MAX_CONSECUTIVE_LOSSES})"
-            )
+        if consec_limit > 0:
+            consec = self.count_consecutive_strategy_losses(strategy, consec_limit)
+            if consec >= consec_limit:
+                return True, (
+                    f"{strategy} consecutive SL limit ({consec}/{consec_limit})"
+                )
         return False, ""
+
+    def log_signal_conflict(
+        self,
+        symbol: str,
+        strategy: str,
+        direction: str,
+        score: float,
+        reason: str,
+        context: str = "conflict_guard",
+    ) -> None:
+        with self._write_lock:
+            try:
+                with self.connection() as conn:
+                    conn.execute(
+                        """
+                        INSERT INTO signal_conflicts
+                            (symbol, strategy, direction, score, timestamp, reason, context)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            symbol.upper(),
+                            strategy,
+                            direction,
+                            score,
+                            utc_now().isoformat(),
+                            reason,
+                            context,
+                        ),
+                    )
+                    conn.commit()
+            except sqlite3.Error as exc:
+                error_logger.error("Failed to log signal conflict: %s", exc)
+
+    def get_open_trades_for_symbol(self, symbol: str) -> List[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in ACTIVE_TRADE_STATUSES)
+        query = (
+            f"SELECT * FROM trades WHERE symbol = ? AND status IN ({placeholders}) "
+            "ORDER BY opened_at ASC"
+        )
+        try:
+            with self.connection() as conn:
+                rows = conn.execute(
+                    query, (symbol.upper(), *ACTIVE_TRADE_STATUSES)
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            error_logger.error("Failed to fetch open trades for %s: %s", symbol, exc)
+            return []
+
+    def get_open_trades_by_strategy(self, strategy: str) -> List[dict[str, Any]]:
+        placeholders = ",".join("?" for _ in ACTIVE_TRADE_STATUSES)
+        query = (
+            f"SELECT * FROM trades WHERE strategy = ? AND status IN ({placeholders}) "
+            "ORDER BY opened_at ASC"
+        )
+        try:
+            with self.connection() as conn:
+                rows = conn.execute(
+                    query, (strategy, *ACTIVE_TRADE_STATUSES)
+                ).fetchall()
+                return [dict(row) for row in rows]
+        except sqlite3.Error as exc:
+            error_logger.error(
+                "Failed to fetch open trades for strategy %s: %s", strategy, exc
+            )
+            return []
 
     def get_open_trades(self) -> List[dict[str, Any]]:
         """Return active trades ordered FIFO."""

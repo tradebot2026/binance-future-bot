@@ -126,7 +126,9 @@ class RiskManager:
             return False, snapshot.block_reason
 
         if strategy and is_range_strategy(strategy):
-            paused, pause_reason = self.db.is_range_entries_paused(utc_today_str())
+            paused, pause_reason = self.db.is_strategy_entries_paused(
+                strategy, health_check=True
+            )
             if paused:
                 return False, pause_reason
 
@@ -135,6 +137,21 @@ class RiskManager:
                 return False, (
                     f"Max RANGE positions reached ({range_open}/{Config.MAX_RANGE_POSITIONS})"
                 )
+
+        if strategy:
+            from constants import is_smc_strategy
+
+            if is_smc_strategy(strategy):
+                paused, pause_reason = self.db.is_strategy_entries_paused(
+                    strategy, health_check=True
+                )
+                if paused:
+                    return False, pause_reason
+                smc_open = self.db.count_active_trades_by_strategy(strategy)
+                if smc_open >= Config.MAX_SMC_POSITIONS:
+                    return False, (
+                        f"Max SMC positions reached ({smc_open}/{Config.MAX_SMC_POSITIONS})"
+                    )
 
         if symbol:
             if self._has_active_trade_for_symbol(symbol):

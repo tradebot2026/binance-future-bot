@@ -7,8 +7,6 @@ retest-based entry validation, and watchlist generation.
 from __future__ import annotations
 
 import time
-from collections import Counter
-from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 import pandas as pd
@@ -19,7 +17,10 @@ from constants import STRATEGY_RANGE_REVERSION, STRATEGY_SMC_TREND
 from database import DatabaseManager
 from exceptions import ExchangeRateLimitError
 from exchange import BinanceExchangeManager
+from indicators.market_analyzer import MIN_ANALYZER_BARS, MarketAnalyzer
 from logger import error_logger, scanner_logger, signal_logger
+from pipeline.scanner_pipeline import StrategyScannerPipeline
+from pipeline.universe_builder import UniverseBuilder, UniverseFilterStats
 from range_engine import evaluate_range_setup
 from smc_engine import (
     effective_smc_min_score,
@@ -29,128 +30,8 @@ from smc_engine import (
 )
 from utils import safe_float
 
-MIN_ANALYZER_BARS = 250
-
-
-@dataclass
-class UniverseFilterStats:
-    """Rejection counters for universe construction logging."""
-
-    total_tickers: int = 0
-    rejected_quote: int = 0
-    rejected_volume: int = 0
-    rejected_spread: int = 0
-    rejected_stagnant: int = 0
-    rejected_atr: int = 0
-    rejected_blacklist: int = 0
-    rejected_no_price: int = 0
-    candidates: list[tuple[str, float, float, float]] = field(default_factory=list)
-
-
-class MarketAnalyzer:
-    """Vectorized indicators and live-safe SMC constructs (no lookahead)."""
-
-    @staticmethod
-    def apply_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty or len(df) < MIN_ANALYZER_BARS:
-            return df
-
-        df = df.copy()
-
-        df["ema_20"] = ta.trend.ema_indicator(df["close"], window=20)
-        df["ema_50"] = ta.trend.ema_indicator(df["close"], window=50)
-        df["ema_200"] = ta.trend.ema_indicator(df["close"], window=200)
-        df["rsi"] = ta.momentum.rsi(df["close"], window=14)
-
-        macd = ta.trend.MACD(df["close"])
-        df["macd"] = macd.macd()
-        df["macd_signal"] = macd.macd_signal()
-        df["macd_hist"] = macd.macd_diff()
-
-        df["atr"] = ta.volatility.average_true_range(
-            high=df["high"],
-            low=df["low"],
-            close=df["close"],
-            window=14,
-        )
-        df["adx"] = ta.trend.adx(df["high"], df["low"], df["close"], window=14)
-        df["vol_sma"] = df["volume"].rolling(window=20).mean()
-        df["vol_spike"] = df["volume"] > (df["vol_sma"] * 2.0)
-
-        df["trend_bullish"] = (df["close"] > df["ema_200"]) & (df["ema_50"] > df["ema_200"])
-        df["trend_bearish"] = (df["close"] < df["ema_200"]) & (df["ema_50"] < df["ema_200"])
-
-        df["swing_high"] = (
-            (df["high"].shift(2) > df["high"].shift(4))
-            & (df["high"].shift(2) > df["high"].shift(3))
-            & (df["high"].shift(2) > df["high"].shift(1))
-            & (df["high"].shift(2) > df["high"])
-        )
-        df["swing_low"] = (
-            (df["low"].shift(2) < df["low"].shift(4))
-            & (df["low"].shift(2) < df["low"].shift(3))
-            & (df["low"].shift(2) < df["low"].shift(1))
-            & (df["low"].shift(2) < df["low"])
-        )
-
-        df["last_swing_high"] = df["high"].shift(2).where(df["swing_high"]).ffill()
-        df["last_swing_low"] = df["low"].shift(2).where(df["swing_low"]).ffill()
-
-        min_fvg_gap = df["atr"] * 0.15
-        df["fvg_bullish_raw"] = (df["low"] > df["high"].shift(2)) & (
-            (df["low"] - df["high"].shift(2)) > min_fvg_gap
-        )
-        df["fvg_bearish_raw"] = (df["high"] < df["low"].shift(2)) & (
-            (df["low"].shift(2) - df["high"]) > min_fvg_gap
-        )
-        df["fvg_bullish"] = df["fvg_bullish_raw"] & (df["low"].shift(1) > df["high"].shift(2))
-        df["fvg_bearish"] = df["fvg_bearish_raw"] & (df["high"].shift(1) < df["low"].shift(2))
-
-        df["break_high"] = (df["close"] > df["last_swing_high"].shift(1)) & (
-            df["close"].shift(1) <= df["last_swing_high"].shift(1)
-        )
-        df["break_low"] = (df["close"] < df["last_swing_low"].shift(1)) & (
-            df["close"].shift(1) >= df["last_swing_low"].shift(1)
-        )
-
-        df["bos_bullish"] = df["break_high"] & df["trend_bullish"]
-        df["choch_bullish"] = df["break_high"] & df["trend_bearish"]
-        df["bos_bearish"] = df["break_low"] & df["trend_bearish"]
-        df["choch_bearish"] = df["break_low"] & df["trend_bullish"]
-
-        df["is_bull_displacement"] = df["close"] > df["open"]
-        df["is_bear_displacement"] = df["close"] < df["open"]
-        df["liq_sweep_bullish"] = (
-            (df["low"] < df["last_swing_low"].shift(1))
-            & (df["close"] > df["last_swing_low"].shift(1))
-        )
-        df["liq_sweep_bearish"] = (
-            (df["high"] > df["last_swing_high"].shift(1))
-            & (df["close"] < df["last_swing_high"].shift(1))
-        )
-
-        df["ob_bullish_formed"] = (df["bos_bullish"] | df["choch_bullish"]) & df[
-            "is_bear_displacement"
-        ].shift(1)
-        df["ob_bearish_formed"] = (df["bos_bearish"] | df["choch_bearish"]) & df[
-            "is_bull_displacement"
-        ].shift(1)
-
-        df.dropna(subset=["ema_200", "last_swing_high", "last_swing_low"], inplace=True)
-        df.reset_index(drop=True, inplace=True)
-        return df
-
-    @staticmethod
-    def get_latest_atr(df: pd.DataFrame) -> float:
-        if "atr" in df.columns and not df.empty:
-            return float(df["atr"].iloc[-1])
-        return 0.0
-
-    @staticmethod
-    def extract_latest_signals(df: pd.DataFrame) -> tuple[dict, dict]:
-        if len(df) < 2:
-            return {}, {}
-        return df.iloc[-1].to_dict(), df.iloc[-2].to_dict()
+# Backward-compatible re-export
+__all__ = ["MarketAnalyzer", "MarketScanner", "MIN_ANALYZER_BARS", "UniverseFilterStats"]
 
 
 class MarketScanner:
@@ -167,7 +48,16 @@ class MarketScanner:
         self._hub = getattr(exchange, "_market_data", None)
         self._scan_priority: list[str] = []
         self._near_miss_scores: dict[str, float] = {}
-        self._last_universe_symbols: list[str] = []
+        self._pipeline = StrategyScannerPipeline(exchange, db)
+        self._universe_builder = UniverseBuilder(exchange, db)
+
+    @property
+    def _last_universe_symbols(self) -> list[str]:
+        return self._pipeline.last_universe_symbols
+
+    @_last_universe_symbols.setter
+    def _last_universe_symbols(self, value: list[str]) -> None:
+        self._pipeline._last_universe_symbols = value
 
     def _scan_gate_open(self) -> tuple[bool, str]:
         if self._hub:
@@ -312,33 +202,11 @@ class MarketScanner:
     def get_tradable_symbols(self) -> tuple[list[str], dict[str, float]]:
         """
         Build dynamic scan universe (50-80 pairs) from WS ticker/book cache only.
-        Filters: USDT-M volume, bid-ask spread, 24h range, optional ATR, blacklist.
+        Delegates to UniverseBuilder (backward-compatible wrapper).
         """
-        try:
-            ticker_map = self.exchange.get_futures_ticker_map()
-            if not ticker_map:
-                scanner_logger.warning("Universe empty — WS ticker cache not ready.")
-                return [], {}
-
-            book_map = self.exchange.get_book_ticker_map()
-            stats = self._build_universe_candidates(ticker_map, book_map)
-
-            cap = Config.MAX_SCAN_UNIVERSE
-            selected = stats.candidates[:cap]
-            symbols = self._prioritize_symbols([row[0] for row in selected])
-
-            price_map: dict[str, float] = {}
-            for symbol in symbols:
-                ticker = ticker_map.get(symbol, {})
-                price = safe_float(ticker.get("lastPrice"))
-                if price > 0:
-                    price_map[symbol] = price
-
-            self._log_universe_selection(symbols, stats)
-            return symbols, price_map
-        except Exception as exc:
-            error_logger.error("Failed to build tradable universe: %s", exc)
-            return [], {}
+        result = self._universe_builder.build(priority_symbols=self._scan_priority)
+        self._pipeline._last_universe_symbols = result.symbols
+        return result.symbols, result.price_map
 
     def _fetch_candles_with_retry(
         self, symbol: str, timeframe: str, limit: int
@@ -676,97 +544,11 @@ class MarketScanner:
             return neutral
 
     def scan_market(self) -> List[Dict[str, Any]]:
-        """Run a sequential, rate-limit-aware scan and return top candidates."""
-        halted, halt_reason = self._scan_gate_open()
-        if halted:
-            scanner_logger.warning("SMC scan skipped — %s", halt_reason)
-            return []
-
-        scanner_logger.info(
-            "Starting market scan cycle (sequential, pair_delay=%.2fs)...",
-            Config.SCAN_PAIR_DELAY_SECONDS,
-        )
-        started = time.time()
-        symbols, price_map = self._prepare_scan_universe()
-        self._last_universe_symbols = symbols
-        if not symbols:
-            scanner_logger.warning("No tradable symbols found.")
-            return []
-
-        candidates: List[Dict[str, Any]] = []
-        rejection_stats: Counter[str] = Counter()
-        scanned = 0
-
-        with self.exchange.scan_context():
-            for symbol in symbols:
-                if time.time() - started > Config.SCAN_TIMEOUT_SEC:
-                    scanner_logger.warning(
-                        "Scan timeout after %ss — returning partial results (%s/%s scanned).",
-                        Config.SCAN_TIMEOUT_SEC,
-                        scanned,
-                        len(symbols),
-                    )
-                    break
-
-                result = self.evaluate_single_symbol(symbol, price_map=price_map)
-                scanned += 1
-
-                result_score = safe_float(result.get("score"))
-                result_confluence = str(result.get("confluence", ""))
-                result_macro = str(result.get("macro_trend", "NEUTRAL"))
-                min_required = effective_smc_min_score(result_confluence, result_macro)
-
-                if (
-                    result.get("action") not in (None, "NEUTRAL")
-                    and result_score >= min_required
-                ):
-                    candidates.append(result)
-                    self.db.log_signal(
-                        {
-                            "symbol": result["symbol"],
-                            "timeframe": self.entry_tf,
-                            "direction": result["action"],
-                            "score": result["score"],
-                            "strategy": result.get("strategy", STRATEGY_SMC_TREND),
-                            "reason": (
-                                f"macro={result.get('macro_trend')}|"
-                                f"confluence={result.get('confluence')}"
-                            ),
-                            "accepted": True,
-                            "structure_metadata": result.get("structure_metadata"),
-                        }
-                    )
-                elif result.get("action") == "NEUTRAL":
-                    rejection_stats["neutral"] += 1
-
-                if Config.SCAN_PAIR_DELAY_SECONDS > 0:
-                    time.sleep(Config.SCAN_PAIR_DELAY_SECONDS)
-
-        candidates.sort(key=lambda item: safe_float(item.get("score")), reverse=True)
-        top = candidates[: Config.MAX_POSITIONS]
-
-        if top:
-            self.db.update_watchlist(top)
-            for item in top:
-                scanner_logger.info(
-                    "Candidate | %s | %s | score=%.1f | confluence=%s | price=%.6f",
-                    item["symbol"],
-                    item["action"],
-                    safe_float(item["score"]),
-                    item.get("confluence", "?"),
-                    safe_float(item["price"]),
-                )
-        else:
-            scanner_logger.info(
-                "Scan complete — no candidates above threshold (scanned=%s/%s, neutral=%s).",
-                scanned,
-                len(symbols),
-                rejection_stats.get("neutral", 0),
-            )
-
-        self._finalize_scan_priority()
-        scanner_logger.info("Scan finished in %.2fs.", time.time() - started)
-        return top
+        """Run SMC scan via modular pipeline (backward-compatible wrapper)."""
+        self._pipeline._scan_priority = self._scan_priority
+        results = self._pipeline.scan_smc()
+        self._scan_priority = self._pipeline._scan_priority
+        return results
 
     def _evaluate_range_direction(
         self,
@@ -868,75 +650,18 @@ class MarketScanner:
             error_logger.error("Range evaluation failed for %s: %s", symbol, exc)
             return neutral
 
+    def scan_unified(self) -> List[Dict[str, Any]]:
+        """Run all enabled strategies through the unified modular pipeline."""
+        self._pipeline._scan_priority = self._scan_priority
+        results = self._pipeline.scan_unified()
+        self._scan_priority = self._pipeline._scan_priority
+        return results
+
     def scan_range_market(self) -> List[Dict[str, Any]]:
-        """Scan for mean-reversion setups when the market is ranging."""
-        if not Config.ENABLE_RANGE_REGIME:
+        """Run RANGE scan via modular pipeline (backward-compatible wrapper)."""
+        if not Config.ENABLE_RANGE_REGIME and not Config.ENABLE_STRATEGY_RANGE:
             return []
-
-        halted, halt_reason = self._scan_gate_open()
-        if halted:
-            scanner_logger.warning("RANGE scan skipped — %s", halt_reason)
-            return []
-
-        scanner_logger.info(
-            "Starting RANGE scan (pair_delay=%.2fs)...",
-            Config.SCAN_PAIR_DELAY_SECONDS,
-        )
-        started = time.time()
-        symbols, price_map = self._prepare_scan_universe()
-        self._last_universe_symbols = symbols
-        if not symbols:
-            return []
-
-        candidates: List[Dict[str, Any]] = []
-        scanned = 0
-
-        with self.exchange.scan_context():
-            for symbol in symbols:
-                if time.time() - started > Config.SCAN_TIMEOUT_SEC:
-                    break
-
-                result = self.evaluate_range_symbol(symbol, price_map=price_map)
-                scanned += 1
-
-                if (
-                    result.get("action") not in (None, "NEUTRAL")
-                    and safe_float(result.get("score")) >= Config.RANGE_MIN_SCORE
-                ):
-                    candidates.append(result)
-                    self.db.log_signal(
-                        {
-                            "symbol": result["symbol"],
-                            "timeframe": self.entry_tf,
-                            "direction": result["action"],
-                            "score": result["score"],
-                            "strategy": STRATEGY_RANGE_REVERSION,
-                            "reason": f"edge={result.get('confluence')}|range_mode",
-                            "accepted": True,
-                            "structure_metadata": result.get("structure_metadata"),
-                        }
-                    )
-
-                if Config.SCAN_PAIR_DELAY_SECONDS > 0:
-                    time.sleep(Config.SCAN_PAIR_DELAY_SECONDS)
-
-        candidates.sort(key=lambda item: safe_float(item.get("score")), reverse=True)
-        top = candidates[: Config.MAX_RANGE_POSITIONS]
-
-        if top:
-            for item in top:
-                scanner_logger.info(
-                    "RANGE Candidate | %s | %s | score=%.1f | edge=%s",
-                    item["symbol"],
-                    item["action"],
-                    safe_float(item["score"]),
-                    item.get("confluence", "?"),
-                )
-        else:
-            scanner_logger.info(
-                "RANGE scan complete — no candidates (scanned=%s).", scanned
-            )
-
-        self._finalize_scan_priority()
-        scanner_logger.info("RANGE scan finished in %.2fs.", time.time() - started)
-        return top
+        self._pipeline._scan_priority = self._scan_priority
+        results = self._pipeline.scan_range()
+        self._scan_priority = self._pipeline._scan_priority
+        return results

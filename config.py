@@ -169,6 +169,61 @@ class Config:
     RANGE_LOOKBACK_BARS: int = _env_int("RANGE_LOOKBACK_BARS", 48)
     RANGE_MIN_SCORE: float = _env_float("RANGE_MIN_SCORE", 65.0)
 
+    # ---------------- Multi-strategy modular system ----------------
+    ENABLE_STRATEGY_SMC: bool = _env_bool("ENABLE_STRATEGY_SMC", True)
+    ENABLE_STRATEGY_RANGE: bool = _env_bool("ENABLE_STRATEGY_RANGE", True)
+    ENABLE_STRATEGY_LIQUIDITY_SWEEP: bool = _env_bool(
+        "ENABLE_STRATEGY_LIQUIDITY_SWEEP", False
+    )
+    ENABLE_STRATEGY_VWAP_PULLBACK: bool = _env_bool(
+        "ENABLE_STRATEGY_VWAP_PULLBACK", False
+    )
+    ENABLE_STRATEGY_VP_BREAKOUT: bool = _env_bool("ENABLE_STRATEGY_VP_BREAKOUT", False)
+    ENABLE_STRATEGY_VOL_EXPANSION: bool = _env_bool(
+        "ENABLE_STRATEGY_VOL_EXPANSION", False
+    )
+    ALLOW_CROSS_STRATEGY_SCALE_IN: bool = _env_bool(
+        "ALLOW_CROSS_STRATEGY_SCALE_IN", False
+    )
+    ENABLE_PORTFOLIO_ALLOCATOR: bool = _env_bool("ENABLE_PORTFOLIO_ALLOCATOR", True)
+    ENABLE_GLOBAL_STRATEGY_KILL_SWITCH: bool = _env_bool(
+        "ENABLE_GLOBAL_STRATEGY_KILL_SWITCH", True
+    )
+    USE_UNIFIED_SCAN_PIPELINE: bool = _env_bool("USE_UNIFIED_SCAN_PIPELINE", False)
+    VP_BREAKOUT_TOP_VOLUME_LIMIT: int = _env_int("VP_BREAKOUT_TOP_VOLUME_LIMIT", 20)
+    VWAP_SESSION_ANCHOR_UTC: bool = _env_bool("VWAP_SESSION_ANCHOR_UTC", True)
+
+    MAX_SMC_POSITIONS: int = _env_int("MAX_SMC_POSITIONS", 8)
+    MAX_LSC_POSITIONS: int = _env_int("MAX_LSC_POSITIONS", 3)
+    MAX_VWAP_POSITIONS: int = _env_int("MAX_VWAP_POSITIONS", 4)
+    MAX_VPB_POSITIONS: int = _env_int("MAX_VPB_POSITIONS", 3)
+    MAX_VEMR_POSITIONS: int = _env_int("MAX_VEMR_POSITIONS", 2)
+
+    STRATEGY_PRIORITY_SMC: float = _env_float("STRATEGY_PRIORITY_SMC", 1.0)
+    STRATEGY_PRIORITY_RANGE: float = _env_float("STRATEGY_PRIORITY_RANGE", 0.8)
+    STRATEGY_PRIORITY_LSC: float = _env_float("STRATEGY_PRIORITY_LSC", 0.95)
+    STRATEGY_PRIORITY_VWAP: float = _env_float("STRATEGY_PRIORITY_VWAP", 0.9)
+    STRATEGY_PRIORITY_VPB: float = _env_float("STRATEGY_PRIORITY_VPB", 0.85)
+    STRATEGY_PRIORITY_VEMR: float = _env_float("STRATEGY_PRIORITY_VEMR", 0.7)
+
+    STRATEGY_BUDGET_SMC: float = _env_float("STRATEGY_BUDGET_SMC", 0.35)
+    STRATEGY_BUDGET_RANGE: float = _env_float("STRATEGY_BUDGET_RANGE", 0.10)
+    STRATEGY_BUDGET_LSC: float = _env_float("STRATEGY_BUDGET_LSC", 0.15)
+    STRATEGY_BUDGET_VWAP: float = _env_float("STRATEGY_BUDGET_VWAP", 0.20)
+    STRATEGY_BUDGET_VPB: float = _env_float("STRATEGY_BUDGET_VPB", 0.15)
+    STRATEGY_BUDGET_VEMR: float = _env_float("STRATEGY_BUDGET_VEMR", 0.05)
+
+    MAX_ACCOUNT_MARGIN_UTILIZATION: float = _env_float(
+        "MAX_ACCOUNT_MARGIN_UTILIZATION", 0.65
+    )
+    MIN_LIQUIDATION_BUFFER_PCT: float = _env_float("MIN_LIQUIDATION_BUFFER_PCT", 25.0)
+    MAX_GROSS_EXPOSURE_PCT: float = _env_float("MAX_GROSS_EXPOSURE_PCT", 2.5)
+    MAX_NET_LONG_EXPOSURE_PCT: float = _env_float("MAX_NET_LONG_EXPOSURE_PCT", 1.5)
+    MAX_NET_SHORT_EXPOSURE_PCT: float = _env_float("MAX_NET_SHORT_EXPOSURE_PCT", 1.5)
+
+    SMC_DAILY_MAX_LOSS_PERCENT: float = _env_float("SMC_DAILY_MAX_LOSS_PERCENT", 5.0)
+    SMC_MAX_CONSECUTIVE_LOSSES: int = _env_int("SMC_MAX_CONSECUTIVE_LOSSES", 3)
+
     # ---------------- Market filters / universe ----------------
     MIN_24H_VOLUME_USDT: float = _env_float("MIN_24H_VOLUME_USDT", 10_000_000.0)
     MAX_SPREAD_PERCENT: float = _env_float("MAX_SPREAD_PERCENT", 0.08)

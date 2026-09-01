@@ -523,28 +523,10 @@ def main(controller: Optional[BotController] = None) -> str:
                         scanner.bootstrap_next_batch(
                             batch_size=Config.BOOTSTRAP_KLINE_BATCH_SIZE
                         )
-                    smc_candidates = scanner.scan_market()
-                    _execute_candidates(
-                        candidates=smc_candidates,
-                        executor=executor,
-                        risk=risk,
-                        scheduler=scheduler,
-                        db=db,
-                        tg=tg,
-                        critical_alerts=critical_alerts,
-                    )
-
-                    if Config.ENABLE_RANGE_REGIME:
-                        range_candidates = scanner.scan_range_market()
-                        if range_candidates:
-                            system_logger.info(
-                                "RANGE scan found %s candidate(s) — SMC has priority; "
-                                "filling up to %s RANGE slots.",
-                                len(range_candidates),
-                                Config.MAX_RANGE_POSITIONS,
-                            )
+                    if Config.USE_UNIFIED_SCAN_PIPELINE:
+                        unified = scanner.scan_unified()
                         _execute_candidates(
-                            candidates=range_candidates,
+                            candidates=unified,
                             executor=executor,
                             risk=risk,
                             scheduler=scheduler,
@@ -552,6 +534,36 @@ def main(controller: Optional[BotController] = None) -> str:
                             tg=tg,
                             critical_alerts=critical_alerts,
                         )
+                    else:
+                        smc_candidates = scanner.scan_market()
+                        _execute_candidates(
+                            candidates=smc_candidates,
+                            executor=executor,
+                            risk=risk,
+                            scheduler=scheduler,
+                            db=db,
+                            tg=tg,
+                            critical_alerts=critical_alerts,
+                        )
+
+                        if Config.ENABLE_RANGE_REGIME or Config.ENABLE_STRATEGY_RANGE:
+                            range_candidates = scanner.scan_range_market()
+                            if range_candidates:
+                                system_logger.info(
+                                    "RANGE scan found %s candidate(s) — SMC has priority; "
+                                    "filling up to %s RANGE slots.",
+                                    len(range_candidates),
+                                    Config.MAX_RANGE_POSITIONS,
+                                )
+                            _execute_candidates(
+                                candidates=range_candidates,
+                                executor=executor,
+                                risk=risk,
+                                scheduler=scheduler,
+                                db=db,
+                                tg=tg,
+                                critical_alerts=critical_alerts,
+                            )
                 elif gate_reason:
                     system_logger.info("Entries paused: %s", gate_reason)
 
