@@ -772,9 +772,57 @@ class BinanceExchangeManager:
                 "fetch_bootstrap_klines_df requires exchange.bootstrap_context()"
             )
         fetch_limit = limit or Config.CANDLE_FETCH_LIMIT
-        return self.fetch_historical_candles(
-            symbol, timeframe, limit=fetch_limit, allow_rest=True
+        return self._fetch_bootstrap_klines_direct(symbol, timeframe, fetch_limit)
+
+    def _fetch_bootstrap_klines_direct(
+        self, symbol: str, timeframe: str, limit: int
+    ) -> pd.DataFrame:
+        """
+        Fast parallel-safe kline fetch for startup bootstrap only.
+        Skips the 1s inter-request limiter and token bucket (concurrency capped elsewhere).
+        """
+        blocked, reason = self._rest_block_applies(execution_priority=False)
+        if blocked:
+            raise ExchangeRateLimitError(reason)
+
+        try:
+            klines = self.client.futures_klines(
+                symbol=symbol,
+                interval=timeframe,
+                limit=limit,
+            )
+        except BinanceAPIException as exc:
+            if self._is_rate_limit_error(exc):
+                self._apply_rate_limit_halt(exc)
+                raise ExchangeRateLimitError(str(exc.message)) from exc
+            raise ExchangeError(str(exc.message)) from exc
+        except (ConnectionError, TimeoutError, OSError) as exc:
+            raise ExchangeError(str(exc)) from exc
+
+        if not klines:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(
+            klines,
+            columns=[
+                "timestamp",
+                "open",
+                "high",
+                "low",
+                "close",
+                "volume",
+                "close_time",
+                "quote_asset_volume",
+                "number_of_trades",
+                "taker_buy_base_asset_volume",
+                "taker_buy_quote_asset_volume",
+                "ignore",
+            ],
         )
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        for col in ("open", "high", "low", "close", "volume"):
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df[["timestamp", "open", "high", "low", "close", "volume"]]
 
     def bootstrap_scan_candles(self, symbols: list[str], timeframes: list[str]) -> int:
         """Seed WS kline buffers via REST before scan evaluation (not during scan)."""

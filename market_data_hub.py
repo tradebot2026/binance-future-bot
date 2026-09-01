@@ -20,6 +20,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 from config import Config
+from kline_bootstrap import run_parallel_kline_bootstrap
 from logger import error_logger, system_logger
 from utils import safe_float
 from ws_reconnect import (
@@ -716,40 +717,18 @@ class MarketDataHub:
         if not pending:
             return 0
 
-        system_logger.info(
-            "One-time kline bootstrap starting — %s series to seed (limit=%s bars).",
-            len(pending),
+        def _mark_bootstrapped(sym: str, interval: str) -> None:
+            self._bootstrapped_pairs.add((sym.upper(), interval))
+
+        result = run_parallel_kline_bootstrap(
+            pending,
+            rest_fetcher,
             limit,
+            min_bars,
+            seed_fn=self.seed_klines_from_dataframe,
+            mark_bootstrapped=_mark_bootstrapped,
         )
-
-        seeded = 0
-        failed = 0
-        for sym, interval in pending:
-            try:
-                df = rest_fetcher(sym, interval, limit)
-                if df.empty or len(df) < min_bars:
-                    failed += 1
-                    continue
-                self.seed_klines_from_dataframe(sym, interval, df)
-                self._bootstrapped_pairs.add((sym, interval))
-                seeded += 1
-            except Exception as exc:
-                failed += 1
-                error_logger.warning(
-                    "Kline bootstrap failed for %s %s: %s", sym, interval, exc
-                )
-
-            delay = Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS
-            if delay > 0:
-                time.sleep(delay)
-
-        system_logger.info(
-            "One-time kline bootstrap complete — seeded=%s failed=%s pending_was=%s.",
-            seeded,
-            failed,
-            len(pending),
-        )
-        return seeded
+        return result.seeded
 
     def is_kline_bootstrapped(self, symbol: str, interval: str) -> bool:
         return (symbol.upper(), interval) in self._bootstrapped_pairs
