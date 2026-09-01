@@ -40,7 +40,7 @@ class RegimeRouter:
             if cls._has_valid_range(df_trend):
                 return RegimeLabel.RANGE_CHOP
 
-        if cls._is_compression(df_confirm or df_entry):
+        if cls._is_compression(cls._first_valid_df(df_confirm, df_entry)):
             return RegimeLabel.COMPRESSION
 
         adx_15m = cls._latest_adx(df_confirm)
@@ -48,6 +48,13 @@ class RegimeRouter:
             return RegimeLabel.STRONG_TREND
 
         return RegimeLabel.UNCLEAR
+
+    @staticmethod
+    def _first_valid_df(*dfs: "pd.DataFrame | None") -> "pd.DataFrame | None":
+        for df in dfs:
+            if df is not None and not df.empty:
+                return df
+        return None
 
     @staticmethod
     def _latest_adx(df: "pd.DataFrame | None") -> float:
@@ -66,7 +73,7 @@ class RegimeRouter:
 
     @staticmethod
     def _has_valid_range(df: "pd.DataFrame | None") -> bool:
-        if df is None or len(df) < 10:
+        if df is None or df.empty or len(df) < 10:
             return False
         lookback = min(Config.RANGE_LOOKBACK_BARS, len(df))
         window = df.iloc[-lookback:]
@@ -76,7 +83,7 @@ class RegimeRouter:
 
     @staticmethod
     def _is_compression(df: "pd.DataFrame | None") -> bool:
-        if df is None or len(df) < 30 or "atr" not in df.columns:
+        if df is None or df.empty or len(df) < 30 or "atr" not in df.columns:
             return False
         atr_series = df["atr"].dropna()
         if len(atr_series) < 20:
@@ -89,7 +96,7 @@ class RegimeRouter:
 
     @staticmethod
     def _is_expansion_spike(df: "pd.DataFrame | None") -> bool:
-        if df is None or len(df) < 20:
+        if df is None or df.empty or len(df) < 20:
             return False
         if "atr" not in df.columns or "high" not in df.columns:
             return False
