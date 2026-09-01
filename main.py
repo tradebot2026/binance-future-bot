@@ -57,11 +57,7 @@ def _bootstrap_scan_universe_at_startup(
                 "Startup kline bootstrap skipped — tradable universe empty."
             )
             return
-        timeframes = [
-            Config.ENTRY_TIMEFRAME,
-            Config.CONFIRM_TIMEFRAME,
-            Config.TREND_TIMEFRAME,
-        ]
+        timeframes = Config.get_scan_kline_intervals()
         expected = len(symbols) * len(timeframes)
         seeded = scanner.ensure_scan_klines_ready(symbols)
         system_logger.info(

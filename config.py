@@ -53,6 +53,16 @@ class Config:
         "WS_RECONNECT_DEBOUNCE_SECONDS", 5.0
     )
     WS_KLINE_BUFFER_LIMIT: int = _env_int("WS_KLINE_BUFFER_LIMIT", 320)
+    WS_KLINE_MAX_STREAMS_PER_SOCKET: int = _env_int(
+        "WS_KLINE_MAX_STREAMS_PER_SOCKET", 100
+    )
+    WS_KLINE_LIVE_TIMEFRAMES_ONLY: bool = _env_bool(
+        "WS_KLINE_LIVE_TIMEFRAMES_ONLY", True
+    )
+    WS_KLINE_WS_TIMEFRAMES: str = os.getenv("WS_KLINE_WS_TIMEFRAMES", "")
+    WS_KLINE_SOCKET_STALE_SECONDS: int = _env_int(
+        "WS_KLINE_SOCKET_STALE_SECONDS", 600
+    )
     SCAN_WS_ONLY: bool = _env_bool("SCAN_WS_ONLY", True)
     BOOTSTRAP_KLINE_BATCH_SIZE: int = _env_int("BOOTSTRAP_KLINE_BATCH_SIZE", 9)
     BOOK_TICKER_CACHE_SECONDS: int = _env_int("BOOK_TICKER_CACHE_SECONDS", 90)
@@ -297,6 +307,24 @@ class Config:
         DATA_DIR,
         os.getenv("DATABASE_NAME", "trading_bot.sqlite"),
     )
+
+    @classmethod
+    def get_scan_kline_intervals(cls) -> list[str]:
+        """All timeframes required for indicator snapshots (REST bootstrap + cache)."""
+        return [cls.ENTRY_TIMEFRAME, cls.CONFIRM_TIMEFRAME, cls.TREND_TIMEFRAME]
+
+    @classmethod
+    def get_ws_kline_intervals(cls) -> list[str]:
+        """Timeframes subscribed live via WebSocket (keep total streams under limit)."""
+        if cls.WS_KLINE_WS_TIMEFRAMES.strip():
+            return [
+                part.strip()
+                for part in cls.WS_KLINE_WS_TIMEFRAMES.split(",")
+                if part.strip()
+            ]
+        if cls.WS_KLINE_LIVE_TIMEFRAMES_ONLY:
+            return [cls.ENTRY_TIMEFRAME]
+        return cls.get_scan_kline_intervals()
 
     @classmethod
     def setup_directories(cls) -> None:

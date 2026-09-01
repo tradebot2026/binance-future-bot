@@ -239,7 +239,7 @@ class MarketScanner:
         if not symbols:
             return 0
 
-        timeframes = [self.entry_tf, self.confirm_tf, self.trend_tf]
+        timeframes = Config.get_scan_kline_intervals()
         with self.exchange.bootstrap_context():
             return self._hub.subscribe_and_bootstrap_klines(
                 symbols,
@@ -253,9 +253,8 @@ class MarketScanner:
         if not symbols:
             return [], {}
 
-        timeframes = [self.entry_tf, self.confirm_tf, self.trend_tf]
         if self._hub:
-            self._hub.subscribe_kline_streams(symbols, timeframes)
+            self._hub.subscribe_kline_streams(symbols)
 
         return symbols, price_map
 
@@ -273,10 +272,10 @@ class MarketScanner:
             symbols, _ = self.get_tradable_symbols()
             self._last_universe_symbols = symbols
 
-        timeframes = [self.entry_tf, self.confirm_tf, self.trend_tf]
+        timeframes = Config.get_scan_kline_intervals()
         hub = self._hub
         if hub and symbols:
-            hub.subscribe_kline_streams(symbols, timeframes)
+            hub.subscribe_kline_streams(symbols)
         pending: list[tuple[str, str]] = []
         limit = Config.CANDLE_FETCH_LIMIT
         hub = self._hub

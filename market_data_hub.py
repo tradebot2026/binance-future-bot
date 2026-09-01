@@ -47,7 +47,17 @@ TIMEFRAME_SECONDS: dict[str, int] = {
 }
 
 _BAN_UNTIL_RE = re.compile(r"banned until\s+(\d+)", re.IGNORECASE)
-_KLINE_MULTIPLEX_CHUNK = 180
+
+
+@dataclass
+class _KlineMultiplexSocket:
+    """One multiplex WS connection carrying up to N kline stream subscriptions."""
+
+    streams: list[str]
+    conn_key: Optional[str] = None
+    last_event_at: float = field(default_factory=time.monotonic)
+    reconnect_in_progress: bool = False
+    _reconnect_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -92,7 +102,7 @@ class MarketDataHub:
         self._ticker_conn_key: Optional[str] = None
         self._book_ticker_conn_key: Optional[str] = None
         self._user_conn_key: Optional[str] = None
-        self._kline_conn_keys: list[str] = []
+        self._kline_sockets: list[_KlineMultiplexSocket] = []
         self._subscribed_kline_streams: set[str] = set()
         self._bootstrapped_pairs: set[tuple[str, str]] = set()
         self._ws_running = False
@@ -228,8 +238,43 @@ class MarketDataHub:
                 continue
             if self.is_ws_warming_up():
                 continue
+            self._check_kline_sockets_health()
             if self.ws_is_stale():
                 self._request_reconnect("ticker stream stale — no events received")
+
+    @staticmethod
+    def _kline_socket_chunk_size() -> int:
+        return max(Config.WS_KLINE_MAX_STREAMS_PER_SOCKET, 1)
+
+    @classmethod
+    def _chunk_stream_list(cls, streams: list[str]) -> list[list[str]]:
+        size = cls._kline_socket_chunk_size()
+        return [streams[i : i + size] for i in range(0, len(streams), size)]
+
+    def _wrap_kline_socket_callback(
+        self,
+        handler: Callable[[dict[str, Any]], None],
+        socket_idx: int,
+    ) -> Callable[[dict[str, Any]], None]:
+        """Per-socket kline callback — reconnects only the affected multiplex socket."""
+
+        def _wrapped(message: dict[str, Any]) -> None:
+            if is_ws_error_message(message):
+                detail = str(message.get("m", message.get("type", "ws error")))
+                if is_read_loop_closed_error(detail):
+                    self._request_kline_socket_reconnect(socket_idx, detail)
+                return
+            try:
+                if 0 <= socket_idx < len(self._kline_sockets):
+                    self._kline_sockets[socket_idx].last_event_at = time.monotonic()
+                handler(message)
+            except Exception as exc:
+                if is_read_loop_closed_error(exc):
+                    self._request_kline_socket_reconnect(socket_idx, str(exc))
+                elif self._ws_log.should_log(f"kline_cb:{type(exc).__name__}"):
+                    error_logger.warning("Kline WebSocket callback error: %s", exc)
+
+        return _wrapped
 
     def _wrap_ws_callback(
         self, handler: Callable[[dict[str, Any]], None]
@@ -306,16 +351,113 @@ class MarketDataHub:
             with self._reconnect_lock:
                 self._reconnect_in_progress = False
 
+    def _check_kline_sockets_health(self) -> None:
+        stale_after = max(Config.WS_KLINE_SOCKET_STALE_SECONDS, 60)
+        now = time.monotonic()
+        for idx, sock in enumerate(self._kline_sockets):
+            if not sock.streams or sock.reconnect_in_progress:
+                continue
+            if (now - sock.last_event_at) > stale_after:
+                self._request_kline_socket_reconnect(
+                    idx, f"kline socket stale ({len(sock.streams)} streams)"
+                )
+
+    def _request_kline_socket_reconnect(self, socket_idx: int, reason: str) -> None:
+        if not Config.WS_RECONNECT_ENABLED or not Config.ENABLE_WEBSOCKET_STREAMS:
+            return
+        if socket_idx < 0 or socket_idx >= len(self._kline_sockets):
+            return
+
+        sock = self._kline_sockets[socket_idx]
+        with sock._reconnect_lock:
+            if sock.reconnect_in_progress:
+                return
+            sock.reconnect_in_progress = True
+
+        if self._ws_log.should_log(f"kline_sock:{socket_idx}:{reason}"):
+            system_logger.warning(
+                "Kline WS socket %s dropped (%s streams) — reconnecting socket only.",
+                socket_idx,
+                len(sock.streams),
+            )
+
+        threading.Thread(
+            target=self._reconnect_kline_socket_worker,
+            args=(socket_idx, reason),
+            name=f"ws-kline-reconnect-{socket_idx}",
+            daemon=True,
+        ).start()
+
+    def _reconnect_kline_socket_worker(self, socket_idx: int, reason: str) -> None:
+        sock = self._kline_sockets[socket_idx] if socket_idx < len(self._kline_sockets) else None
+        try:
+            if sock is None or not sock.streams:
+                return
+            time.sleep(max(Config.WS_RECONNECT_MIN_SECONDS, 0.5))
+            if not self._ws_manager or not self._ws_running or self._reconnect_in_progress:
+                return
+            self._close_kline_multiplex(sock)
+            sock.conn_key = self._start_kline_socket(sock, socket_idx)
+            sock.last_event_at = time.monotonic()
+            system_logger.info(
+                "Kline WS socket %s reconnected (%s streams).",
+                socket_idx,
+                len(sock.streams),
+            )
+        except Exception as exc:
+            if self._ws_log.should_log(f"kline_sock_fail:{socket_idx}:{exc}"):
+                error_logger.error(
+                    "Kline WS socket %s reconnect failed: %s", socket_idx, exc
+                )
+        finally:
+            if sock is not None:
+                sock.reconnect_in_progress = False
+
+    def _start_kline_socket(
+        self, sock: _KlineMultiplexSocket, socket_idx: int
+    ) -> str:
+        if not self._ws_manager:
+            raise RuntimeError("WebSocket manager not running")
+        return self._ws_manager.start_futures_multiplex_socket(
+            callback=self._wrap_kline_socket_callback(
+                self._on_kline_multiplex, socket_idx
+            ),
+            streams=sock.streams,
+        )
+
+    def _close_kline_multiplex(self, sock: _KlineMultiplexSocket) -> None:
+        if sock.conn_key and self._ws_manager:
+            try:
+                self._ws_manager.stop_socket(sock.conn_key)
+            except Exception:
+                pass
+        sock.conn_key = None
+
+    def _open_kline_socket_pool(self, streams: list[str]) -> int:
+        """Open multiplex kline sockets (chunked) and return stream count opened."""
+        if not self._ws_manager or not streams:
+            return 0
+        opened = 0
+        for chunk in self._chunk_stream_list(streams):
+            socket_idx = len(self._kline_sockets)
+            sock = _KlineMultiplexSocket(streams=list(chunk))
+            try:
+                sock.conn_key = self._start_kline_socket(sock, socket_idx)
+                self._kline_sockets.append(sock)
+                opened += len(chunk)
+            except Exception as exc:
+                error_logger.error(
+                    "Kline WS socket open failed (%s streams): %s", len(chunk), exc
+                )
+        return opened
+
     def _stop_ws_internal(self, *, preserve_kline_subscriptions: bool) -> None:
         if self._ws_manager is None:
             self._ws_running = False
             return
         try:
-            for key in list(self._kline_conn_keys):
-                try:
-                    self._ws_manager.stop_socket(key)
-                except Exception:
-                    pass
+            for sock in list(self._kline_sockets):
+                self._close_kline_multiplex(sock)
             if self._user_conn_key:
                 try:
                     self._ws_manager.stop_socket(self._user_conn_key)
@@ -341,30 +483,23 @@ class MarketDataHub:
             self._ticker_conn_key = None
             self._book_ticker_conn_key = None
             self._user_conn_key = None
-            self._kline_conn_keys.clear()
+            self._kline_sockets.clear()
             if not preserve_kline_subscriptions:
                 self._subscribed_kline_streams.clear()
 
     def _resubscribe_kline_streams(self) -> None:
-        """Re-open kline multiplex sockets after reconnect."""
+        """Re-open kline multiplex sockets after reconnect (chunked connection pool)."""
         if not self._ws_manager or not self._subscribed_kline_streams:
             return
+        self._kline_sockets.clear()
         streams = sorted(self._subscribed_kline_streams)
-        opened = 0
-        for i in range(0, len(streams), _KLINE_MULTIPLEX_CHUNK):
-            chunk = streams[i : i + _KLINE_MULTIPLEX_CHUNK]
-            try:
-                conn_key = self._ws_manager.start_futures_multiplex_socket(
-                    callback=self._wrap_ws_callback(self._on_kline_multiplex),
-                    streams=chunk,
-                )
-                self._kline_conn_keys.append(conn_key)
-                opened += len(chunk)
-            except Exception as exc:
-                error_logger.error("Kline WS resubscribe failed: %s", exc)
+        opened = self._open_kline_socket_pool(streams)
         if opened:
             system_logger.info(
-                "Re-subscribed %s kline WS streams after reconnect.", opened
+                "Re-subscribed %s kline WS streams across %s socket(s) (max %s/socket).",
+                opened,
+                len(self._kline_sockets),
+                self._kline_socket_chunk_size(),
             )
 
     def stop(self) -> None:
@@ -631,16 +766,22 @@ class MarketDataHub:
         )
 
     def subscribe_kline_streams(
-        self, symbols: list[str], intervals: list[str]
+        self,
+        symbols: list[str],
+        intervals: Optional[list[str]] = None,
     ) -> None:
-        """Subscribe WS kline streams for scan universe (multiplex, chunked)."""
+        """
+        Subscribe WS kline streams for scan universe (pooled multiplex sockets).
+        Uses Config.get_ws_kline_intervals() by default (entry TF only when enabled).
+        """
         if not self._ws_manager or not self._ws_running:
             return
 
+        ws_intervals = intervals or Config.get_ws_kline_intervals()
         new_streams: list[str] = []
         for symbol in symbols:
             sym = symbol.lower()
-            for interval in intervals:
+            for interval in ws_intervals:
                 stream = f"{sym}@kline_{interval}"
                 if stream not in self._subscribed_kline_streams:
                     new_streams.append(stream)
@@ -649,22 +790,22 @@ class MarketDataHub:
         if not new_streams:
             return
 
-        for i in range(0, len(new_streams), _KLINE_MULTIPLEX_CHUNK):
-            chunk = new_streams[i : i + _KLINE_MULTIPLEX_CHUNK]
-            try:
-                conn_key = self._ws_manager.start_futures_multiplex_socket(
-                    callback=self._wrap_ws_callback(self._on_kline_multiplex),
-                    streams=chunk,
-                )
-                self._kline_conn_keys.append(conn_key)
-            except Exception as exc:
-                error_logger.error("Kline WS subscribe failed: %s", exc)
-
+        opened = self._open_kline_socket_pool(new_streams)
         system_logger.info(
-            "Subscribed %s new kline WS streams (%s total).",
+            "Subscribed %s new kline WS streams (%s total, %s socket(s), "
+            "intervals=%s, max %s/socket).",
             len(new_streams),
             len(self._subscribed_kline_streams),
+            len(self._kline_sockets),
+            ",".join(ws_intervals),
+            self._kline_socket_chunk_size(),
         )
+        if opened < len(new_streams):
+            system_logger.warning(
+                "Kline WS subscribe incomplete — opened %s/%s new streams.",
+                opened,
+                len(new_streams),
+            )
 
     def subscribe_and_bootstrap_klines(
         self,
@@ -676,7 +817,7 @@ class MarketDataHub:
         Subscribe WS kline streams, then one-time REST bootstrap for new pairs.
         Must be called outside scan_context (via exchange.bootstrap_context()).
         """
-        self.subscribe_kline_streams(symbols, intervals)
+        self.subscribe_kline_streams(symbols)
         if not rest_fetcher or not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP:
             return 0
         return self.bootstrap_klines_on_subscribe(symbols, intervals, rest_fetcher)
