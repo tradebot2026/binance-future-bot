@@ -452,10 +452,8 @@ def main(controller: Optional[BotController] = None) -> str:
     )
 
     if Config.ENABLE_WEBSOCKET_STREAMS and not (startup_ban and startup_ban.is_banned):
-        market_data.ensure_ticker_cache_ready(
-            rest_seeder=exchange.fetch_startup_ticker_map,
-        )
         exchange.mark_ws_rest_ready()
+        market_data.ensure_ticker_cache_ready()
 
     if startup_ban and startup_ban.is_banned:
         ban_msg = market_data.format_ban_message(startup_ban)

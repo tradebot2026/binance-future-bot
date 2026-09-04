@@ -208,6 +208,10 @@ class MarketScanner:
         Build dynamic scan universe (50-80 pairs) from WS ticker/book cache only.
         Delegates to UniverseBuilder (backward-compatible wrapper).
         """
+        if self._hub is not None:
+            self._hub.ensure_ticker_cache_ready(
+                rest_seeder=self.exchange.fetch_futures_ticker_map_rest,
+            )
         result = self._universe_builder.build(priority_symbols=self._scan_priority)
         self._pipeline._last_universe_symbols = result.symbols
         return result.symbols, result.price_map

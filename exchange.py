@@ -187,6 +187,8 @@ class BinanceExchangeManager:
     def attach_market_data(self, hub: Any) -> None:
         """Attach WebSocket + candle cache hub."""
         self._market_data = hub
+        if hub is not None:
+            hub.set_ticker_rest_fetcher(self.fetch_futures_ticker_map_rest)
         if hub and hasattr(self, "_startup_ban") and self._startup_ban.is_banned:
             hub.apply_startup_ban(self._startup_ban)
 
@@ -612,11 +614,16 @@ class BinanceExchangeManager:
         """Warm position cache once per monitor/risk cycle."""
         self._refresh_positions_cache(force=force)
 
-    def fetch_startup_ticker_map(self) -> dict[str, dict[str, Any]]:
-        """One-time REST ticker fetch to seed WS cache when miniTicker is slow."""
-        allowed, _ = self._rest_gate_open()
-        if not allowed or not self._rest_reads_allowed():
+    def fetch_futures_ticker_map_rest(self) -> dict[str, dict[str, Any]]:
+        """
+        Single futures_ticker() REST call to warm the cache.
+        Allowed during startup / WS outage — only blocked on active IP ban.
+        """
+        if self._market_data and self._market_data.is_rest_blocked()[0]:
             return {}
+        if self.in_scan_mode and Config.SCAN_WS_ONLY:
+            return {}
+
         try:
             tickers = self._throttled_call(
                 self.client.futures_ticker,
@@ -625,9 +632,16 @@ class BinanceExchangeManager:
             return {
                 str(row["symbol"]): row for row in tickers if row.get("symbol")
             }
-        except Exception as exc:
-            error_logger.warning("Startup ticker REST fetch failed: %s", exc)
+        except ExchangeRateLimitError:
             return {}
+        except Exception as exc:
+            if self._rest_block_log.should_log("ticker_rest_fallback"):
+                error_logger.warning("Ticker REST fallback failed: %s", exc)
+            return {}
+
+    def fetch_startup_ticker_map(self) -> dict[str, dict[str, Any]]:
+        """Alias for startup seeding — same single lightweight REST request."""
+        return self.fetch_futures_ticker_map_rest()
 
     def fetch_startup_balance(self) -> float:
         """
@@ -986,11 +1000,19 @@ class BinanceExchangeManager:
             return 0.0
 
     def get_futures_ticker_map(self) -> dict[str, dict[str, Any]]:
-        """Return futures tickers from WebSocket cache — REST fallback disabled by default."""
+        """Return futures tickers — WS cache with automatic REST fallback when stale."""
         if self._market_data:
             cached = self._market_data.get_ticker_map()
-            if cached:
+            if cached and not self._market_data.needs_ticker_rest_fallback():
                 return cached
+            if (
+                Config.ENABLE_REST_TICKER_FALLBACK
+                or self._market_data.needs_ticker_rest_fallback()
+            ):
+                self._market_data.refresh_ticker_cache_from_rest()
+                cached = self._market_data.get_ticker_map()
+                if cached:
+                    return cached
             if (
                 self._market_data.ws_is_running()
                 and not Config.ENABLE_REST_TICKER_FALLBACK
@@ -1000,27 +1022,12 @@ class BinanceExchangeManager:
         if not Config.ENABLE_REST_TICKER_FALLBACK:
             return self._market_data.get_ticker_map() if self._market_data else {}
 
-        if not self._rest_reads_allowed():
-            if self._market_data:
-                return self._market_data.get_ticker_map()
-            return {}
-
-        try:
-            tickers = self._throttled_call(self.client.futures_ticker)
-            result = {str(t["symbol"]): t for t in tickers if t.get("symbol")}
-            if self._market_data and result:
-                self._market_data.seed_tickers_from_rest(result)
-            return result
-        except ExchangeRateLimitError:
-            if self._market_data:
-                return self._market_data.get_ticker_map()
-            return {}
-        except Exception as exc:
-            if self._rest_block_log.should_log("ticker_map_failed"):
-                error_logger.error("Failed to fetch futures ticker map: %s", exc)
-            if self._market_data:
-                return self._market_data.get_ticker_map()
-            return {}
+        result = self.fetch_futures_ticker_map_rest()
+        if self._market_data and result:
+            self._market_data.seed_tickers_from_rest(result)
+        return result if result else (
+            self._market_data.get_ticker_map() if self._market_data else {}
+        )
 
     def get_book_ticker_map(self) -> dict[str, dict[str, Any]]:
         """Return book tickers — WS proxy by default; REST only when explicitly allowed."""

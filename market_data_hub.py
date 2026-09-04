@@ -113,7 +113,13 @@ class MarketDataHub:
         self._ws_manager: Optional[ThreadedWebsocketManager] = None
         self._ws_loop: Optional[asyncio.AbstractEventLoop] = None
         self._ws_lifecycle_lock = threading.Lock()
-        self._ws_join_timeout_seconds = 15.0
+        self._ws_reconnect_join_timeout = Config.WS_RECONNECT_JOIN_TIMEOUT_SECONDS
+        self._ws_shutdown_join_timeout = Config.WS_SHUTDOWN_JOIN_TIMEOUT_SECONDS
+        self._ticker_rest_fetcher: Optional[
+            Callable[[], dict[str, dict[str, Any]]]
+        ] = None
+        self._last_ticker_rest_at: float = 0.0
+        self._ticker_rest_seeded: bool = False
         self._ticker_conn_key: Optional[str] = None
         self._book_ticker_conn_key: Optional[str] = None
         self._user_conn_key: Optional[str] = None
@@ -146,36 +152,120 @@ class MarketDataHub:
     def ws_is_running(self) -> bool:
         return self._ws_running
 
+    def set_ticker_rest_fetcher(
+        self,
+        fetcher: Callable[[], dict[str, dict[str, Any]]],
+    ) -> None:
+        self._ticker_rest_fetcher = fetcher
+
+    def ticker_cache_age_seconds(self) -> float:
+        """Seconds since last WS ticker event (or since WS start if none yet)."""
+        if self._last_ticker_event_at > 0:
+            return time.monotonic() - self._last_ticker_event_at
+        if self._ws_started_at > 0:
+            return time.monotonic() - self._ws_started_at
+        return float("inf")
+
+    def needs_ticker_rest_fallback(self) -> bool:
+        """True when WS ticker cache is empty or stale beyond the REST threshold."""
+        if not Config.ENABLE_REST_TICKER_FALLBACK and not Config.STARTUP_TICKER_REST_SEED:
+            return False
+        threshold = max(Config.TICKER_REST_FALLBACK_AFTER_SECONDS, 1.0)
+        if not self._tickers:
+            return self.ticker_cache_age_seconds() >= threshold
+        if self._last_ticker_event_at <= 0:
+            return self.ticker_cache_age_seconds() >= threshold
+        return (time.monotonic() - self._last_ticker_event_at) >= threshold
+
+    def refresh_ticker_cache_from_rest(self, *, force: bool = False) -> int:
+        """
+        Populate ticker cache via one futures_ticker() REST call.
+        Returns symbol count after refresh.
+        """
+        fetcher = self._ticker_rest_fetcher
+        if fetcher is None:
+            return len(self._tickers)
+
+        blocked, reason = self.is_rest_blocked()
+        if blocked:
+            system_logger.debug("Ticker REST fallback skipped — REST blocked: %s", reason)
+            return len(self._tickers)
+
+        now = time.monotonic()
+        min_interval = max(Config.TICKER_REST_MIN_INTERVAL_SECONDS, 5.0)
+        if (
+            not force
+            and self._tickers
+            and (now - self._last_ticker_rest_at) < min_interval
+        ):
+            return len(self._tickers)
+
+        try:
+            result = fetcher()
+        except Exception as exc:
+            error_logger.warning("Ticker REST fallback failed: %s", exc)
+            return len(self._tickers)
+
+        if not result:
+            return len(self._tickers)
+
+        self.seed_tickers_from_rest(result)
+        self._last_ticker_rest_at = now
+        self._ticker_rest_seeded = True
+        count = len(self._tickers)
+        if self._ws_log.should_log("ticker_rest_fallback"):
+            system_logger.info(
+                "Ticker cache refreshed from REST (%s symbols).", count
+            )
+        return count
+
+    def is_ticker_cache_usable(self, min_symbols: int = 1) -> bool:
+        """Scanner may proceed when tickers are present (WS or REST)."""
+        return len(self._tickers) >= max(min_symbols, 1)
+
     def wait_until_ready(
         self,
         timeout_seconds: Optional[int] = None,
         min_symbols: int = 30,
     ) -> bool:
         """
-        Block until miniTicker WS cache has enough symbols (startup warm-up).
-        Returns False on timeout — caller must NOT fall back to REST tickers.
+        Wait briefly for WS tickers, then REST fallback if still empty/stale.
         """
-        timeout = timeout_seconds or Config.WS_STARTUP_WAIT_SECONDS
-        deadline = time.monotonic() + max(timeout, 1)
+        min_syms = max(min_symbols, 1)
+        if len(self.get_ticker_map()) >= min_syms:
+            system_logger.info(
+                "WebSocket ticker cache ready (%s symbols).",
+                len(self.get_ticker_map()),
+            )
+            return True
+
+        ws_wait = min(
+            timeout_seconds or Config.WS_STARTUP_WAIT_SECONDS,
+            max(int(Config.TICKER_REST_FALLBACK_AFTER_SECONDS), 1),
+        )
+        deadline = time.monotonic() + ws_wait
         while time.monotonic() < deadline:
             count = len(self.get_ticker_map())
-            if count >= min_symbols:
-                system_logger.info(
-                    "WebSocket ticker cache ready (%s symbols).", count
-                )
+            if count >= min_syms:
+                system_logger.info("WebSocket ticker cache ready (%s symbols).", count)
                 return True
-            time.sleep(0.5)
+            time.sleep(0.25)
+
+        if self.refresh_ticker_cache_from_rest(force=True) >= min_syms:
+            return True
+
         count = len(self.get_ticker_map())
         if count > 0:
             system_logger.warning(
-                "WebSocket warm-up partial — %s symbols (wanted >= %s).",
+                "Ticker cache partial after REST fallback — %s symbols (wanted >= %s).",
                 count,
-                min_symbols,
+                min_syms,
             )
             return True
+
         system_logger.warning(
-            "WebSocket ticker cache empty after %ss — REST ticker fallback disabled.",
-            timeout,
+            "Ticker cache empty after WS (%ss) and REST fallback.",
+            ws_wait,
         )
         return False
 
@@ -187,59 +277,31 @@ class MarketDataHub:
         rest_seeder: Optional[Callable[[], dict[str, dict[str, Any]]]] = None,
     ) -> bool:
         """
-        Wait for WS miniTicker cache, optionally one-time REST seed at startup.
-        Returns True when at least one symbol is available for universe build.
+        Ensure ticker cache is usable for universe build — WS first, REST after 10s.
         """
-        min_syms = min_symbols or max(min(Config.MIN_SCAN_UNIVERSE, 10), 1)
-        timeout = timeout_seconds or Config.WS_STARTUP_WAIT_SECONDS
+        if rest_seeder is not None:
+            self._ticker_rest_fetcher = rest_seeder
 
+        min_syms = min_symbols or max(min(Config.MIN_SCAN_UNIVERSE, 10), 1)
         if len(self.get_ticker_map()) >= min_syms:
             return True
 
-        if self._ws_running:
-            self.wait_until_ready(timeout_seconds=timeout, min_symbols=min_syms)
-            if len(self.get_ticker_map()) >= min_syms:
-                return True
-
-        if (
-            Config.STARTUP_TICKER_REST_SEED
-            and rest_seeder is not None
-            and len(self.get_ticker_map()) < min_syms
-        ):
-            blocked, reason = self.is_rest_blocked()
-            if blocked:
-                system_logger.debug(
-                    "Startup ticker REST seed skipped — REST blocked: %s", reason
-                )
-            else:
-                try:
-                    seeded = rest_seeder()
-                    if seeded:
-                        self.seed_tickers_from_rest(seeded)
-                        count = len(self.get_ticker_map())
-                        if count >= min_syms:
-                            system_logger.info(
-                                "Ticker cache seeded from REST (%s symbols).", count
-                            )
-                            return True
-                        if count > 0:
-                            system_logger.info(
-                                "Ticker cache partially seeded from REST (%s symbols).",
-                                count,
-                            )
-                            return True
-                except Exception as exc:
-                    error_logger.warning("Startup ticker REST seed failed: %s", exc)
-
-        return len(self.get_ticker_map()) > 0
+        return self.wait_until_ready(
+            timeout_seconds=timeout_seconds,
+            min_symbols=min_syms,
+        )
 
     def is_ws_warming_up(self) -> bool:
         if not self._ws_running:
             return False
+        if self.is_ticker_cache_usable(min_symbols=10):
+            return False
         if self._ws_started_at <= 0:
             return True
         if self._last_ticker_event_at <= 0:
-            return (time.monotonic() - self._ws_started_at) < Config.WS_WARMUP_SECONDS
+            return (
+                time.monotonic() - self._ws_started_at
+            ) < Config.TICKER_REST_FALLBACK_AFTER_SECONDS
         return False
 
     def get_rest_block_remaining_seconds(self) -> int:
@@ -322,6 +384,8 @@ class MarketDataHub:
             if self.is_ws_warming_up():
                 continue
             self._check_kline_sockets_health()
+            if self.needs_ticker_rest_fallback():
+                self.refresh_ticker_cache_from_rest()
             if self.ws_is_stale():
                 self._request_reconnect("ticker stream stale — no events received")
 
@@ -420,14 +484,14 @@ class MarketDataHub:
                 )
             time.sleep(delay)
 
-            self._stop_ws_internal(preserve_kline_subscriptions=True)
+            self._stop_ws_internal(
+                preserve_kline_subscriptions=True,
+                blocking=False,
+            )
             self._start_ws_internal()
             self._reconnect_policy.reset()
             self._ws_log.reset()
-            self.wait_until_ready(
-                timeout_seconds=min(30, Config.WS_STARTUP_WAIT_SECONDS),
-                min_symbols=max(min(Config.MIN_SCAN_UNIVERSE, 10), 1),
-            )
+            self.refresh_ticker_cache_from_rest(force=True)
             system_logger.info("WebSocket reconnected successfully.")
         except Exception as exc:
             if self._ws_log.should_log(f"reconnect_failed:{exc}"):
@@ -540,7 +604,17 @@ class MarketDataHub:
                 )
         return opened
 
-    def _stop_ws_internal(self, *, preserve_kline_subscriptions: bool) -> None:
+    def _stop_ws_internal(
+        self,
+        *,
+        preserve_kline_subscriptions: bool,
+        blocking: bool = True,
+    ) -> None:
+        join_timeout = (
+            self._ws_shutdown_join_timeout
+            if blocking
+            else self._ws_reconnect_join_timeout
+        )
         with self._ws_lifecycle_lock:
             manager = self._ws_manager
             loop = self._ws_loop
@@ -566,12 +640,12 @@ class MarketDataHub:
                     except Exception:
                         pass
                 manager.stop()
-                if manager.is_alive():
-                    manager.join(timeout=self._ws_join_timeout_seconds)
+                if manager.is_alive() and join_timeout > 0:
+                    manager.join(timeout=join_timeout)
                     if manager.is_alive():
-                        error_logger.warning(
-                            "WebSocket manager thread did not exit within %.0fs.",
-                            self._ws_join_timeout_seconds,
+                        system_logger.debug(
+                            "WS manager thread still running after %.1fs — detaching.",
+                            join_timeout,
                         )
             except Exception as exc:
                 if self._ws_log.should_log(f"ws_stop:{exc}"):
@@ -586,7 +660,11 @@ class MarketDataHub:
                 self._kline_sockets.clear()
                 if not preserve_kline_subscriptions:
                     self._subscribed_kline_streams.clear()
-                if loop is not None and not loop.is_closed():
+                if (
+                    loop is not None
+                    and not loop.is_closed()
+                    and (manager is None or not manager.is_alive())
+                ):
                     try:
                         loop.close()
                     except Exception:

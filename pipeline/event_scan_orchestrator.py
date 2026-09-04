@@ -63,11 +63,11 @@ class EventScanOrchestrator:
 
         if self._hub:
             ready = self._hub.ensure_ticker_cache_ready(
-                rest_seeder=self.exchange.fetch_startup_ticker_map,
+                rest_seeder=self.exchange.fetch_futures_ticker_map_rest,
             )
             if not ready:
-                scanner_logger.info(
-                    "Tier1 refresh deferred — WS ticker cache still warming up."
+                scanner_logger.warning(
+                    "Tier1 refresh skipped — ticker cache unavailable (WS+REST)."
                 )
                 return self._tier1_symbols
 
