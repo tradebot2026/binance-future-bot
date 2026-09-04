@@ -111,34 +111,22 @@ def run_parallel_kline_bootstrap(
         request_timeout,
     )
 
-    try:
-        raw_results = asyncio.run(
-            _run_parallel_fetch(
-                pairs,
-                rest_fetcher,
-                limit,
-                concurrency=concurrency,
-                request_timeout=request_timeout,
-                overall_timeout=overall_timeout,
-            )
-        )
-    except RuntimeError:
-        # Nested event loop (e.g. some test runners) — fall back to new loop in thread.
-        import concurrent.futures
+    import concurrent.futures
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(
-                asyncio.run,
-                _run_parallel_fetch(
-                    pairs,
-                    rest_fetcher,
-                    limit,
-                    concurrency=concurrency,
-                    request_timeout=request_timeout,
-                    overall_timeout=overall_timeout,
-                ),
-            )
-            raw_results = future.result(timeout=overall_timeout + 5)
+    async def _fetch_all() -> list[tuple[str, str, Optional[pd.DataFrame], Optional[str]]]:
+        return await _run_parallel_fetch(
+            pairs,
+            rest_fetcher,
+            limit,
+            concurrency=concurrency,
+            request_timeout=request_timeout,
+            overall_timeout=overall_timeout,
+        )
+
+    # Keep asyncio off the main thread so python-binance WS never shares its loop.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(asyncio.run, _fetch_all())
+        raw_results = future.result(timeout=overall_timeout + 10)
 
     seeded = 0
     failed = 0

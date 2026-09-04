@@ -6,6 +6,7 @@ REST is fallback-only outside scan cycles and never during IP bans.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import threading
 import time
@@ -99,6 +100,9 @@ class MarketDataHub:
         self._rest_block_reason: str = ""
         self._ban_status: Optional[BanStatus] = None
         self._ws_manager: Optional[ThreadedWebsocketManager] = None
+        self._ws_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._ws_lifecycle_lock = threading.Lock()
+        self._ws_join_timeout_seconds = 15.0
         self._ticker_conn_key: Optional[str] = None
         self._book_ticker_conn_key: Optional[str] = None
         self._user_conn_key: Optional[str] = None
@@ -194,32 +198,41 @@ class MarketDataHub:
             error_logger.error("Failed to start WebSocket streams: %s", exc)
 
     def _start_ws_internal(self) -> None:
-        """Create ThreadedWebsocketManager and subscribe base + kline streams."""
-        self._ws_manager = ThreadedWebsocketManager(
-            api_key=Config.BINANCE_API_KEY,
-            api_secret=Config.BINANCE_API_SECRET,
-            testnet=Config.USE_TESTNET,
-        )
-        self._ws_manager.start()
-        self._ticker_conn_key = self._ws_manager.start_futures_multiplex_socket(
-            callback=self._wrap_ws_callback(self._on_ticker_message),
-            streams=["!miniTicker@arr"],
-        )
-        if Config.ENABLE_WS_BOOK_STREAM:
-            self._book_ticker_conn_key = self._ws_manager.start_futures_multiplex_socket(
-                callback=self._wrap_ws_callback(self._on_book_ticker_message),
-                streams=["!bookTicker@arr"],
+        """Create ThreadedWebsocketManager on a dedicated event loop (never main thread)."""
+        with self._ws_lifecycle_lock:
+            if self._ws_manager is not None:
+                raise RuntimeError("WebSocket manager already running")
+
+            ws_loop = asyncio.new_event_loop()
+            self._ws_loop = ws_loop
+            self._ws_manager = ThreadedWebsocketManager(
+                api_key=Config.BINANCE_API_KEY,
+                api_secret=Config.BINANCE_API_SECRET,
+                testnet=Config.USE_TESTNET,
+                loop=ws_loop,
             )
-        self._user_conn_key = self._ws_manager.start_futures_user_socket(
-            callback=self._wrap_ws_callback(self._on_user_message),
-        )
-        self._ws_running = True
-        self._ws_started_at = time.monotonic()
-        self._resubscribe_kline_streams()
-        streams = "miniTicker + user data"
-        if Config.ENABLE_WS_BOOK_STREAM:
-            streams += " + bookTicker"
-        system_logger.info("WebSocket streams started (%s).", streams)
+            self._ws_manager.start()
+
+            manager = self._ws_manager
+            self._ticker_conn_key = manager.start_futures_multiplex_socket(
+                callback=self._wrap_ws_callback(self._on_ticker_message),
+                streams=["!miniTicker@arr"],
+            )
+            if Config.ENABLE_WS_BOOK_STREAM:
+                self._book_ticker_conn_key = manager.start_futures_multiplex_socket(
+                    callback=self._wrap_ws_callback(self._on_book_ticker_message),
+                    streams=["!bookTicker@arr"],
+                )
+            self._user_conn_key = manager.start_futures_user_socket(
+                callback=self._wrap_ws_callback(self._on_user_message),
+            )
+            self._ws_running = True
+            self._ws_started_at = time.monotonic()
+            self._resubscribe_kline_streams()
+            streams = "miniTicker + user data"
+            if Config.ENABLE_WS_BOOK_STREAM:
+                streams += " + bookTicker"
+            system_logger.info("WebSocket streams started (%s).", streams)
 
     def _start_watchdog(self) -> None:
         if not Config.WS_RECONNECT_ENABLED:
@@ -455,40 +468,56 @@ class MarketDataHub:
         return opened
 
     def _stop_ws_internal(self, *, preserve_kline_subscriptions: bool) -> None:
-        if self._ws_manager is None:
-            self._ws_running = False
-            return
-        try:
-            for sock in list(self._kline_sockets):
-                self._close_kline_multiplex(sock)
-            if self._user_conn_key:
-                try:
-                    self._ws_manager.stop_socket(self._user_conn_key)
-                except Exception:
-                    pass
-            if self._book_ticker_conn_key:
-                try:
-                    self._ws_manager.stop_socket(self._book_ticker_conn_key)
-                except Exception:
-                    pass
-            if self._ticker_conn_key:
-                try:
-                    self._ws_manager.stop_socket(self._ticker_conn_key)
-                except Exception:
-                    pass
-            self._ws_manager.stop()
-        except Exception as exc:
-            if self._ws_log.should_log(f"ws_stop:{exc}"):
-                error_logger.warning("WebSocket shutdown error: %s", exc)
-        finally:
-            self._ws_running = False
-            self._ws_manager = None
-            self._ticker_conn_key = None
-            self._book_ticker_conn_key = None
-            self._user_conn_key = None
-            self._kline_sockets.clear()
-            if not preserve_kline_subscriptions:
-                self._subscribed_kline_streams.clear()
+        with self._ws_lifecycle_lock:
+            manager = self._ws_manager
+            loop = self._ws_loop
+            if manager is None:
+                self._ws_running = False
+                return
+            try:
+                for sock in list(self._kline_sockets):
+                    self._close_kline_multiplex(sock)
+                if self._user_conn_key:
+                    try:
+                        manager.stop_socket(self._user_conn_key)
+                    except Exception:
+                        pass
+                if self._book_ticker_conn_key:
+                    try:
+                        manager.stop_socket(self._book_ticker_conn_key)
+                    except Exception:
+                        pass
+                if self._ticker_conn_key:
+                    try:
+                        manager.stop_socket(self._ticker_conn_key)
+                    except Exception:
+                        pass
+                manager.stop()
+                if manager.is_alive():
+                    manager.join(timeout=self._ws_join_timeout_seconds)
+                    if manager.is_alive():
+                        error_logger.warning(
+                            "WebSocket manager thread did not exit within %.0fs.",
+                            self._ws_join_timeout_seconds,
+                        )
+            except Exception as exc:
+                if self._ws_log.should_log(f"ws_stop:{exc}"):
+                    error_logger.warning("WebSocket shutdown error: %s", exc)
+            finally:
+                self._ws_running = False
+                self._ws_manager = None
+                self._ws_loop = None
+                self._ticker_conn_key = None
+                self._book_ticker_conn_key = None
+                self._user_conn_key = None
+                self._kline_sockets.clear()
+                if not preserve_kline_subscriptions:
+                    self._subscribed_kline_streams.clear()
+                if loop is not None and not loop.is_closed():
+                    try:
+                        loop.close()
+                    except Exception:
+                        pass
 
     def _resubscribe_kline_streams(self) -> None:
         """Re-open kline multiplex sockets after reconnect (chunked connection pool)."""

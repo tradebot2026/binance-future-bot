@@ -465,158 +465,120 @@ def main(controller: Optional[BotController] = None) -> str:
     elif not exchange._full_init_done:
         exchange.ensure_initialized()
 
-    scheduler = DailyScheduler(exchange, db, telegram=None, controller=controller)
-    risk = RiskManager(exchange, db)
-
-    tg = TelegramManager(
-        db=db,
-        scheduler=scheduler,
-        risk_manager=risk,
-        exchange=exchange,
-        controller=controller,
-    )
-    scheduler.telegram = tg
-    critical_alerts.attach_telegram(tg)
-
-    if startup_ban and startup_ban.is_banned:
-        tg.send_message(market_data.format_ban_message(startup_ban))
-
-    manager = TradeManager(
-        exchange=exchange,
-        db=db,
-        telegram=tg,
-        scheduler=scheduler,
-        risk_manager=risk,
-    )
-    tg.manager = manager
-    tg.scanner = scanner
-
-    tg.start_listening()
-    mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
-    tg.send_message(f"🚀 <b>Bot started</b> and connected to Binance ({mode}).")
-
     scanner = MarketScanner(exchange, db) if SCANNER_AVAILABLE else None
     executor = TradeExecutor(exchange, db)
     reporter = ReportGenerator(db) if REPORTER_AVAILABLE else None
 
-    if scanner is not None and scanner.orchestrator is not None:
-        market_data.register_candle_close_listener(
-            scanner.orchestrator.on_candle_close
-        )
-        system_logger.info(
-            "Event-driven scan enabled — triggers on %s candle closes.",
-            ",".join(Config.get_scan_trigger_timeframes()),
-        )
+    scheduler = DailyScheduler(exchange, db, telegram=None, controller=controller)
+    risk = RiskManager(exchange, db)
 
-    reconcile_positions_at_startup(exchange, db, tg)
-
-    if (
-        scanner is not None
-        and Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
-        and not market_data.is_rest_blocked()[0]
-    ):
-        _bootstrap_scan_universe_at_startup(scanner, exchange, market_data)
-
+    tg: Optional[TelegramManager] = None
     monitor_stop = threading.Event()
-    _start_position_monitor(manager, monitor_stop)
+    shutdown_done = False
+    try:
+        tg = TelegramManager(
+            db=db,
+            scheduler=scheduler,
+            risk_manager=risk,
+            exchange=exchange,
+            controller=controller,
+        )
+        scheduler.telegram = tg
+        critical_alerts.attach_telegram(tg)
 
-    system_logger.info("Initialization complete. Entering main trading loop.")
+        if startup_ban and startup_ban.is_banned:
+            tg.send_message(market_data.format_ban_message(startup_ban))
 
-    last_heartbeat = time.monotonic()
-    last_report_day = ""
-    last_reconciliation = time.monotonic()
-    last_maintenance = time.monotonic()
-    cycle = 0
-    consecutive_errors = 0
+        manager = TradeManager(
+            exchange=exchange,
+            db=db,
+            telegram=tg,
+            scheduler=scheduler,
+            risk_manager=risk,
+        )
+        tg.manager = manager
+        tg.scanner = scanner
 
-    while not controller.is_shutdown_requested():
-        cycle += 1
-        loop_started = time.monotonic()
+        tg.start_listening()
+        mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
+        tg.send_message(f"🚀 <b>Bot started</b> and connected to Binance ({mode}).")
 
-        try:
-            # Step 0 — If IP ban active, pause silently until REST is allowed again
-            if _wait_for_rest_unblock(market_data, controller):
-                continue
+        if scanner is not None and scanner.orchestrator is not None:
+            market_data.register_candle_close_listener(
+                scanner.orchestrator.on_candle_close
+            )
+            system_logger.info(
+                "Event-driven scan enabled — triggers on %s candle closes.",
+                ",".join(Config.get_scan_trigger_timeframes()),
+            )
 
-            # Step 0b — One-time deferred REST init (never retried aggressively in loop)
-            if not exchange._full_init_done and not market_data.is_rest_blocked()[0]:
-                exchange.ensure_initialized()
+        reconcile_positions_at_startup(exchange, db, tg)
 
-            # Step 1 — Periodic DB/exchange reconciliation (every 15 min)
-            now_mono = time.monotonic()
-            if now_mono - last_reconciliation >= Config.RECONCILIATION_INTERVAL_SECONDS:
-                if not market_data.is_rest_blocked()[0]:
-                    reconcile_positions(exchange, db, tg, context="periodic")
-                db.cleanup_expired_cooldowns()
-                last_reconciliation = now_mono
+        if (
+            scanner is not None
+            and Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
+            and not market_data.is_rest_blocked()[0]
+        ):
+            _bootstrap_scan_universe_at_startup(scanner, exchange, market_data)
 
-            # Step 1b — Periodic DB purge + VACUUM (default: daily)
-            if now_mono - last_maintenance >= Config.DB_MAINTENANCE_INTERVAL_SECONDS:
-                db.run_maintenance(retention_days=Config.DB_RETENTION_DAYS, vacuum=True)
-                last_maintenance = now_mono
+        _start_position_monitor(manager, monitor_stop)
 
-            # Step 2 — Scan and execute only when entries are allowed
-            if scanner is None:
-                if cycle == 1:
-                    system_logger.warning(
-                        "scanner.py not found — entries disabled until scanner is added."
-                    )
-            else:
-                allowed, gate_reason = _entries_allowed(scheduler, risk, db)
-                if allowed:
-                    if (
-                        Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
-                        and not market_data.is_rest_blocked()[0]
-                    ):
-                        scanner.ensure_scan_klines_ready()
+        system_logger.info("Initialization complete. Entering main trading loop.")
 
-                    if Config.ENABLE_EVENT_DRIVEN_SCAN and scanner.orchestrator:
-                        if cycle == 1:
-                            scanner.refresh_event_universe()
-                        candidates = scanner.process_event_scan_cycle()
-                        _execute_candidates(
-                            candidates=candidates,
-                            executor=executor,
-                            risk=risk,
-                            scheduler=scheduler,
-                            db=db,
-                            tg=tg,
-                            critical_alerts=critical_alerts,
+        last_heartbeat = time.monotonic()
+        last_report_day = ""
+        last_reconciliation = time.monotonic()
+        last_maintenance = time.monotonic()
+        cycle = 0
+        consecutive_errors = 0
+
+        while not controller.is_shutdown_requested():
+            cycle += 1
+            loop_started = time.monotonic()
+
+            try:
+                # Step 0 — If IP ban active, pause silently until REST is allowed again
+                if _wait_for_rest_unblock(market_data, controller):
+                    continue
+
+                # Step 0b — One-time deferred REST init (never retried aggressively in loop)
+                if not exchange._full_init_done and not market_data.is_rest_blocked()[0]:
+                    exchange.ensure_initialized()
+
+                # Step 1 — Periodic DB/exchange reconciliation (every 15 min)
+                now_mono = time.monotonic()
+                if now_mono - last_reconciliation >= Config.RECONCILIATION_INTERVAL_SECONDS:
+                    if not market_data.is_rest_blocked()[0]:
+                        reconcile_positions(exchange, db, tg, context="periodic")
+                    db.cleanup_expired_cooldowns()
+                    last_reconciliation = now_mono
+
+                # Step 1b — Periodic DB purge + VACUUM (default: daily)
+                if now_mono - last_maintenance >= Config.DB_MAINTENANCE_INTERVAL_SECONDS:
+                    db.run_maintenance(retention_days=Config.DB_RETENTION_DAYS, vacuum=True)
+                    last_maintenance = now_mono
+
+                # Step 2 — Scan and execute only when entries are allowed
+                if scanner is None:
+                    if cycle == 1:
+                        system_logger.warning(
+                            "scanner.py not found — entries disabled until scanner is added."
                         )
-                    elif Config.USE_UNIFIED_SCAN_PIPELINE:
-                        unified = scanner.scan_unified()
-                        _execute_candidates(
-                            candidates=unified,
-                            executor=executor,
-                            risk=risk,
-                            scheduler=scheduler,
-                            db=db,
-                            tg=tg,
-                            critical_alerts=critical_alerts,
-                        )
-                    else:
-                        smc_candidates = scanner.scan_market()
-                        _execute_candidates(
-                            candidates=smc_candidates,
-                            executor=executor,
-                            risk=risk,
-                            scheduler=scheduler,
-                            db=db,
-                            tg=tg,
-                            critical_alerts=critical_alerts,
-                        )
+                else:
+                    allowed, gate_reason = _entries_allowed(scheduler, risk, db)
+                    if allowed:
+                        if (
+                            Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
+                            and not market_data.is_rest_blocked()[0]
+                        ):
+                            scanner.ensure_scan_klines_ready()
 
-                        if Config.ENABLE_RANGE_REGIME or Config.ENABLE_STRATEGY_RANGE:
-                            range_candidates = scanner.scan_range_market()
-                            if range_candidates:
-                                system_logger.info(
-                                    "RANGE scan found %s candidate(s) — SMC has priority; "
-                                    "filling up to %s RANGE slots.",
-                                    len(range_candidates),
-                                    Config.MAX_RANGE_POSITIONS,
-                                )
+                        if Config.ENABLE_EVENT_DRIVEN_SCAN and scanner.orchestrator:
+                            if cycle == 1:
+                                scanner.refresh_event_universe()
+                            candidates = scanner.process_event_scan_cycle()
                             _execute_candidates(
-                                candidates=range_candidates,
+                                candidates=candidates,
                                 executor=executor,
                                 risk=risk,
                                 scheduler=scheduler,
@@ -624,63 +586,114 @@ def main(controller: Optional[BotController] = None) -> str:
                                 tg=tg,
                                 critical_alerts=critical_alerts,
                             )
-                elif gate_reason:
-                    system_logger.info("Entries paused: %s", gate_reason)
+                        elif Config.USE_UNIFIED_SCAN_PIPELINE:
+                            unified = scanner.scan_unified()
+                            _execute_candidates(
+                                candidates=unified,
+                                executor=executor,
+                                risk=risk,
+                                scheduler=scheduler,
+                                db=db,
+                                tg=tg,
+                                critical_alerts=critical_alerts,
+                            )
+                        else:
+                            smc_candidates = scanner.scan_market()
+                            _execute_candidates(
+                                candidates=smc_candidates,
+                                executor=executor,
+                                risk=risk,
+                                scheduler=scheduler,
+                                db=db,
+                                tg=tg,
+                                critical_alerts=critical_alerts,
+                            )
 
-            # Step 3 — Optional daily CSV export (once per UTC day)
-            last_report_day = _maybe_export_daily_report(reporter, last_report_day)
+                            if Config.ENABLE_RANGE_REGIME or Config.ENABLE_STRATEGY_RANGE:
+                                range_candidates = scanner.scan_range_market()
+                                if range_candidates:
+                                    system_logger.info(
+                                        "RANGE scan found %s candidate(s) — SMC has priority; "
+                                        "filling up to %s RANGE slots.",
+                                        len(range_candidates),
+                                        Config.MAX_RANGE_POSITIONS,
+                                    )
+                                _execute_candidates(
+                                    candidates=range_candidates,
+                                    executor=executor,
+                                    risk=risk,
+                                    scheduler=scheduler,
+                                    db=db,
+                                    tg=tg,
+                                    critical_alerts=critical_alerts,
+                                )
+                    elif gate_reason:
+                        system_logger.info("Entries paused: %s", gate_reason)
 
-            # Step 4 — Heartbeat
-            now = time.monotonic()
-            if now - last_heartbeat >= Config.HEARTBEAT_SECONDS:
-                snap = risk.get_risk_snapshot()
-                is_paused, _ = scheduler.is_entry_paused()
-                system_logger.info(
-                    "Heartbeat | cycle=%s | exchange_open=%s | paused=%s | "
-                    "realized_pnl=$%.2f (%.2f%%) | unrealized=$%.2f | drawdown=%.2f%%",
-                    cycle,
-                    snap.exchange_open_positions,
-                    is_paused,
-                    snap.daily_realized_pnl,
-                    snap.daily_realized_pnl_percent,
-                    snap.unrealized_pnl,
-                    snap.drawdown_percent,
+                # Step 3 — Optional daily CSV export (once per UTC day)
+                last_report_day = _maybe_export_daily_report(reporter, last_report_day)
+
+                # Step 4 — Heartbeat
+                now = time.monotonic()
+                if now - last_heartbeat >= Config.HEARTBEAT_SECONDS:
+                    snap = risk.get_risk_snapshot()
+                    is_paused, _ = scheduler.is_entry_paused()
+                    system_logger.info(
+                        "Heartbeat | cycle=%s | exchange_open=%s | paused=%s | "
+                        "realized_pnl=$%.2f (%.2f%%) | unrealized=$%.2f | drawdown=%.2f%%",
+                        cycle,
+                        snap.exchange_open_positions,
+                        is_paused,
+                        snap.daily_realized_pnl,
+                        snap.daily_realized_pnl_percent,
+                        snap.unrealized_pnl,
+                        snap.drawdown_percent,
+                    )
+                    last_heartbeat = now
+
+                consecutive_errors = 0
+
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                consecutive_errors = _handle_loop_error(
+                    exc, consecutive_errors, tg, critical_alerts, market_data
                 )
-                last_heartbeat = now
+                continue
 
-            consecutive_errors = 0
+            if controller.is_shutdown_requested():
+                break
 
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            consecutive_errors = _handle_loop_error(
-                exc, consecutive_errors, tg, critical_alerts, market_data
-            )
-            continue
+            elapsed = time.monotonic() - loop_started
+            sleep_for = max(Config.SCAN_INTERVAL_SECONDS - elapsed, 0.5)
+            slept = 0.0
+            while slept < sleep_for and not controller.is_shutdown_requested():
+                chunk = min(1.0, sleep_for - slept)
+                time.sleep(chunk)
+                slept += chunk
 
-        if controller.is_shutdown_requested():
-            break
+        # Graceful shutdown
+        shutdown_done = True
+        monitor_stop.set()
+        market_data.stop()
+        tg.send_message("🛑 <b>Bot stopped</b> — trading loop shut down safely.")
+        tg.stop_listening()
+        system_logger.info("Trading loop stopped gracefully.")
 
-        elapsed = time.monotonic() - loop_started
-        sleep_for = max(Config.SCAN_INTERVAL_SECONDS - elapsed, 0.5)
-        slept = 0.0
-        while slept < sleep_for and not controller.is_shutdown_requested():
-            chunk = min(1.0, sleep_for - slept)
-            time.sleep(chunk)
-            slept += chunk
+        if controller.is_restart_requested():
+            controller.clear_restart_flag()
+            return "restart"
 
-    # Graceful shutdown
-    monitor_stop.set()
-    market_data.stop()
-    tg.send_message("🛑 <b>Bot stopped</b> — trading loop shut down safely.")
-    tg.stop_listening()
-    system_logger.info("Trading loop stopped gracefully.")
-
-    if controller.is_restart_requested():
-        controller.clear_restart_flag()
-        return "restart"
-
-    return "stop"
+        return "stop"
+    finally:
+        if not shutdown_done:
+            monitor_stop.set()
+            market_data.stop()
+            if tg is not None:
+                try:
+                    tg.stop_listening()
+                except Exception:
+                    pass
 
 
 def run_with_auto_restart() -> None:
