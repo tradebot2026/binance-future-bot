@@ -612,6 +612,84 @@ class BinanceExchangeManager:
         """Warm position cache once per monitor/risk cycle."""
         self._refresh_positions_cache(force=force)
 
+    def fetch_startup_ticker_map(self) -> dict[str, dict[str, Any]]:
+        """One-time REST ticker fetch to seed WS cache when miniTicker is slow."""
+        allowed, _ = self._rest_gate_open()
+        if not allowed or not self._rest_reads_allowed():
+            return {}
+        try:
+            tickers = self._throttled_call(
+                self.client.futures_ticker,
+                **self.recv_window_param,
+            )
+            return {
+                str(row["symbol"]): row for row in tickers if row.get("symbol")
+            }
+        except Exception as exc:
+            error_logger.warning("Startup ticker REST fetch failed: %s", exc)
+            return {}
+
+    def fetch_startup_balance(self) -> float:
+        """
+        Startup-only balance lookup with quick REST retries.
+        Bypasses ENABLE_REST_BALANCE_POLL so testnet cold starts still initialize stats.
+        """
+        quote = Config.QUOTE_ASSET
+
+        if self._market_data and not self._market_data.user_stream_is_stale():
+            ws_balance = self._market_data.get_ws_wallet_balance(quote)
+            if ws_balance > 0:
+                self._balance_cache.set(ws_balance)
+                return ws_balance
+
+        if self._balance_cache.is_valid() and self._balance_cache.value > 0:
+            return self._balance_cache.value
+
+        allowed, reason = self._rest_gate_open()
+        if not allowed:
+            system_logger.debug("Startup balance deferred: %s", reason)
+            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+
+        max_attempts = max(Config.STARTUP_BALANCE_MAX_ATTEMPTS, 1)
+        delay = max(Config.STARTUP_BALANCE_RETRY_SECONDS, 0.5)
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                account_info = self._throttled_call(
+                    self.client.futures_account,
+                    **self.recv_window_param,
+                )
+                self._last_balance_rest_at = time.monotonic()
+                for asset in account_info.get("assets", []):
+                    if asset.get("asset") != quote:
+                        continue
+                    balance = safe_float(asset.get("availableBalance"))
+                    if balance <= 0:
+                        balance = safe_float(asset.get("crossWalletBalance"))
+                    if balance > 0:
+                        self._balance_cache.set(balance)
+                        return balance
+            except ExchangeRateLimitError:
+                break
+            except Exception as exc:
+                if attempt >= max_attempts:
+                    error_logger.warning(
+                        "Startup balance fetch failed after %s attempts: %s",
+                        max_attempts,
+                        exc,
+                    )
+                else:
+                    system_logger.debug(
+                        "Startup balance attempt %s/%s failed: %s — retrying.",
+                        attempt,
+                        max_attempts,
+                        exc,
+                    )
+            if attempt < max_attempts:
+                time.sleep(delay)
+
+        return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+
     def get_futures_balance(self, force_refresh: bool = False) -> float:
         """
         Return available USDT balance.

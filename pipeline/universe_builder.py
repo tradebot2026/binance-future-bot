@@ -154,7 +154,14 @@ class UniverseBuilder:
         try:
             ticker_map = self.exchange.get_futures_ticker_map()
             if not ticker_map:
-                scanner_logger.warning("Universe empty — WS ticker cache not ready.")
+                if self._hub and self._hub.is_ws_warming_up():
+                    scanner_logger.debug(
+                        "Universe build skipped — WS ticker cache warming up."
+                    )
+                else:
+                    scanner_logger.warning(
+                        "Universe empty — WS ticker cache not ready."
+                    )
                 return UniverseResult([], {}, {}, [], UniverseFilterStats())
 
             book_map = self.exchange.get_book_ticker_map()

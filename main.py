@@ -452,7 +452,9 @@ def main(controller: Optional[BotController] = None) -> str:
     )
 
     if Config.ENABLE_WEBSOCKET_STREAMS and not (startup_ban and startup_ban.is_banned):
-        market_data.wait_until_ready(timeout_seconds=Config.WS_STARTUP_WAIT_SECONDS)
+        market_data.ensure_ticker_cache_ready(
+            rest_seeder=exchange.fetch_startup_ticker_map,
+        )
         exchange.mark_ws_rest_ready()
 
     if startup_ban and startup_ban.is_banned:
@@ -470,6 +472,7 @@ def main(controller: Optional[BotController] = None) -> str:
     reporter = ReportGenerator(db) if REPORTER_AVAILABLE else None
 
     scheduler = DailyScheduler(exchange, db, telegram=None, controller=controller)
+    scheduler.ensure_startup_initialized()
     risk = RiskManager(exchange, db)
 
     tg: Optional[TelegramManager] = None

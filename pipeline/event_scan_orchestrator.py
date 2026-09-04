@@ -61,6 +61,16 @@ class EventScanOrchestrator:
         ):
             return self._tier1_symbols
 
+        if self._hub:
+            ready = self._hub.ensure_ticker_cache_ready(
+                rest_seeder=self.exchange.fetch_startup_ticker_map,
+            )
+            if not ready:
+                scanner_logger.info(
+                    "Tier1 refresh deferred — WS ticker cache still warming up."
+                )
+                return self._tier1_symbols
+
         universe = self.universe_builder.build()
         cap = min(len(universe.symbols), Config.TIER1_WATCHLIST_SIZE)
         self._tier1_symbols = universe.symbols[:cap]
@@ -110,7 +120,7 @@ class EventScanOrchestrator:
             return []
 
         if not self._tier1_symbols:
-            self.refresh_tier1_universe(force=True)
+            self.refresh_tier1_universe()
 
         events = self.event_scheduler.drain_due(limit=Config.TIER2_HOT_SIZE * 3)
         if not events:

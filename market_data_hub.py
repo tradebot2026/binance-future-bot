@@ -33,6 +33,17 @@ from ws_reconnect import (
 )
 
 
+class _WsThreadedWebsocketManager(ThreadedWebsocketManager):
+    """
+    python-binance binds get_loop() per thread — set the dedicated loop on the
+    worker thread before run_until_complete so socket tasks schedule correctly.
+    """
+
+    def run(self) -> None:
+        asyncio.set_event_loop(self._loop)
+        self._loop.run_until_complete(self.socket_listener())
+
+
 TIMEFRAME_SECONDS: dict[str, int] = {
     "1m": 60,
     "3m": 180,
@@ -168,6 +179,60 @@ class MarketDataHub:
         )
         return False
 
+    def ensure_ticker_cache_ready(
+        self,
+        *,
+        min_symbols: Optional[int] = None,
+        timeout_seconds: Optional[int] = None,
+        rest_seeder: Optional[Callable[[], dict[str, dict[str, Any]]]] = None,
+    ) -> bool:
+        """
+        Wait for WS miniTicker cache, optionally one-time REST seed at startup.
+        Returns True when at least one symbol is available for universe build.
+        """
+        min_syms = min_symbols or max(min(Config.MIN_SCAN_UNIVERSE, 10), 1)
+        timeout = timeout_seconds or Config.WS_STARTUP_WAIT_SECONDS
+
+        if len(self.get_ticker_map()) >= min_syms:
+            return True
+
+        if self._ws_running:
+            self.wait_until_ready(timeout_seconds=timeout, min_symbols=min_syms)
+            if len(self.get_ticker_map()) >= min_syms:
+                return True
+
+        if (
+            Config.STARTUP_TICKER_REST_SEED
+            and rest_seeder is not None
+            and len(self.get_ticker_map()) < min_syms
+        ):
+            blocked, reason = self.is_rest_blocked()
+            if blocked:
+                system_logger.debug(
+                    "Startup ticker REST seed skipped — REST blocked: %s", reason
+                )
+            else:
+                try:
+                    seeded = rest_seeder()
+                    if seeded:
+                        self.seed_tickers_from_rest(seeded)
+                        count = len(self.get_ticker_map())
+                        if count >= min_syms:
+                            system_logger.info(
+                                "Ticker cache seeded from REST (%s symbols).", count
+                            )
+                            return True
+                        if count > 0:
+                            system_logger.info(
+                                "Ticker cache partially seeded from REST (%s symbols).",
+                                count,
+                            )
+                            return True
+                except Exception as exc:
+                    error_logger.warning("Startup ticker REST seed failed: %s", exc)
+
+        return len(self.get_ticker_map()) > 0
+
     def is_ws_warming_up(self) -> bool:
         if not self._ws_running:
             return False
@@ -205,13 +270,15 @@ class MarketDataHub:
 
             ws_loop = asyncio.new_event_loop()
             self._ws_loop = ws_loop
-            self._ws_manager = ThreadedWebsocketManager(
+            self._ws_manager = _WsThreadedWebsocketManager(
                 api_key=Config.BINANCE_API_KEY,
                 api_secret=Config.BINANCE_API_SECRET,
                 testnet=Config.USE_TESTNET,
                 loop=ws_loop,
             )
             self._ws_manager.start()
+            self._last_ticker_event_at = 0.0
+            self._last_user_event_at = 0.0
 
             manager = self._ws_manager
             self._ticker_conn_key = manager.start_futures_multiplex_socket(
@@ -316,6 +383,8 @@ class MarketDataHub:
     def _request_reconnect(self, reason: str) -> None:
         if not Config.WS_RECONNECT_ENABLED or not Config.ENABLE_WEBSOCKET_STREAMS:
             return
+        if self.is_ws_warming_up():
+            return
 
         now = time.monotonic()
         if (now - self._last_reconnect_request_at) < Config.WS_RECONNECT_DEBOUNCE_SECONDS:
@@ -355,6 +424,10 @@ class MarketDataHub:
             self._start_ws_internal()
             self._reconnect_policy.reset()
             self._ws_log.reset()
+            self.wait_until_ready(
+                timeout_seconds=min(30, Config.WS_STARTUP_WAIT_SECONDS),
+                min_symbols=max(min(Config.MIN_SCAN_UNIVERSE, 10), 1),
+            )
             system_logger.info("WebSocket reconnected successfully.")
         except Exception as exc:
             if self._ws_log.should_log(f"reconnect_failed:{exc}"):

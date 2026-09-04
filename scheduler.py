@@ -42,8 +42,42 @@ class DailyScheduler:
         self.today_str = utc_today_str()
         self._last_limit_check_at = 0.0
         self._limit_check_interval = float(Config.BALANCE_CACHE_TTL_SECONDS)
+        self._startup_initialized = False
 
-        self._initialize_trading_day(force_balance_refresh=False)
+    def ensure_startup_initialized(self) -> None:
+        """Initialize daily stats once WS/REST balance is available (startup retries)."""
+        if self._startup_initialized:
+            return
+
+        max_attempts = max(Config.STARTUP_BALANCE_MAX_ATTEMPTS, 1)
+        delay = max(Config.STARTUP_BALANCE_RETRY_SECONDS, 0.5)
+
+        for attempt in range(1, max_attempts + 1):
+            balance = self.exchange.fetch_startup_balance()
+            if balance > 0:
+                self.db.initialize_daily_stats(self.today_str, balance)
+                self.db.update_daily_balance(self.today_str, balance, DAILY_STATUS_ACTIVE)
+                self._startup_initialized = True
+                system_logger.info(
+                    "Trading day %s initialized with reference balance $%.2f.",
+                    self.today_str,
+                    balance,
+                )
+                return
+
+            if attempt < max_attempts:
+                system_logger.debug(
+                    "Startup balance unavailable (attempt %s/%s) — retrying in %.1fs.",
+                    attempt,
+                    max_attempts,
+                    delay,
+                )
+                time.sleep(delay)
+
+        system_logger.warning(
+            "Could not initialize daily stats for %s: balance unavailable.",
+            self.today_str,
+        )
 
     # ---------------- Public API ----------------
 
@@ -68,11 +102,12 @@ class DailyScheduler:
 
     def check_daily_limits(self) -> tuple[bool, str]:
         """Evaluate day rollover and realized-PnL daily profit/loss thresholds."""
+        self.ensure_startup_initialized()
         self._handle_day_rollover()
 
         stats = self.db.get_daily_stats(self.today_str)
         if not stats:
-            self._initialize_trading_day(force_balance_refresh=False)
+            self.ensure_startup_initialized()
             stats = self.db.get_daily_stats(self.today_str)
             if not stats:
                 return False, ""
