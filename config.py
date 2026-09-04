@@ -119,7 +119,7 @@ class Config:
     )
     WS_KLINE_BOOTSTRAP_MIN_BARS: int = _env_int("WS_KLINE_BOOTSTRAP_MIN_BARS", 250)
     WS_KLINE_BOOTSTRAP_CONCURRENCY: int = _env_int(
-        "WS_KLINE_BOOTSTRAP_CONCURRENCY", 12
+        "WS_KLINE_BOOTSTRAP_CONCURRENCY", 3
     )
     WS_KLINE_BOOTSTRAP_REQUEST_TIMEOUT_SECONDS: float = _env_float(
         "WS_KLINE_BOOTSTRAP_REQUEST_TIMEOUT_SECONDS", 3.0
@@ -204,19 +204,23 @@ class Config:
     RANGE_EDGE_ATR_TOLERANCE: float = _env_float("RANGE_EDGE_ATR_TOLERANCE", 0.35)
     RANGE_LOOKBACK_BARS: int = _env_int("RANGE_LOOKBACK_BARS", 48)
     RANGE_MIN_SCORE: float = _env_float("RANGE_MIN_SCORE", 65.0)
+    LSC_MIN_SCORE: float = _env_float("LSC_MIN_SCORE", 68.0)
+    VWAP_MIN_SCORE: float = _env_float("VWAP_MIN_SCORE", 70.0)
+    VPB_MIN_SCORE: float = _env_float("VPB_MIN_SCORE", 72.0)
+    VEMR_MIN_SCORE: float = _env_float("VEMR_MIN_SCORE", 65.0)
 
     # ---------------- Multi-strategy modular system ----------------
     ENABLE_STRATEGY_SMC: bool = _env_bool("ENABLE_STRATEGY_SMC", True)
     ENABLE_STRATEGY_RANGE: bool = _env_bool("ENABLE_STRATEGY_RANGE", True)
     ENABLE_STRATEGY_LIQUIDITY_SWEEP: bool = _env_bool(
-        "ENABLE_STRATEGY_LIQUIDITY_SWEEP", False
+        "ENABLE_STRATEGY_LIQUIDITY_SWEEP", True
     )
     ENABLE_STRATEGY_VWAP_PULLBACK: bool = _env_bool(
-        "ENABLE_STRATEGY_VWAP_PULLBACK", False
+        "ENABLE_STRATEGY_VWAP_PULLBACK", True
     )
-    ENABLE_STRATEGY_VP_BREAKOUT: bool = _env_bool("ENABLE_STRATEGY_VP_BREAKOUT", False)
+    ENABLE_STRATEGY_VP_BREAKOUT: bool = _env_bool("ENABLE_STRATEGY_VP_BREAKOUT", True)
     ENABLE_STRATEGY_VOL_EXPANSION: bool = _env_bool(
-        "ENABLE_STRATEGY_VOL_EXPANSION", False
+        "ENABLE_STRATEGY_VOL_EXPANSION", True
     )
     ALLOW_CROSS_STRATEGY_SCALE_IN: bool = _env_bool(
         "ALLOW_CROSS_STRATEGY_SCALE_IN", False
@@ -226,6 +230,20 @@ class Config:
         "ENABLE_GLOBAL_STRATEGY_KILL_SWITCH", True
     )
     USE_UNIFIED_SCAN_PIPELINE: bool = _env_bool("USE_UNIFIED_SCAN_PIPELINE", False)
+
+    # ---------------- Event-driven scan & tier management ----------------
+    ENABLE_EVENT_DRIVEN_SCAN: bool = _env_bool("ENABLE_EVENT_DRIVEN_SCAN", True)
+    SCAN_TRIGGER_TIMEFRAMES: str = os.getenv("SCAN_TRIGGER_TIMEFRAMES", "5m,15m")
+    TIER1_WATCHLIST_SIZE: int = _env_int("TIER1_WATCHLIST_SIZE", 100)
+    TIER2_HOT_SIZE: int = _env_int("TIER2_HOT_SIZE", 20)
+    TIER2_PROMOTE_SCORE: float = _env_float("TIER2_PROMOTE_SCORE", 80.0)
+    TIER2_DEMOTE_SCORE: float = _env_float("TIER2_DEMOTE_SCORE", 70.0)
+    # Normalized Tier-2 gates: (raw - min) / (100 - min) * 100 — fair across strategies.
+    TIER2_PROMOTE_NORMALIZED: float = _env_float("TIER2_PROMOTE_NORMALIZED", 70.0)
+    TIER2_DEMOTE_NORMALIZED: float = _env_float("TIER2_DEMOTE_NORMALIZED", 50.0)
+    EVENT_EVAL_STAGGER_MS: float = _env_float("EVENT_EVAL_STAGGER_MS", 50.0)
+    EVENT_CATCHUP_INTERVAL_SECONDS: int = _env_int("EVENT_CATCHUP_INTERVAL_SECONDS", 60)
+    REST_BUDGET_WEIGHT_PER_MINUTE: int = _env_int("REST_BUDGET_WEIGHT_PER_MINUTE", 200)
     VP_BREAKOUT_TOP_VOLUME_LIMIT: int = _env_int("VP_BREAKOUT_TOP_VOLUME_LIMIT", 20)
     VWAP_SESSION_ANCHOR_UTC: bool = _env_bool("VWAP_SESSION_ANCHOR_UTC", True)
 
@@ -314,6 +332,17 @@ class Config:
         return [cls.ENTRY_TIMEFRAME, cls.CONFIRM_TIMEFRAME, cls.TREND_TIMEFRAME]
 
     @classmethod
+    def get_scan_trigger_timeframes(cls) -> list[str]:
+        """Timeframes that trigger event-driven evaluation on candle close."""
+        if cls.SCAN_TRIGGER_TIMEFRAMES.strip():
+            return [
+                part.strip()
+                for part in cls.SCAN_TRIGGER_TIMEFRAMES.split(",")
+                if part.strip()
+            ]
+        return [cls.ENTRY_TIMEFRAME, cls.CONFIRM_TIMEFRAME]
+
+    @classmethod
     def get_ws_kline_intervals(cls) -> list[str]:
         """Timeframes subscribed live via WebSocket (keep total streams under limit)."""
         if cls.WS_KLINE_WS_TIMEFRAMES.strip():
@@ -322,6 +351,8 @@ class Config:
                 for part in cls.WS_KLINE_WS_TIMEFRAMES.split(",")
                 if part.strip()
             ]
+        if cls.ENABLE_EVENT_DRIVEN_SCAN:
+            return cls.get_scan_trigger_timeframes()
         if cls.WS_KLINE_LIVE_TIMEFRAMES_ONLY:
             return [cls.ENTRY_TIMEFRAME]
         return cls.get_scan_kline_intervals()

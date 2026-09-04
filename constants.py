@@ -57,11 +57,17 @@ def is_smc_strategy(strategy: str) -> bool:
 
 
 def strategy_display_label(strategy: str) -> str:
-    if is_range_strategy(strategy):
-        return "RANGE Mode"
-    if is_smc_strategy(strategy):
-        return "SMC Mode"
-    return str(strategy)
+    tag = str(strategy).upper()
+    labels = {
+        "RANGE_REVERSION": "RANGE Mode",
+        "SMC_TREND": "SMC Mode",
+        "SMC_MULTITF": "SMC Mode",
+        "LIQUIDITY_SWEEP_CONT": "LSC Mode",
+        "VWAP_PULLBACK": "VWAP Mode",
+        "VOLUME_PROFILE_BREAKOUT": "VPB Mode",
+        "VOL_EXPANSION_MR": "VEMR Mode",
+    }
+    return labels.get(tag, str(strategy))
 
 # ---------------- Database column whitelist ----------------
 ALLOWED_TRADE_COLUMNS: Final[Set[str]] = {

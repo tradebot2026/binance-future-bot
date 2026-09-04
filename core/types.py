@@ -116,3 +116,46 @@ class AllocationResult:
     risk_budget_usdt: float = 0.0
     size_multiplier: float = 1.0
     reason: str = ""
+
+
+@dataclass(frozen=True)
+class CandleCloseEvent:
+    """WS or catch-up candle close trigger."""
+
+    symbol: str
+    timeframe: str
+    bar_open_ms: int
+    source: Literal["ws", "catchup", "timer"] = "ws"
+    due_at: float = 0.0
+
+
+@dataclass
+class StrategyScore:
+    """Normalized strategy evaluation for one symbol."""
+
+    symbol: str
+    strategy: str
+    score: float
+    adjusted_score: float
+    min_score: float = 0.0
+    normalized_score: float = 0.0
+    regime_fit: float = 1.0
+    priority_weight: float = 1.0
+    action: Action = "NEUTRAL"
+    bar_open_ms: int = 0
+    timeframe: str = ""
+
+
+@dataclass
+class CoinAssignment:
+    """Tier-2 active assignment for a symbol."""
+
+    symbol: str
+    strategy: str
+    score: float
+    adjusted_score: float
+    normalized_score: float = 0.0
+    min_score: float = 0.0
+    assigned_bar_open_ms: int = 0
+    assigned_at_ms: int = 0
+    frozen: bool = False

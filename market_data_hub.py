@@ -105,6 +105,9 @@ class MarketDataHub:
         self._kline_sockets: list[_KlineMultiplexSocket] = []
         self._subscribed_kline_streams: set[str] = set()
         self._bootstrapped_pairs: set[tuple[str, str]] = set()
+        self._candle_close_listeners: list[
+            Callable[[str, str, int], None]
+        ] = []
         self._ws_running = False
         self._last_ticker_event_at: float = 0.0
         self._last_user_event_at: float = 0.0
@@ -744,8 +747,72 @@ class MarketDataHub:
                 else:
                     bars.append(row)
                 self._sync_candles_from_klines(symbol, interval)
+            if row["closed"]:
+                self._emit_candle_close(symbol, interval, row["open_ms"])
         except Exception as exc:
             error_logger.warning("Kline WS parse error: %s", exc)
+
+    def register_candle_close_listener(
+        self, listener: Callable[[str, str, int], None]
+    ) -> None:
+        """Register callback(symbol, interval, bar_open_ms) on closed kline WS events."""
+        if listener not in self._candle_close_listeners:
+            self._candle_close_listeners.append(listener)
+
+    def _emit_candle_close(self, symbol: str, interval: str, bar_open_ms: int) -> None:
+        for listener in list(self._candle_close_listeners):
+            try:
+                listener(symbol, interval, bar_open_ms)
+            except Exception as exc:
+                error_logger.warning("Candle close listener error: %s", exc)
+
+    def get_last_closed_bar_open_ms(
+        self, symbol: str, timeframe: str
+    ) -> Optional[int]:
+        """Return open_ms of the most recent closed bar in WS cache."""
+        symbol = symbol.upper()
+        with self._lock:
+            bars = self._kline_bars.get((symbol, timeframe))
+            if not bars:
+                return None
+            for bar in reversed(bars):
+                if bar.get("closed"):
+                    return int(bar.get("open_ms", 0))
+        return None
+
+    def demote_symbol_klines(self, symbol: str) -> None:
+        """GC demoted symbol — flush buffers and rebuild WS kline subscriptions."""
+        symbol = symbol.upper()
+        sym_lower = symbol.lower()
+        ws_intervals = Config.get_ws_kline_intervals()
+        to_remove = {f"{sym_lower}@kline_{iv}" for iv in ws_intervals}
+
+        with self._lock:
+            self._subscribed_kline_streams -= to_remove
+            for key in [k for k in self._kline_bars if k[0] == symbol]:
+                del self._kline_bars[key]
+            for key in [k for k in self._candles if k[0] == symbol]:
+                del self._candles[key]
+
+        if to_remove and self._ws_manager and self._ws_running:
+            self._rebuild_kline_socket_pool()
+
+        system_logger.debug(
+            "GC demoted symbol %s — removed %s kline stream(s).",
+            symbol,
+            len(to_remove),
+        )
+
+    def _rebuild_kline_socket_pool(self) -> None:
+        """Close and reopen all kline multiplex sockets from subscription set."""
+        if not self._ws_manager:
+            return
+        for sock in list(self._kline_sockets):
+            self._close_kline_multiplex(sock)
+        self._kline_sockets.clear()
+        if self._subscribed_kline_streams:
+            streams = sorted(self._subscribed_kline_streams)
+            self._open_kline_socket_pool(streams)
 
     def _sync_candles_from_klines(self, symbol: str, interval: str) -> None:
         """Rebuild bar-aligned candle cache entry from WS kline buffer."""

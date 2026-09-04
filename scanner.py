@@ -19,6 +19,7 @@ from exceptions import ExchangeRateLimitError
 from exchange import BinanceExchangeManager
 from indicators.market_analyzer import MIN_ANALYZER_BARS, MarketAnalyzer
 from logger import error_logger, scanner_logger, signal_logger
+from pipeline.event_scan_orchestrator import EventScanOrchestrator
 from pipeline.scanner_pipeline import StrategyScannerPipeline
 from pipeline.universe_builder import UniverseBuilder, UniverseFilterStats
 from range_engine import evaluate_range_setup
@@ -50,6 +51,9 @@ class MarketScanner:
         self._near_miss_scores: dict[str, float] = {}
         self._pipeline = StrategyScannerPipeline(exchange, db)
         self._universe_builder = UniverseBuilder(exchange, db)
+        self.orchestrator: Optional[EventScanOrchestrator] = None
+        if Config.ENABLE_EVENT_DRIVEN_SCAN:
+            self.orchestrator = EventScanOrchestrator(exchange, db)
 
     @property
     def _last_universe_symbols(self) -> list[str]:
@@ -246,6 +250,25 @@ class MarketScanner:
                 timeframes,
                 self.exchange.fetch_bootstrap_klines_df,
             )
+
+    def refresh_event_universe(self) -> list[str]:
+        """Refresh Tier-1 watchlist for event-driven scanning."""
+        if self.orchestrator is None:
+            return []
+        return self.orchestrator.refresh_tier1_universe(force=True)
+
+    def process_event_scan_cycle(self) -> List[Dict[str, Any]]:
+        """Drain candle-close queue and return execution candidates."""
+        if self.orchestrator is None:
+            return []
+        self.orchestrator.run_catchup()
+        return self.orchestrator.process_due_events()
+
+    def get_tier2_summary(self) -> list[tuple[str, str, float]]:
+        """Return Tier-2 active coins: (symbol, strategy, score)."""
+        if self.orchestrator is None:
+            return []
+        return self.orchestrator.tier2_summary()
 
     def _prepare_scan_universe(self) -> tuple[List[str], dict[str, float]]:
         """Build universe and subscribe WS klines (REST bootstrap via ensure_scan_klines_ready)."""

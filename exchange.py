@@ -22,6 +22,7 @@ from rest_rate_guard import (
     weight_for_call,
 )
 from config import Config
+from core.rest_budget import RestBudgetManager, RestLane
 from exceptions import ExchangeError, ExchangeRateLimitError, OrderExecutionError
 from logger import error_logger, system_logger, trade_logger
 from utils import amount_to_precision, round_step_size, safe_float
@@ -135,6 +136,7 @@ class BinanceExchangeManager:
             Config.EXECUTION_MIN_REQUEST_INTERVAL_MS
         )
         self._rest_token_bucket = build_default_token_bucket()
+        self._rest_budget = RestBudgetManager()
         self._rest_block_log = RestBlockLogSuppressor(
             Config.REST_BLOCK_LOG_INTERVAL_SECONDS
         )
@@ -398,6 +400,11 @@ class BinanceExchangeManager:
 
         call_weight = weight_for_call(func)
         if Config.ENABLE_STRICT_RATE_LIMIT:
+            if priority:
+                lane = RestLane.EXECUTION
+            else:
+                lane = RestLane.BACKGROUND
+            self._rest_budget.acquire(call_weight, lane)
             self._rest_token_bucket.acquire(call_weight)
 
         limiter = self._execution_rate_limiter if priority else self._rate_limiter
@@ -778,19 +785,26 @@ class BinanceExchangeManager:
         self, symbol: str, timeframe: str, limit: int
     ) -> pd.DataFrame:
         """
-        Fast parallel-safe kline fetch for startup bootstrap only.
-        Skips the 1s inter-request limiter and token bucket (concurrency capped elsewhere).
+        Rate-limited REST kline fetch for startup bootstrap only.
+        Routes through token-bucket + RestBudgetManager (200 weight/min cap).
         """
+        if not self._is_bootstrap_priority():
+            raise ExchangeError(
+                "Bootstrap kline fetch requires exchange.bootstrap_context()"
+            )
         blocked, reason = self._rest_block_applies(execution_priority=False)
         if blocked:
             raise ExchangeRateLimitError(reason)
 
         try:
-            klines = self.client.futures_klines(
+            klines = self._throttled_call(
+                self.client.futures_klines,
                 symbol=symbol,
                 interval=timeframe,
                 limit=limit,
             )
+        except ExchangeRateLimitError:
+            raise
         except BinanceAPIException as exc:
             if self._is_rate_limit_error(exc):
                 self._apply_rate_limit_halt(exc)

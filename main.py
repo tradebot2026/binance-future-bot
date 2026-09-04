@@ -51,7 +51,10 @@ def _bootstrap_scan_universe_at_startup(
 ) -> None:
     """One-time REST kline seed for scan universe — runs before the 15s trading loop."""
     try:
-        symbols, _ = scanner.get_tradable_symbols()
+        if getattr(scanner, "orchestrator", None) is not None:
+            symbols = scanner.refresh_event_universe()
+        else:
+            symbols, _ = scanner.get_tradable_symbols()
         if not symbols:
             system_logger.warning(
                 "Startup kline bootstrap skipped — tradable universe empty."
@@ -486,6 +489,7 @@ def main(controller: Optional[BotController] = None) -> str:
         risk_manager=risk,
     )
     tg.manager = manager
+    tg.scanner = scanner
 
     tg.start_listening()
     mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
@@ -494,6 +498,15 @@ def main(controller: Optional[BotController] = None) -> str:
     scanner = MarketScanner(exchange, db) if SCANNER_AVAILABLE else None
     executor = TradeExecutor(exchange, db)
     reporter = ReportGenerator(db) if REPORTER_AVAILABLE else None
+
+    if scanner is not None and scanner.orchestrator is not None:
+        market_data.register_candle_close_listener(
+            scanner.orchestrator.on_candle_close
+        )
+        system_logger.info(
+            "Event-driven scan enabled — triggers on %s candle closes.",
+            ",".join(Config.get_scan_trigger_timeframes()),
+        )
 
     reconcile_positions_at_startup(exchange, db, tg)
 
@@ -557,7 +570,20 @@ def main(controller: Optional[BotController] = None) -> str:
                     ):
                         scanner.ensure_scan_klines_ready()
 
-                    if Config.USE_UNIFIED_SCAN_PIPELINE:
+                    if Config.ENABLE_EVENT_DRIVEN_SCAN and scanner.orchestrator:
+                        if cycle == 1:
+                            scanner.refresh_event_universe()
+                        candidates = scanner.process_event_scan_cycle()
+                        _execute_candidates(
+                            candidates=candidates,
+                            executor=executor,
+                            risk=risk,
+                            scheduler=scheduler,
+                            db=db,
+                            tg=tg,
+                            critical_alerts=critical_alerts,
+                        )
+                    elif Config.USE_UNIFIED_SCAN_PIPELINE:
                         unified = scanner.scan_unified()
                         _execute_candidates(
                             candidates=unified,

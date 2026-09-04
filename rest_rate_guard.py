@@ -119,7 +119,10 @@ class RestBlockLogSuppressor:
 
 
 def build_default_token_bucket() -> RestTokenBucket:
+    per_minute = max(Config.REST_BUDGET_WEIGHT_PER_MINUTE, 1)
     return RestTokenBucket(
-        capacity=float(Config.REST_TOKEN_BUCKET_CAPACITY),
-        refill_per_second=Config.REST_TOKEN_REFILL_PER_SECOND,
+        capacity=float(min(Config.REST_TOKEN_BUCKET_CAPACITY, per_minute)),
+        refill_per_second=min(
+            Config.REST_TOKEN_REFILL_PER_SECOND, per_minute / 60.0
+        ),
     )

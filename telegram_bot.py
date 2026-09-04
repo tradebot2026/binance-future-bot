@@ -52,6 +52,7 @@ class TelegramManager:
         self.exchange = exchange
         self.manager = manager
         self.controller = controller
+        self.scanner: Any = None
 
         self.token = Config.TELEGRAM_BOT_TOKEN.strip()
         self.chat_id = str(Config.TELEGRAM_CHAT_ID).strip()
@@ -538,6 +539,24 @@ class TelegramManager:
             balance = self.exchange.get_futures_balance(force_refresh=False)
             self.bot.reply_to(message, f"💵 <b>Available balance:</b> ${balance:.2f}")
 
+        @self.bot.message_handler(commands=["active", "watchlist"])
+        @authorized
+        def active_handler(message: telebot.types.Message) -> None:
+            scanner = getattr(self, "scanner", None)
+            if scanner is None or not hasattr(scanner, "get_tier2_summary"):
+                self.bot.reply_to(message, "⚠️ Event scan not available.")
+                return
+            rows = scanner.get_tier2_summary()
+            if not rows:
+                self.bot.reply_to(message, "🔥 <b>Active</b>\n<i>No Tier 2 coins.</i>")
+                return
+            lines = [
+                f"{escape_html(sym)} | {escape_html(strat)} | {score:.0f}"
+                for sym, strat, score in rows[: Config.TIER2_HOT_SIZE]
+            ]
+            body = "\n".join(lines)
+            self.bot.reply_to(message, f"🔥 <b>Active ({len(rows)})</b>\n{body}")
+
         @self.bot.message_handler(commands=["help"])
         @authorized
         def help_handler(message: telebot.types.Message) -> None:
@@ -555,6 +574,8 @@ class TelegramManager:
                 "/restart — graceful bot restart\n"
                 "/errors — recent critical errors\n"
                 "/balance — live futures balance\n"
+                "/active — Tier 2 scored coins\n"
+                "/watchlist — alias for /active\n"
                 "/ping — bot health\n"
                 "/help — this message",
             )
