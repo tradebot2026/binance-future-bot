@@ -49,22 +49,26 @@ def _bootstrap_scan_universe_at_startup(
     exchange: BinanceExchangeManager,
     market_data: Any,
 ) -> None:
-    """One-time REST kline seed for scan universe — runs before the 15s trading loop."""
+    """Paced REST kline seed for hot watchlist — background tier seeds gradually."""
     try:
         if getattr(scanner, "orchestrator", None) is not None:
-            symbols = scanner.refresh_event_universe()
+            scanner.refresh_event_universe()
+            seeded = scanner.bootstrap_hot_symbols_at_startup()
+            hot = scanner.orchestrator.priority_queue.hot_symbols
+            timeframes = Config.get_scan_kline_intervals()
+            expected = len(hot) * len(timeframes)
         else:
             symbols, _ = scanner.get_tradable_symbols()
-        if not symbols:
-            system_logger.warning(
-                "Startup kline bootstrap skipped — tradable universe empty."
-            )
-            return
-        timeframes = Config.get_scan_kline_intervals()
-        expected = len(symbols) * len(timeframes)
-        seeded = scanner.ensure_scan_klines_ready(symbols)
+            if not symbols:
+                system_logger.warning(
+                    "Startup kline bootstrap skipped — tradable universe empty."
+                )
+                return
+            timeframes = Config.get_scan_kline_intervals()
+            expected = len(symbols) * len(timeframes)
+            seeded = scanner.ensure_scan_klines_ready(symbols)
         system_logger.info(
-            "Startup kline bootstrap finished — %s/%s symbol series ready.",
+            "Startup hot kline bootstrap finished — %s/%s symbol series ready.",
             seeded,
             expected,
         )
@@ -568,16 +572,15 @@ def main(controller: Optional[BotController] = None) -> str:
                 else:
                     allowed, gate_reason = _entries_allowed(scheduler, risk, db)
                     if allowed:
-                        if (
-                            Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
-                            and not market_data.is_rest_blocked()[0]
-                        ):
-                            scanner.ensure_scan_klines_ready()
-
                         if Config.ENABLE_EVENT_DRIVEN_SCAN and scanner.orchestrator:
                             if cycle == 1:
                                 scanner.refresh_event_universe()
-                            candidates = scanner.process_event_scan_cycle()
+                            candidates = scanner.process_priority_scan_cycle()
+                            if (
+                                Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
+                                and not market_data.is_rest_blocked()[0]
+                            ):
+                                scanner.bootstrap_background_klines()
                             _execute_candidates(
                                 candidates=candidates,
                                 executor=executor,

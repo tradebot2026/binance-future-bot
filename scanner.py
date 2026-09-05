@@ -276,8 +276,50 @@ class MarketScanner:
         """Drain candle-close queue and return execution candidates."""
         if self.orchestrator is None:
             return []
-        self.orchestrator.run_catchup()
         return self.orchestrator.process_due_events()
+
+    def process_priority_scan_cycle(self) -> List[Dict[str, Any]]:
+        """Tiered hot/background/event scan cycle (WS-only evaluation)."""
+        if self.orchestrator is None:
+            return []
+        return self.orchestrator.process_priority_scan_cycle()
+
+    def bootstrap_hot_symbols_at_startup(self) -> int:
+        """Paced REST bootstrap for Tier-1 hot watchlist only."""
+        if not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP or not self._hub:
+            return 0
+        if self.orchestrator is None:
+            return self.ensure_scan_klines_ready()
+        symbols = self.orchestrator.priority_queue.hot_symbols
+        if not symbols:
+            symbols = self.orchestrator.tier1_symbols[: Config.HOT_SCAN_SIZE]
+        return self.ensure_scan_klines_ready(symbols)
+
+    def bootstrap_background_klines(self) -> int:
+        """Paced REST bootstrap for one background symbol per call."""
+        if (
+            not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
+            or not self._hub
+            or self.orchestrator is None
+        ):
+            return 0
+        if self.exchange.in_scan_mode:
+            return 0
+        if not self.exchange.can_make_background_rest_call(5):
+            return 0
+
+        symbols = self.orchestrator.priority_queue.next_background_bootstrap_symbols(1)
+        if not symbols:
+            return 0
+
+        timeframes = Config.get_scan_kline_intervals()
+        with self.exchange.bootstrap_context():
+            return self._hub.bootstrap_klines_for_symbols(
+                symbols,
+                timeframes,
+                self.exchange.fetch_bootstrap_klines_df,
+                max_pairs=len(timeframes),
+            )
 
     def get_tier2_summary(self) -> list[tuple[str, str, float]]:
         """Return Tier-2 active coins: (symbol, strategy, score)."""

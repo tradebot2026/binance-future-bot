@@ -8,6 +8,7 @@ from typing import Any, Optional
 from config import Config
 from core.assignment_manager import AssignmentManager
 from core.event_scheduler import EventScheduler
+from core.scan_priority_queue import ScanPriorityQueue
 from core.scoring_engine import ScoringEngine
 from core.symbol_conflict_guard import SymbolConflictGuard
 from core.types import CandleCloseEvent, SignalCandidate
@@ -38,6 +39,7 @@ class EventScanOrchestrator:
         self.scoring_engine = ScoringEngine(self.registry)
         self.assignment_manager = AssignmentManager()
         self.event_scheduler = EventScheduler()
+        self.priority_queue = ScanPriorityQueue()
         self.conflict_guard = SymbolConflictGuard(exchange, db)
         self._hub = getattr(exchange, "_market_data", None)
         self._tier1_symbols: list[str] = []
@@ -74,6 +76,7 @@ class EventScanOrchestrator:
         universe = self.universe_builder.build()
         cap = min(len(universe.symbols), Config.TIER1_WATCHLIST_SIZE)
         self._tier1_symbols = universe.symbols[:cap]
+        self.priority_queue.update(self._tier1_symbols)
         self._price_map = universe.price_map
         self._volume_ranks = universe.volume_ranks
         self._last_universe_refresh_at = now
@@ -82,8 +85,10 @@ class EventScanOrchestrator:
             self._hub.subscribe_kline_streams(self._tier1_symbols)
 
         scanner_logger.info(
-            "Tier1 watchlist refreshed — %s symbols (cap=%s).",
+            "Tier1 watchlist refreshed — %s symbols (hot=%s, background=%s, cap=%s).",
             len(self._tier1_symbols),
+            len(self.priority_queue.hot_symbols),
+            len(self.priority_queue.background_symbols),
             Config.TIER1_WATCHLIST_SIZE,
         )
         return self._tier1_symbols
@@ -122,20 +127,73 @@ class EventScanOrchestrator:
         if not self._tier1_symbols:
             self.refresh_tier1_universe()
 
-        events = self.event_scheduler.drain_due(limit=Config.TIER2_HOT_SIZE * 3)
-        if not events:
+        self.run_catchup()
+        self.conflict_guard.reset_cycle()
+        candidates = self._process_due_event_candidates()
+        dict_results = [c.to_dict() for c in candidates]
+        if dict_results:
+            self.db.update_watchlist(dict_results)
+            scanner_logger.info(
+                "Event scan produced %s execution candidate(s).",
+                len(dict_results),
+            )
+        return dict_results
+
+    def process_priority_scan_cycle(self) -> list[dict[str, Any]]:
+        """
+        Tiered scan cycle:
+        - Hot watchlist: WS-only poll every HOT_SCAN_INTERVAL_SECONDS
+        - Background queue: rotate small batches with pacing
+        - Candle-close events: existing event-driven path
+        """
+        halted, reason = self._scan_gate_open()
+        if halted:
+            scanner_logger.warning("Priority scan skipped — %s", reason)
             return []
 
+        if not self._tier1_symbols:
+            self.refresh_tier1_universe()
+
+        self.run_catchup()
         self.conflict_guard.reset_cycle()
+
+        candidates: list[SignalCandidate] = []
+        candidates.extend(self.process_hot_scan_cycle())
+        candidates.extend(self.process_background_scan_cycle())
+        candidates.extend(self._process_due_event_candidates())
+
+        dict_results = [c.to_dict() for c in candidates]
+        if dict_results:
+            self.db.update_watchlist(dict_results)
+        return dict_results
+
+    def process_hot_scan_cycle(self) -> list[SignalCandidate]:
+        """Tier 1 — frequent WS-only scan of high-activity symbols."""
+        if not self.priority_queue.should_run_hot_scan():
+            return []
+
+        symbols = self.priority_queue.hot_symbols
+        if not symbols:
+            return []
+
         open_symbols = self._open_symbols()
         ticker_map = self.exchange.get_futures_ticker_map()
         book_map = self.exchange.get_book_ticker_map()
+        trigger_tfs = Config.get_scan_trigger_timeframes()
+        primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
         candidates: list[SignalCandidate] = []
 
         with self.exchange.scan_context():
-            for event in events:
-                signal = self._process_event(
-                    event,
+            for symbol in symbols:
+                bar_open_ms = 0
+                if self._hub:
+                    closed = self._hub.get_last_closed_bar_open_ms(symbol, primary_tf)
+                    if closed:
+                        bar_open_ms = closed
+                signal = self._evaluate_symbol(
+                    symbol,
+                    bar_open_ms=bar_open_ms,
+                    timeframe=primary_tf,
                     open_symbols=open_symbols,
                     ticker_map=ticker_map,
                     book_map=book_map,
@@ -143,25 +201,102 @@ class EventScanOrchestrator:
                 if signal is not None:
                     candidates.append(signal)
 
-        dict_results = [c.to_dict() for c in candidates]
-        if dict_results:
-            self.db.update_watchlist(dict_results)
+        self.priority_queue.mark_hot_scan_complete()
+        if candidates:
+            scanner_logger.info(
+                "Hot scan produced %s execution candidate(s) from %s symbols.",
+                len(candidates),
+                len(symbols),
+            )
+        return candidates
+
+    def process_background_scan_cycle(self) -> list[SignalCandidate]:
+        """Tier 2 — rotate background symbols in small WS-only batches."""
+        if not self.priority_queue.should_run_background_batch():
+            return []
+
+        batch = self.priority_queue.next_background_batch()
+        if not batch:
+            return []
+
+        open_symbols = self._open_symbols()
+        ticker_map = self.exchange.get_futures_ticker_map()
+        book_map = self.exchange.get_book_ticker_map()
+        trigger_tfs = Config.get_scan_trigger_timeframes()
+        primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
+        candidates: list[SignalCandidate] = []
+
+        with self.exchange.scan_context():
+            for symbol in batch:
+                bar_open_ms = 0
+                if self._hub:
+                    closed = self._hub.get_last_closed_bar_open_ms(symbol, primary_tf)
+                    if closed:
+                        bar_open_ms = closed
+                signal = self._evaluate_symbol(
+                    symbol,
+                    bar_open_ms=bar_open_ms,
+                    timeframe=primary_tf,
+                    open_symbols=open_symbols,
+                    ticker_map=ticker_map,
+                    book_map=book_map,
+                )
+                if signal is not None:
+                    candidates.append(signal)
+
+        if candidates:
+            scanner_logger.info(
+                "Background scan produced %s execution candidate(s) from batch=%s.",
+                len(candidates),
+                len(batch),
+            )
+        return candidates
+
+    def _process_due_event_candidates(self) -> list[SignalCandidate]:
+        """Score due candle-close events (internal — returns SignalCandidate list)."""
+        events = self.event_scheduler.drain_due(limit=Config.TIER2_HOT_SIZE * 3)
+        if not events:
+            return []
+
+        open_symbols = self._open_symbols()
+        ticker_map = self.exchange.get_futures_ticker_map()
+        book_map = self.exchange.get_book_ticker_map()
+        candidates: list[SignalCandidate] = []
+
+        with self.exchange.scan_context():
+            for event in events:
+                signal = self._evaluate_symbol(
+                    event.symbol,
+                    bar_open_ms=event.bar_open_ms,
+                    timeframe=event.timeframe,
+                    open_symbols=open_symbols,
+                    ticker_map=ticker_map,
+                    book_map=book_map,
+                    mark_event=event,
+                )
+                if signal is not None:
+                    candidates.append(signal)
+
+        if candidates:
             scanner_logger.info(
                 "Event scan produced %s execution candidate(s) from %s event(s).",
-                len(dict_results),
+                len(candidates),
                 len(events),
             )
-        return dict_results
+        return candidates
 
-    def _process_event(
+    def _evaluate_symbol(
         self,
-        event: CandleCloseEvent,
+        symbol: str,
         *,
+        bar_open_ms: int,
+        timeframe: str,
         open_symbols: set[str],
         ticker_map: dict[str, Any],
         book_map: dict[str, Any],
+        mark_event: Optional[CandleCloseEvent] = None,
     ) -> Optional[SignalCandidate]:
-        symbol = event.symbol.upper()
+        symbol = symbol.upper()
         ticker = ticker_map.get(symbol, {})
         book = book_map.get(symbol, {})
         price = self._price_map.get(symbol, float(ticker.get("lastPrice", 0) or 0))
@@ -177,16 +312,23 @@ class EventScanOrchestrator:
             volume_rank=volume_rank,
         )
         if snapshot is None:
+            if mark_event is not None:
+                self.event_scheduler.mark_evaluated(
+                    symbol, mark_event.timeframe, mark_event.bar_open_ms
+                )
             return None
 
         scores = self.scoring_engine.evaluate_symbol(
             snapshot,
-            bar_open_ms=event.bar_open_ms,
-            timeframe=event.timeframe,
+            bar_open_ms=bar_open_ms,
+            timeframe=timeframe,
         )
         best = self.scoring_engine.pick_best(scores)
         if best is None:
-            self.event_scheduler.mark_evaluated(symbol, event.timeframe, event.bar_open_ms)
+            if mark_event is not None:
+                self.event_scheduler.mark_evaluated(
+                    symbol, mark_event.timeframe, mark_event.bar_open_ms
+                )
             return None
 
         promoted, demoted, gc_symbol = self.assignment_manager.update(
@@ -199,7 +341,10 @@ class EventScanOrchestrator:
         if promoted and self._hub:
             self._hub.subscribe_kline_streams([symbol])
 
-        self.event_scheduler.mark_evaluated(symbol, event.timeframe, event.bar_open_ms)
+        if mark_event is not None:
+            self.event_scheduler.mark_evaluated(
+                symbol, mark_event.timeframe, mark_event.bar_open_ms
+            )
 
         if not self.assignment_manager.is_hot(symbol):
             return None
@@ -220,12 +365,30 @@ class EventScanOrchestrator:
                 "direction": signal.action,
                 "score": signal.score,
                 "strategy": signal.strategy,
-                "reason": f"event={event.timeframe}|regime={signal.regime}",
+                "reason": f"scan={timeframe}|regime={signal.regime}",
                 "accepted": True,
                 "structure_metadata": signal.structure_metadata,
             }
         )
         return signal
+
+    def _process_event(
+        self,
+        event: CandleCloseEvent,
+        *,
+        open_symbols: set[str],
+        ticker_map: dict[str, Any],
+        book_map: dict[str, Any],
+    ) -> Optional[SignalCandidate]:
+        return self._evaluate_symbol(
+            event.symbol,
+            bar_open_ms=event.bar_open_ms,
+            timeframe=event.timeframe,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+            mark_event=event,
+        )
 
     def _open_symbols(self) -> set[str]:
         try:

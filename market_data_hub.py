@@ -21,7 +21,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 from config import Config
-from kline_bootstrap import run_parallel_kline_bootstrap
+from kline_bootstrap import run_parallel_kline_bootstrap, run_paced_kline_bootstrap
 from logger import error_logger, system_logger
 from utils import safe_float
 from ws_reconnect import (
@@ -1135,13 +1135,78 @@ class MarketDataHub:
         def _mark_bootstrapped(sym: str, interval: str) -> None:
             self._bootstrapped_pairs.add((sym.upper(), interval))
 
-        result = run_parallel_kline_bootstrap(
+        use_paced = (
+            Config.ENABLE_PACED_KLINE_BOOTSTRAP
+            or Config.WS_KLINE_BOOTSTRAP_CONCURRENCY <= 1
+        )
+        if use_paced:
+            result = run_paced_kline_bootstrap(
+                pending,
+                rest_fetcher,
+                limit,
+                min_bars,
+                seed_fn=self.seed_klines_from_dataframe,
+                mark_bootstrapped=_mark_bootstrapped,
+            )
+        else:
+            result = run_parallel_kline_bootstrap(
+                pending,
+                rest_fetcher,
+                limit,
+                min_bars,
+                seed_fn=self.seed_klines_from_dataframe,
+                mark_bootstrapped=_mark_bootstrapped,
+            )
+        return result.seeded
+
+    def bootstrap_klines_for_symbols(
+        self,
+        symbols: list[str],
+        intervals: list[str],
+        rest_fetcher: Callable[[str, str, int], pd.DataFrame],
+        *,
+        max_pairs: int | None = None,
+    ) -> int:
+        """Paced REST bootstrap for a subset of symbols (background tier seeding)."""
+        if not symbols or not rest_fetcher:
+            return 0
+        blocked, reason = self.is_rest_blocked()
+        if blocked:
+            system_logger.debug(
+                "Background kline bootstrap skipped — REST blocked: %s", reason
+            )
+            return 0
+
+        limit = Config.CANDLE_FETCH_LIMIT
+        min_bars = max(Config.WS_KLINE_BOOTSTRAP_MIN_BARS, 10)
+        pending: list[tuple[str, str]] = []
+
+        for symbol in symbols:
+            sym = symbol.upper()
+            for interval in intervals:
+                pair = (sym, interval)
+                if pair in self._bootstrapped_pairs:
+                    continue
+                cached = self.get_candles_cached_only(sym, interval, limit)
+                if not cached.empty and len(cached) >= min_bars:
+                    self._bootstrapped_pairs.add(pair)
+                    continue
+                pending.append(pair)
+
+        if not pending:
+            return 0
+
+        def _mark_bootstrapped(sym: str, interval: str) -> None:
+            self._bootstrapped_pairs.add((sym.upper(), interval))
+
+        result = run_paced_kline_bootstrap(
             pending,
             rest_fetcher,
             limit,
             min_bars,
             seed_fn=self.seed_klines_from_dataframe,
             mark_bootstrapped=_mark_bootstrapped,
+            max_pairs=max_pairs,
         )
         return result.seeded
 

@@ -172,3 +172,92 @@ def run_parallel_kline_bootstrap(
         elapsed_seconds=elapsed,
         pending=len(pairs),
     )
+
+
+def run_paced_kline_bootstrap(
+    pairs: list[tuple[str, str]],
+    rest_fetcher: Callable[[str, str, int], pd.DataFrame],
+    limit: int,
+    min_bars: int,
+    seed_fn: Callable[[str, str, pd.DataFrame], None],
+    mark_bootstrapped: Callable[[str, str], None],
+    *,
+    delay_seconds: float | None = None,
+    can_fetch: Callable[[], bool] | None = None,
+    max_pairs: int | None = None,
+) -> BootstrapResult:
+    """
+    Fetch historical klines one pair at a time with a sleep between requests.
+    Keeps REST weight usage low during startup and background seeding.
+    """
+    if not pairs:
+        return BootstrapResult()
+
+    delay = (
+        delay_seconds
+        if delay_seconds is not None
+        else Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS
+    )
+    delay = max(delay, 0.0)
+    work = pairs if max_pairs is None else pairs[: max(max_pairs, 0)]
+    started = time.monotonic()
+    seeded = 0
+    failed = 0
+
+    system_logger.info(
+        "Paced kline bootstrap starting — %s series (limit=%s bars, delay=%ss).",
+        len(work),
+        limit,
+        delay,
+    )
+
+    for sym, interval in work:
+        if can_fetch is not None and not can_fetch():
+            system_logger.info(
+                "Paced kline bootstrap paused — budget/ban gate (seeded=%s).",
+                seeded,
+            )
+            break
+        try:
+            df = rest_fetcher(sym, interval, limit)
+        except Exception as exc:
+            failed += 1
+            error_logger.debug("Paced kline bootstrap skip %s %s: %s", sym, interval, exc)
+            if delay > 0:
+                time.sleep(delay)
+            continue
+
+        if df is None or df.empty or len(df) < min_bars:
+            failed += 1
+            if delay > 0:
+                time.sleep(delay)
+            continue
+
+        try:
+            seed_fn(sym, interval, df)
+            mark_bootstrapped(sym, interval)
+            seeded += 1
+        except Exception as exc:
+            failed += 1
+            error_logger.warning(
+                "Paced kline bootstrap seed failed for %s %s: %s", sym, interval, exc
+            )
+
+        if delay > 0:
+            time.sleep(delay)
+
+    elapsed = time.monotonic() - started
+    system_logger.info(
+        "Paced kline bootstrap finished in %.1fs — seeded=%s failed=%s of %s series.",
+        elapsed,
+        seeded,
+        failed,
+        len(work),
+    )
+    return BootstrapResult(
+        seeded=seeded,
+        failed=failed,
+        timed_out=0,
+        elapsed_seconds=elapsed,
+        pending=max(len(pairs) - len(work), 0),
+    )
