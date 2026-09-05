@@ -44,6 +44,33 @@ class _WsThreadedWebsocketManager(ThreadedWebsocketManager):
         self._loop.run_until_complete(self.socket_listener())
 
 
+def _install_ws_ping_defaults() -> None:
+    """Configure python-binance ReconnectingWebsocket to send WS ping frames."""
+    try:
+        from binance.ws.reconnecting_websocket import ReconnectingWebsocket
+    except ImportError:
+        return
+
+    if getattr(ReconnectingWebsocket, "_hub_ping_configured", False):
+        return
+
+    interval = max(Config.WS_PING_INTERVAL_SECONDS, 0.0)
+    if interval <= 0:
+        return
+
+    original_init = ReconnectingWebsocket.__init__
+
+    def _init_with_ping(self, *args: Any, **kwargs: Any) -> None:
+        original_init(self, *args, **kwargs)
+        self._ws_kwargs.setdefault("ping_interval", interval)
+        self._ws_kwargs.setdefault("ping_timeout", max(interval + 10.0, 20.0))
+
+    ReconnectingWebsocket.__init__ = _init_with_ping  # type: ignore[method-assign]
+    ReconnectingWebsocket._hub_ping_configured = True
+
+
+_install_ws_ping_defaults()
+
 TIMEFRAME_SECONDS: dict[str, int] = {
     "1m": 60,
     "3m": 180,
@@ -166,6 +193,16 @@ class MarketDataHub:
             return time.monotonic() - self._ws_started_at
         return float("inf")
 
+    @staticmethod
+    def _effective_ticker_stale_seconds() -> float:
+        """Testnet streams are often quiet — use a longer stale threshold."""
+        if Config.USE_TESTNET:
+            return float(max(Config.WS_STALE_SECONDS_TESTNET, 60))
+        return float(max(Config.WS_STALE_SECONDS, 30))
+
+    def _preserve_cache_on_reconnect(self) -> bool:
+        """True when cached tickers/klines should survive a WS reconnect."""
+        return self.is_ticker_cache_usable(min_symbols=10) or bool(self._kline_bars)
     def needs_ticker_rest_fallback(self) -> bool:
         """True when WS ticker cache is empty or stale beyond the REST threshold."""
         if not Config.ENABLE_REST_TICKER_FALLBACK and not Config.STARTUP_TICKER_REST_SEED:
@@ -230,6 +267,9 @@ class MarketDataHub:
 
     def _should_reconnect_for_stale_ticker(self) -> bool:
         if not self.ws_is_stale():
+            return False
+        # Testnet miniTicker can go silent for long stretches — keep cached data.
+        if Config.USE_TESTNET and self.is_ticker_cache_usable(min_symbols=10):
             return False
         if self._rest_quiet_mode() and self.is_ticker_cache_usable(min_symbols=10):
             return False
@@ -340,7 +380,7 @@ class MarketDataHub:
         except Exception as exc:
             error_logger.error("Failed to start WebSocket streams: %s", exc)
 
-    def _start_ws_internal(self) -> None:
+    def _start_ws_internal(self, *, preserve_cache: bool = False) -> None:
         """Create ThreadedWebsocketManager on a dedicated event loop (never main thread)."""
         with self._ws_lifecycle_lock:
             if self._ws_manager is not None:
@@ -355,8 +395,12 @@ class MarketDataHub:
                 loop=ws_loop,
             )
             self._ws_manager.start()
-            self._last_ticker_event_at = 0.0
-            self._last_user_event_at = 0.0
+            if preserve_cache:
+                if self._tickers:
+                    self._last_ticker_event_at = time.monotonic()
+            else:
+                self._last_ticker_event_at = 0.0
+                self._last_user_event_at = 0.0
 
             manager = self._ws_manager
             self._ticker_conn_key = manager.start_futures_multiplex_socket(
@@ -465,8 +509,14 @@ class MarketDataHub:
             return
         if self.is_ws_warming_up():
             return
-        if self._rest_quiet_mode() and self.is_ticker_cache_usable(min_symbols=10):
-            return
+
+        is_stale_reason = "stale" in reason.lower()
+        preserve_cache = self._preserve_cache_on_reconnect()
+        if is_stale_reason:
+            if Config.USE_TESTNET and self.is_ticker_cache_usable(min_symbols=10):
+                return
+            if self._rest_quiet_mode() and self.is_ticker_cache_usable(min_symbols=10):
+                return
 
         now = time.monotonic()
         if (now - self._last_reconnect_request_at) < Config.WS_RECONNECT_DEBOUNCE_SECONDS:
@@ -478,43 +528,55 @@ class MarketDataHub:
                 return
             self._reconnect_in_progress = True
 
+        silent = preserve_cache
         if self._ws_log.should_log(reason):
-            system_logger.warning(
-                "WebSocket disconnect detected (%s) — scheduling reconnect.",
-                reason,
-            )
+            if silent:
+                system_logger.debug(
+                    "WebSocket reconnect scheduled (%s) — preserving cached data.",
+                    reason,
+                )
+            else:
+                system_logger.warning(
+                    "WebSocket disconnect detected (%s) — scheduling reconnect.",
+                    reason,
+                )
 
         threading.Thread(
             target=self._reconnect_worker,
-            args=(reason,),
+            args=(reason, silent),
             name="ws-reconnect",
             daemon=True,
         ).start()
 
-    def _reconnect_worker(self, reason: str) -> None:
+    def _reconnect_worker(self, reason: str, silent: bool = False) -> None:
         try:
             delay = self._reconnect_policy.next_delay()
             if self._ws_log.should_log(f"backoff:{delay:.0f}s"):
-                system_logger.info(
+                log_fn = system_logger.debug if silent else system_logger.info
+                log_fn(
                     "WebSocket reconnect in %.1fs (attempt %s).",
                     delay,
                     self._reconnect_policy.attempt,
                 )
             time.sleep(delay)
 
+            preserve_cache = self._preserve_cache_on_reconnect()
             self._stop_ws_internal(
                 preserve_kline_subscriptions=True,
                 blocking=False,
             )
-            self._start_ws_internal()
+            self._start_ws_internal(preserve_cache=preserve_cache)
             self._ws_log.reset()
-            if not self._rest_quiet_mode():
+            if not self._rest_quiet_mode() and not preserve_cache:
                 self.refresh_ticker_cache_from_rest(force=True)
-            elif self._ws_log.should_log("ws_reconnect_quiet"):
+            elif preserve_cache and self._ws_log.should_log("ws_reconnect_quiet"):
                 system_logger.debug(
-                    "WebSocket reconnected during REST ban — using cached tickers only."
+                    "WebSocket reconnected — continuing with cached tickers/klines."
                 )
-            system_logger.info("WebSocket reconnected successfully.")
+            if silent:
+                system_logger.debug("WebSocket reconnected successfully (silent).")
+            else:
+                system_logger.info("WebSocket reconnected successfully.")
         except Exception as exc:
             if self._ws_log.should_log(f"reconnect_failed:{exc}"):
                 error_logger.error(
@@ -528,6 +590,8 @@ class MarketDataHub:
 
     def _check_kline_sockets_health(self) -> None:
         stale_after = max(Config.WS_KLINE_SOCKET_STALE_SECONDS, 60)
+        if Config.USE_TESTNET:
+            stale_after = max(stale_after, Config.WS_STALE_SECONDS_TESTNET, 60)
         now = time.monotonic()
         for idx, sock in enumerate(self._kline_sockets):
             if not sock.streams or sock.reconnect_in_progress:
@@ -1263,7 +1327,9 @@ class MarketDataHub:
             return False
         if self._last_ticker_event_at <= 0:
             return True
-        return (time.monotonic() - self._last_ticker_event_at) > Config.WS_STALE_SECONDS
+        return (
+            time.monotonic() - self._last_ticker_event_at
+        ) > self._effective_ticker_stale_seconds()
 
     def user_stream_is_stale(self) -> bool:
         if not self._ws_running:

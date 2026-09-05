@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime, timezone
 from typing import Any, Optional, TYPE_CHECKING
 
 from config import Config
@@ -19,6 +20,68 @@ if TYPE_CHECKING:
     from exchange import BinanceExchangeManager
     from telegram_bot import TelegramManager
 
+
+def trade_open_age_seconds(trade: dict[str, Any]) -> float:
+    """Seconds since the trade was opened (0 when timestamp missing/invalid)."""
+    opened_at_raw = trade.get("opened_at")
+    if not opened_at_raw:
+        return 0.0
+    try:
+        opened_at = datetime.fromisoformat(str(opened_at_raw))
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        return max((utc_now() - opened_at).total_seconds(), 0.0)
+    except ValueError:
+        return 0.0
+
+
+def is_within_position_grace_period(trade: dict[str, Any]) -> bool:
+    """True while a newly opened trade may not yet appear on exchange/WS feeds."""
+    grace = max(Config.POSITION_GRACE_PERIOD_SECONDS, 0.0)
+    if grace <= 0:
+        return False
+    return trade_open_age_seconds(trade) < grace
+
+
+class PositionReconcileGuard:
+    """
+    Tracks consecutive 'position missing on exchange' observations.
+    Prevents instant RECONCILED_EXTERNAL_CLOSE on API/WS sync lag.
+    """
+
+    def __init__(self) -> None:
+        self._miss_counts: dict[str, int] = {}
+
+    def note_present(self, trade_id: str) -> None:
+        self._miss_counts.pop(str(trade_id), None)
+
+    def note_missing(self, trade_id: str) -> int:
+        key = str(trade_id)
+        self._miss_counts[key] = self._miss_counts.get(key, 0) + 1
+        return self._miss_counts[key]
+
+    def miss_count(self, trade_id: str) -> int:
+        return self._miss_counts.get(str(trade_id), 0)
+
+    def should_confirm_external_close(self, trade: dict[str, Any]) -> bool:
+        if is_within_position_grace_period(trade):
+            return False
+        threshold = max(Config.POSITION_RECONCILE_MISS_THRESHOLD, 1)
+        return self.miss_count(str(trade["trade_id"])) >= threshold
+
+    def register_missing(self, trade: dict[str, Any]) -> tuple[int, bool]:
+        """
+        Record one missing observation.
+        Returns (miss_count, should_close).
+        """
+        if is_within_position_grace_period(trade):
+            return 0, False
+        count = self.note_missing(str(trade["trade_id"]))
+        threshold = max(Config.POSITION_RECONCILE_MISS_THRESHOLD, 1)
+        return count, count >= threshold
+
+
+position_reconcile_guard = PositionReconcileGuard()
 
 def reconcile_positions_at_startup(
     exchange: "BinanceExchangeManager",
@@ -59,23 +122,47 @@ def reconcile_positions(
     closed_externally = 0
     for trade in db_trades:
         key = (trade["symbol"], trade["side"])
+        trade_id = str(trade["trade_id"])
         if key in exchange_keys:
+            position_reconcile_guard.note_present(trade_id)
+            continue
+
+        if is_within_position_grace_period(trade):
+            system_logger.debug(
+                "Deferring phantom purge — position grace period: %s %s | id=%s",
+                trade["symbol"],
+                trade["side"],
+                trade_id[:8],
+            )
+            continue
+
+        miss_count, should_close = position_reconcile_guard.register_missing(trade)
+        if not should_close:
+            system_logger.warning(
+                "Trade missing on exchange (%s/%s) — deferring phantom purge: %s %s | id=%s",
+                miss_count,
+                Config.POSITION_RECONCILE_MISS_THRESHOLD,
+                trade["symbol"],
+                trade["side"],
+                trade_id[:8],
+            )
             continue
 
         db.update_trade(
-            str(trade["trade_id"]),
+            trade_id,
             {
                 "status": TRADE_STATUS_CLOSED,
                 "closed_at": utc_now().isoformat(),
                 "exit_reason": "RECONCILED_PHANTOM_PURGE",
             },
         )
+        position_reconcile_guard.note_present(trade_id)
         closed_externally += 1
         system_logger.warning(
             "Purged phantom DB trade (exchange flat): %s %s | id=%s",
             trade["symbol"],
             trade["side"],
-            str(trade["trade_id"])[:8],
+            trade_id[:8],
         )
 
     orphan_exchange: list[dict[str, Any]] = []

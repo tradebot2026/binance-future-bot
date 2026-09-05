@@ -22,6 +22,7 @@ from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from exceptions import OrderExecutionError
 from logger import error_logger, trade_logger
+from reconciliation import is_within_position_grace_period, position_reconcile_guard
 from utils import round_step_size, safe_float, utc_now, utc_today_str
 
 if TYPE_CHECKING:
@@ -64,12 +65,17 @@ class TradeManager:
 
                 live_qty = self.exchange.get_position_quantity(symbol, position_side)
                 if live_qty <= 0:
+                    if self._defer_external_close(trade, symbol):
+                        continue
                     self._mark_trade_closed(
                         trade,
                         reason="RECONCILED_EXTERNAL_CLOSE",
                         exit_price=safe_float(self.exchange.get_market_price(symbol)),
                     )
+                    position_reconcile_guard.note_present(str(trade["trade_id"]))
                     continue
+
+                position_reconcile_guard.note_present(str(trade["trade_id"]))
 
                 price = self.exchange.get_market_price(symbol)
                 if price is None or price <= 0:
@@ -99,6 +105,30 @@ class TradeManager:
         "1h": 3600,
         "4h": 14400,
     }
+
+    def _defer_external_close(self, trade: dict[str, Any], symbol: str) -> bool:
+        """
+        True when an external close should NOT run yet (grace period or pending confirms).
+        """
+        trade_id = str(trade["trade_id"])
+        if is_within_position_grace_period(trade):
+            trade_logger.debug(
+                "[%s] Position reconcile deferred — within %ss grace period.",
+                symbol,
+                int(Config.POSITION_GRACE_PERIOD_SECONDS),
+            )
+            return True
+
+        miss_count, should_close = position_reconcile_guard.register_missing(trade)
+        if not should_close:
+            trade_logger.debug(
+                "[%s] Position not visible on exchange (%s/%s checks) — awaiting confirmation.",
+                symbol,
+                miss_count,
+                Config.POSITION_RECONCILE_MISS_THRESHOLD,
+            )
+            return True
+        return False
 
     def _entry_bar_seconds(self, trade: dict[str, Any]) -> int:
         metadata = self.db.parse_trade_metadata(trade)
@@ -492,11 +522,14 @@ class TradeManager:
 
         close_qty = self._resolve_close_quantity(trade, quantity)
         if close_qty <= 0:
+            if self._defer_external_close(trade, symbol):
+                return False
             self._mark_trade_closed(
                 trade,
                 reason="RECONCILED_EXTERNAL_CLOSE",
                 exit_price=safe_float(self.exchange.get_market_price(symbol)),
             )
+            position_reconcile_guard.note_present(str(trade["trade_id"]))
             return False
 
         try:
@@ -589,6 +622,7 @@ class TradeManager:
                 "duration": duration,
             },
         )
+        position_reconcile_guard.note_present(str(trade_id))
 
         balance = self.exchange.get_futures_balance(force_refresh=False)
         self.db.record_closed_trade(
