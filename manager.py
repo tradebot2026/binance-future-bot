@@ -57,7 +57,8 @@ class TradeManager:
             if not active_trades:
                 return
 
-            self.exchange.ensure_positions_cached()
+            if not self.exchange.rest_account_reads_blocked():
+                self.exchange.ensure_positions_cached(force=False)
 
             for trade in active_trades:
                 symbol = trade["symbol"]

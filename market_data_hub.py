@@ -826,7 +826,11 @@ class MarketDataHub:
         self, message: str, banned_until_ms: Optional[int] = None
     ) -> None:
         until_ms = banned_until_ms or parse_ban_until_ms(message)
-        halt_seconds = max(Config.REST_BAN_MIN_SLEEP_SECONDS, Config.RATE_LIMIT_HALT_SECONDS)
+        halt_seconds = max(
+            Config.REST_BAN_MIN_SLEEP_SECONDS,
+            Config.RATE_LIMIT_HALT_SECONDS,
+            Config.IP_BAN_HALT_SECONDS,
+        )
         if until_ms:
             remaining = max((until_ms / 1000.0) - time.time(), 0.0)
             halt_seconds = max(halt_seconds, int(remaining))
@@ -1331,6 +1335,10 @@ class MarketDataHub:
             time.monotonic() - self._last_ticker_event_at
         ) > self._effective_ticker_stale_seconds()
 
+    def user_stream_has_account_data(self) -> bool:
+        """True after at least one user-data WS event (ACCOUNT_UPDATE / order fill)."""
+        return self._last_user_event_at > 0
+
     def user_stream_is_stale(self) -> bool:
         if not self._ws_running:
             return True
@@ -1403,14 +1411,16 @@ class MarketDataHub:
         with self._lock:
             return self._unrealized_pnl_total
 
-    def get_ws_position_quantity(self, symbol: str, position_side: str) -> Optional[float]:
+    def get_ws_position_quantity(self, symbol: str, position_side: str) -> float:
         symbol = symbol.upper()
         position_side = position_side.upper()
         with self._lock:
+            if self._last_user_event_at <= 0:
+                return 0.0
             for pos in self._positions:
                 if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
                     return safe_float(pos.get("quantity"))
-        return None
+        return 0.0
 
     # ---------------- Candles ----------------
 

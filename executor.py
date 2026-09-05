@@ -93,7 +93,7 @@ class TradeExecutor:
         strategy: str = "DEFAULT",
     ) -> float:
         """Risk-based position sizing with tiered score multiplier."""
-        balance = self.exchange.get_futures_balance()
+        balance = self.exchange.get_futures_balance(force_refresh=False)
         if balance <= 0:
             raise OrderExecutionError("Cannot size position: zero or unavailable balance.")
 

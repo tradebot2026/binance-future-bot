@@ -55,7 +55,7 @@ class BalanceCache:
     ttl_seconds: int = Config.BALANCE_CACHE_TTL_SECONDS
 
     def is_valid(self) -> bool:
-        return self.value > 0 and (time.monotonic() - self.updated_at) < self.ttl_seconds
+        return self.updated_at > 0 and (time.monotonic() - self.updated_at) < self.ttl_seconds
 
     def set(self, balance: float) -> None:
         self.value = balance
@@ -76,6 +76,24 @@ class PositionCache:
 
     def is_valid(self) -> bool:
         return self.updated_at > 0 and (time.monotonic() - self.updated_at) < self.ttl_seconds
+
+
+@dataclass
+class AccountRestCache:
+    """Cached futures_account() payload — fallback when REST is banned or throttled."""
+
+    account_info: dict[str, Any] = field(default_factory=dict)
+    updated_at: float = 0.0
+
+    def is_valid(self) -> bool:
+        return bool(self.account_info) and (
+            time.monotonic() - self.updated_at
+        ) < Config.BALANCE_CACHE_TTL_SECONDS
+
+
+ACCOUNT_REST_ENDPOINTS = frozenset(
+    {"futures_account", "futures_position_information"}
+)
 
 
 class RateLimiter:
@@ -143,6 +161,8 @@ class BinanceExchangeManager:
         self._balance_cache = BalanceCache()
         self._balance_rest_backoff_until: float = 0.0
         self._last_balance_rest_at: float = 0.0
+        self._last_account_rest_at: float = 0.0
+        self._account_rest_cache = AccountRestCache()
         self._position_cache = PositionCache()
         self._position_refresh_lock = threading.Lock()
         self._position_backoff_until: float = 0.0
@@ -334,6 +354,8 @@ class BinanceExchangeManager:
         from market_data_hub import parse_ban_until_ms
 
         halt_seconds = max(Config.REST_BAN_MIN_SLEEP_SECONDS, Config.RATE_LIMIT_HALT_SECONDS)
+        if exc.code == -1003:
+            halt_seconds = max(halt_seconds, Config.IP_BAN_HALT_SECONDS)
         until_ms = parse_ban_until_ms(str(exc.message))
         if until_ms:
             halt_seconds = max(halt_seconds, int((until_ms / 1000.0) - time.time()))
@@ -393,6 +415,150 @@ class BinanceExchangeManager:
         lane = RestLane.BOOTSTRAP if self._is_bootstrap_priority() else RestLane.BACKGROUND
         return self._rest_budget.has_budget_for(max(weight, 1), lane)
 
+    def is_rest_blocked(self) -> tuple[bool, str]:
+        """True when REST must not be attempted (IP ban / hard-stop)."""
+        if self._market_data:
+            blocked, reason = self._market_data.is_rest_blocked()
+            if blocked:
+                return True, reason
+        if self._rest_token_bucket.is_hard_stopped():
+            remaining = int(self._rest_token_bucket.hard_stop_remaining())
+            return True, f"REST hard-stop (~{remaining}s remaining)"
+        return False, ""
+
+    def rest_account_reads_blocked(self) -> bool:
+        """True when account/position REST reads must use WS/cache only."""
+        blocked, _ = self.is_rest_blocked()
+        if blocked:
+            return True
+        if not Config.ENABLE_STRICT_RATE_LIMIT:
+            return False
+        reserve = max(Config.REST_BUDGET_ACCOUNT_RESERVE_FRACTION, 0.0)
+        return self._rest_budget.remaining_fraction() < reserve
+
+    @staticmethod
+    def _is_account_rest_call(func: Any) -> bool:
+        return getattr(func, "__name__", "") in ACCOUNT_REST_ENDPOINTS
+
+    def _account_rest_interval_elapsed(self) -> bool:
+        interval = max(float(Config.ACCOUNT_REST_MIN_INTERVAL_SECONDS), 60.0)
+        if self._last_account_rest_at <= 0:
+            return True
+        return (time.monotonic() - self._last_account_rest_at) >= interval
+
+    def _hydrate_balance_from_ws(self) -> Optional[float]:
+        if not self._market_data or not self._market_data.user_stream_has_account_data():
+            return None
+        quote = Config.QUOTE_ASSET
+        ws_balance = self._market_data.get_ws_wallet_balance(quote)
+        self._balance_cache.set(ws_balance)
+        return ws_balance
+
+    def _sync_account_cache_from_ws(self) -> None:
+        if not self._market_data or not self._market_data.user_stream_has_account_data():
+            return
+        quote = Config.QUOTE_ASSET
+        balance = self._market_data.get_ws_wallet_balance(quote)
+        assets = [
+            {
+                "asset": quote,
+                "availableBalance": str(balance),
+                "crossWalletBalance": str(balance),
+            }
+        ]
+        self._account_rest_cache.account_info = {"assets": assets}
+        self._account_rest_cache.updated_at = time.monotonic()
+        self._balance_cache.set(balance)
+
+    def _cached_futures_account_response(self) -> Optional[dict[str, Any]]:
+        if self._account_rest_cache.is_valid():
+            return dict(self._account_rest_cache.account_info)
+        self._sync_account_cache_from_ws()
+        if self._account_rest_cache.account_info:
+            return dict(self._account_rest_cache.account_info)
+        if self._balance_cache.is_valid():
+            quote = Config.QUOTE_ASSET
+            balance = self._balance_cache.value
+            return {
+                "assets": [
+                    {
+                        "asset": quote,
+                        "availableBalance": str(balance),
+                        "crossWalletBalance": str(balance),
+                    }
+                ]
+            }
+        return None
+
+    def _cached_futures_position_information(self) -> list[dict[str, Any]]:
+        if self._market_data and self._market_data.user_stream_has_account_data():
+            raw: list[dict[str, Any]] = []
+            for pos in self._market_data.get_ws_positions():
+                raw.append(
+                    {
+                        "symbol": pos.get("symbol"),
+                        "positionSide": pos.get("positionSide"),
+                        "positionAmt": str(safe_float(pos.get("quantity"))),
+                        "entryPrice": str(safe_float(pos.get("entry_price"))),
+                        "unRealizedProfit": str(safe_float(pos.get("unrealized_pnl"))),
+                    }
+                )
+            return raw
+        raw_cached: list[dict[str, Any]] = []
+        for pos in self._position_cache.positions:
+            raw_cached.append(
+                {
+                    "symbol": pos.get("symbol"),
+                    "positionSide": pos.get("positionSide"),
+                    "positionAmt": str(safe_float(pos.get("quantity"))),
+                    "entryPrice": str(safe_float(pos.get("entry_price"))),
+                    "unRealizedProfit": str(safe_float(pos.get("unrealized_pnl"))),
+                }
+            )
+        return raw_cached
+
+    def _account_endpoint_gate_reason(self, func: Any, *, execution_priority: bool) -> str:
+        name = getattr(func, "__name__", "")
+        if name not in ACCOUNT_REST_ENDPOINTS:
+            return ""
+        blocked, reason = self.is_rest_blocked()
+        if blocked:
+            return reason
+        if name == "futures_account":
+            if not execution_priority and not self._account_rest_interval_elapsed():
+                return "account_rest_interval"
+            if Config.ENABLE_STRICT_RATE_LIMIT:
+                reserve = max(Config.REST_BUDGET_ACCOUNT_RESERVE_FRACTION, 0.0)
+                if self._rest_budget.remaining_fraction() < reserve:
+                    return "rest_budget_reserve"
+        elif name == "futures_position_information":
+            if not Config.ENABLE_REST_POSITION_POLL:
+                return "rest_position_poll_disabled"
+            if not execution_priority and not self._account_rest_interval_elapsed():
+                return "account_rest_interval"
+            if Config.ENABLE_STRICT_RATE_LIMIT:
+                reserve = max(Config.REST_BUDGET_ACCOUNT_RESERVE_FRACTION, 0.0)
+                if self._rest_budget.remaining_fraction() < reserve:
+                    return "rest_budget_reserve"
+        return ""
+
+    def _return_cached_account_call(self, func: Any) -> Any:
+        name = getattr(func, "__name__", "")
+        if name == "futures_account":
+            cached = self._cached_futures_account_response()
+            if cached is not None:
+                return cached
+            return {"assets": []}
+        if name == "futures_position_information":
+            return self._cached_futures_position_information()
+        return None
+
+    def _store_account_rest_response(self, account_info: dict[str, Any]) -> None:
+        self._account_rest_cache.account_info = dict(account_info)
+        self._account_rest_cache.updated_at = time.monotonic()
+        self._last_account_rest_at = time.monotonic()
+        self._last_balance_rest_at = self._last_account_rest_at
+
     def _throttled_call(
         self,
         func: Any,
@@ -405,8 +571,23 @@ class BinanceExchangeManager:
             execution_priority or allow_during_scan or self._is_execution_priority()
         )
 
+        account_gate = self._account_endpoint_gate_reason(
+            func, execution_priority=priority
+        )
+        if account_gate and self._is_account_rest_call(func):
+            cached = self._return_cached_account_call(func)
+            if self._rest_block_log.should_log(f"account_cache:{account_gate}"):
+                system_logger.debug(
+                    "%s blocked (%s) — returning cached account/position state.",
+                    getattr(func, "__name__", "account"),
+                    account_gate,
+                )
+            return cached
+
         blocked, reason = self._rest_block_applies(priority)
         if blocked:
+            if self._is_account_rest_call(func):
+                return self._return_cached_account_call(func)
             if self._market_data:
                 remaining = self._market_data.get_rest_block_remaining_seconds()
                 if remaining > 0:
@@ -416,12 +597,16 @@ class BinanceExchangeManager:
             raise ExchangeRateLimitError(reason)
 
         if self._rest_token_bucket.is_hard_stopped():
+            if self._is_account_rest_call(func):
+                return self._return_cached_account_call(func)
             remaining = self._rest_token_bucket.hard_stop_remaining()
             raise ExchangeRateLimitError(
                 f"REST hard-stopped due to rate limit (~{int(remaining)}s remaining)"
             )
 
         if self._scan_mode and self._scan_ws_only() and not priority:
+            if self._is_account_rest_call(func):
+                return self._return_cached_account_call(func)
             raise ExchangeError(
                 "REST API call rejected during scan cycle — use WebSocket cache."
             )
@@ -432,6 +617,8 @@ class BinanceExchangeManager:
         if Config.ENABLE_STRICT_RATE_LIMIT:
             if lane != RestLane.EXECUTION:
                 if not self._rest_budget.acquire(call_weight, lane):
+                    if self._is_account_rest_call(func):
+                        return self._return_cached_account_call(func)
                     if self._rest_block_log.should_log("rest_budget_reserve"):
                         error_logger.warning(
                             "REST call skipped — budget below %.0f%% reserve "
@@ -452,10 +639,19 @@ class BinanceExchangeManager:
             if Config.ENABLE_STRICT_RATE_LIMIT:
                 limiter.wait()
             try:
-                return func(*args, **kwargs)
+                result = func(*args, **kwargs)
+                if getattr(func, "__name__", "") == "futures_account" and isinstance(
+                    result, dict
+                ):
+                    self._store_account_rest_response(result)
+                elif getattr(func, "__name__", "") == "futures_position_information":
+                    self._last_account_rest_at = time.monotonic()
+                return result
             except BinanceAPIException as exc:
                 if self._is_rate_limit_error(exc):
                     self._apply_rate_limit_halt(exc)
+                    if self._is_account_rest_call(func):
+                        return self._return_cached_account_call(func)
                     raise ExchangeRateLimitError(str(exc.message)) from exc
                 if self._critical_alerts and exc.code in (-1021, -2015, -2014):
                     self._critical_alerts.notify(
@@ -607,17 +803,18 @@ class BinanceExchangeManager:
         return open_positions
 
     def _refresh_positions_cache(self, force: bool = False) -> list[dict[str, Any]]:
-        """Prefer user-data WebSocket; REST refresh only when allowed and TTL expired."""
+        """Prefer user-data WebSocket; REST refresh throttled to ACCOUNT_REST_MIN_INTERVAL."""
         now = time.monotonic()
 
-        if self._market_data and not self._market_data.user_stream_is_stale():
-            ws_positions = self._market_data.get_ws_positions()
-            self._position_cache.positions = ws_positions
-            self._position_cache.unrealized_pnl_total = (
-                self._market_data.get_ws_unrealized_pnl_total()
-            )
-            self._position_cache.updated_at = now
-            return ws_positions
+        if self._market_data and self._market_data.user_stream_has_account_data():
+            if not self._market_data.user_stream_is_stale():
+                ws_positions = self._market_data.get_ws_positions()
+                self._position_cache.positions = ws_positions
+                self._position_cache.unrealized_pnl_total = (
+                    self._market_data.get_ws_unrealized_pnl_total()
+                )
+                self._position_cache.updated_at = now
+                return ws_positions
 
         if not force and self._position_cache.is_valid():
             return self._position_cache.positions
@@ -625,7 +822,18 @@ class BinanceExchangeManager:
         if now < self._position_backoff_until:
             return self._position_cache.positions
 
+        if (
+            not force
+            and self._last_account_rest_at > 0
+            and (now - self._last_account_rest_at)
+            < max(float(Config.ACCOUNT_REST_MIN_INTERVAL_SECONDS), 60.0)
+        ):
+            return self._position_cache.positions
+
         if not Config.ENABLE_REST_POSITION_POLL or not self._rest_reads_allowed():
+            return self._position_cache.positions
+
+        if self.rest_account_reads_blocked():
             return self._position_cache.positions
 
         with self._position_refresh_lock:
@@ -686,81 +894,66 @@ class BinanceExchangeManager:
 
     def fetch_startup_balance(self) -> float:
         """
-        Startup-only balance lookup with quick REST retries.
-        Bypasses ENABLE_REST_BALANCE_POLL so testnet cold starts still initialize stats.
+        Startup-only balance lookup — single REST futures_account when WS empty.
         """
         quote = Config.QUOTE_ASSET
 
-        if self._market_data and not self._market_data.user_stream_is_stale():
-            ws_balance = self._market_data.get_ws_wallet_balance(quote)
-            if ws_balance > 0:
-                self._balance_cache.set(ws_balance)
-                return ws_balance
+        ws_balance = self._hydrate_balance_from_ws()
+        if ws_balance is not None and ws_balance > 0:
+            return ws_balance
 
-        if self._balance_cache.is_valid() and self._balance_cache.value > 0:
+        if self._balance_cache.is_valid():
             return self._balance_cache.value
 
         allowed, reason = self._rest_gate_open()
         if not allowed:
             system_logger.debug("Startup balance deferred: %s", reason)
-            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+            return self._balance_cache.value
 
-        max_attempts = max(Config.STARTUP_BALANCE_MAX_ATTEMPTS, 1)
-        delay = max(Config.STARTUP_BALANCE_RETRY_SECONDS, 0.5)
+        if self.rest_account_reads_blocked():
+            cached = self._cached_futures_account_response()
+            if cached:
+                for asset in cached.get("assets", []):
+                    if asset.get("asset") == quote:
+                        balance = safe_float(asset.get("availableBalance"))
+                        if balance <= 0:
+                            balance = safe_float(asset.get("crossWalletBalance"))
+                        if balance >= 0:
+                            self._balance_cache.set(balance)
+                            return balance
+            return self._balance_cache.value
 
-        for attempt in range(1, max_attempts + 1):
-            try:
-                account_info = self._throttled_call(
-                    self.client.futures_account,
-                    **self.recv_window_param,
-                )
-                self._last_balance_rest_at = time.monotonic()
-                for asset in account_info.get("assets", []):
-                    if asset.get("asset") != quote:
-                        continue
-                    balance = safe_float(asset.get("availableBalance"))
-                    if balance <= 0:
-                        balance = safe_float(asset.get("crossWalletBalance"))
-                    if balance > 0:
-                        self._balance_cache.set(balance)
-                        return balance
-            except ExchangeRateLimitError:
-                break
-            except Exception as exc:
-                if attempt >= max_attempts:
-                    error_logger.warning(
-                        "Startup balance fetch failed after %s attempts: %s",
-                        max_attempts,
-                        exc,
-                    )
-                else:
-                    system_logger.debug(
-                        "Startup balance attempt %s/%s failed: %s — retrying.",
-                        attempt,
-                        max_attempts,
-                        exc,
-                    )
-            if attempt < max_attempts:
-                time.sleep(delay)
+        try:
+            account_info = self._throttled_call(
+                self.client.futures_account,
+                **self.recv_window_param,
+            )
+            for asset in account_info.get("assets", []):
+                if asset.get("asset") != quote:
+                    continue
+                balance = safe_float(asset.get("availableBalance"))
+                if balance <= 0:
+                    balance = safe_float(asset.get("crossWalletBalance"))
+                self._balance_cache.set(balance)
+                return balance
+        except ExchangeRateLimitError:
+            pass
+        except Exception as exc:
+            error_logger.warning("Startup balance fetch failed: %s", exc)
 
-        return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+        return self._balance_cache.value
 
     def get_futures_balance(self, force_refresh: bool = False) -> float:
         """
         Return available USDT balance.
-        Prefers user-data WebSocket wallet updates; REST polls at most every
-        BALANCE_REST_POLL_SECONDS and never retries aggressively during bans.
+        Primary: user-data WebSocket wallet updates.
+        REST futures_account(): startup + at most once per ACCOUNT_REST_MIN_INTERVAL_SECONDS.
         """
         quote = Config.QUOTE_ASSET
 
-        if self._market_data and not self._market_data.user_stream_is_stale():
-            ws_balance = self._market_data.get_ws_wallet_balance(quote)
-            if ws_balance > 0:
-                self._balance_cache.set(ws_balance)
-                return ws_balance
-
-        now = time.monotonic()
-        poll_interval = float(Config.BALANCE_REST_POLL_SECONDS)
+        ws_balance = self._hydrate_balance_from_ws()
+        if ws_balance is not None:
+            return ws_balance
 
         if force_refresh and not self._is_execution_priority():
             force_refresh = False
@@ -768,25 +961,39 @@ class BinanceExchangeManager:
         if not force_refresh and self._balance_cache.is_valid():
             return self._balance_cache.value
 
+        now = time.monotonic()
+        poll_interval = max(float(Config.ACCOUNT_REST_MIN_INTERVAL_SECONDS), 60.0)
+
         if (
             not force_refresh
-            and self._last_balance_rest_at > 0
-            and (now - self._last_balance_rest_at) < poll_interval
+            and self._last_account_rest_at > 0
+            and (now - self._last_account_rest_at) < poll_interval
         ):
-            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+            return self._balance_cache.value
 
         if now < self._balance_rest_backoff_until:
-            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+            return self._balance_cache.value
 
         if not Config.ENABLE_REST_BALANCE_POLL or not self._rest_reads_allowed():
-            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+            return self._balance_cache.value
+
+        if self.rest_account_reads_blocked():
+            cached = self._cached_futures_account_response()
+            if cached:
+                for asset in cached.get("assets", []):
+                    if asset.get("asset") == quote:
+                        balance = safe_float(asset.get("availableBalance"))
+                        if balance <= 0:
+                            balance = safe_float(asset.get("crossWalletBalance"))
+                        self._balance_cache.set(balance)
+                        return balance
+            return self._balance_cache.value
 
         try:
             account_info = self._throttled_call(
                 self.client.futures_account,
                 **self.recv_window_param,
             )
-            self._last_balance_rest_at = now
             for asset in account_info.get("assets", []):
                 if asset.get("asset") == quote:
                     balance = safe_float(asset.get("availableBalance"))
@@ -794,16 +1001,20 @@ class BinanceExchangeManager:
                         balance = safe_float(asset.get("crossWalletBalance"))
                     self._balance_cache.set(balance)
                     return balance
-            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+            return self._balance_cache.value
         except ExchangeRateLimitError:
             self._balance_rest_backoff_until = now + poll_interval
-            self._last_balance_rest_at = now
-            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+            cached = self._cached_futures_account_response()
+            if cached:
+                for asset in cached.get("assets", []):
+                    if asset.get("asset") == quote:
+                        return safe_float(asset.get("availableBalance"))
+            return self._balance_cache.value
         except Exception as exc:
             self._balance_rest_backoff_until = now + min(poll_interval, 120.0)
             if self._rest_block_log.should_log("balance_fetch_failed"):
                 error_logger.warning("Balance REST fetch failed (cached fallback): %s", exc)
-            return self._balance_cache.value if self._balance_cache.value > 0 else 0.0
+            return self._balance_cache.value
 
     # ---------------- Market data ----------------
 
@@ -1249,10 +1460,11 @@ class BinanceExchangeManager:
     def has_open_position(self, symbol: str, position_side: str) -> bool:
         symbol = symbol.upper()
         position_side = position_side.upper()
-        if self._market_data and not self._market_data.user_stream_is_stale():
-            qty = self._market_data.get_ws_position_quantity(symbol, position_side)
-            if qty is not None:
-                return qty > 0
+        if self._market_data and self._market_data.user_stream_has_account_data():
+            if not self._market_data.user_stream_is_stale():
+                return (
+                    self._market_data.get_ws_position_quantity(symbol, position_side) > 0
+                )
         for pos in self._refresh_positions_cache():
             if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
                 return safe_float(pos.get("quantity")) > 0
@@ -1261,10 +1473,9 @@ class BinanceExchangeManager:
     def get_position_quantity(self, symbol: str, position_side: str) -> float:
         symbol = symbol.upper()
         position_side = position_side.upper()
-        if self._market_data and not self._market_data.user_stream_is_stale():
-            qty = self._market_data.get_ws_position_quantity(symbol, position_side)
-            if qty is not None:
-                return qty
+        if self._market_data and self._market_data.user_stream_has_account_data():
+            if not self._market_data.user_stream_is_stale():
+                return self._market_data.get_ws_position_quantity(symbol, position_side)
         for pos in self._refresh_positions_cache():
             if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
                 return safe_float(pos.get("quantity"))

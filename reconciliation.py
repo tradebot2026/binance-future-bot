@@ -107,6 +107,11 @@ def reconcile_positions(
     """
     system_logger.info("Running %s position reconciliation...", context)
 
+    if exchange.rest_account_reads_blocked():
+        system_logger.info(
+            "Reconciliation using WebSocket/cached positions only (REST limited)."
+        )
+
     recovered = recover_orphan_fills_from_disk(db)
     if recovered:
         system_logger.info("Recovered %s orphan fill(s) from disk into DB.", recovered)
