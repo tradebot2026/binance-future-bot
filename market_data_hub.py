@@ -188,7 +188,10 @@ class MarketDataHub:
 
         blocked, reason = self.is_rest_blocked()
         if blocked:
-            system_logger.debug("Ticker REST fallback skipped — REST blocked: %s", reason)
+            if self._ws_log.should_log(f"ticker_rest_blocked:{reason}"):
+                system_logger.debug(
+                    "Ticker REST fallback skipped — REST blocked: %s", reason
+                )
             return len(self._tickers)
 
         now = time.monotonic()
@@ -203,7 +206,8 @@ class MarketDataHub:
         try:
             result = fetcher()
         except Exception as exc:
-            error_logger.warning("Ticker REST fallback failed: %s", exc)
+            if self._ws_log.should_log(f"ticker_rest_fail:{exc}"):
+                error_logger.warning("Ticker REST fallback failed: %s", exc)
             return len(self._tickers)
 
         if not result:
@@ -218,6 +222,18 @@ class MarketDataHub:
                 "Ticker cache refreshed from REST (%s symbols).", count
             )
         return count
+
+    def _rest_quiet_mode(self) -> bool:
+        """During IP/rate-limit ban, avoid REST polling and noisy WS churn."""
+        blocked, _ = self.is_rest_blocked()
+        return blocked
+
+    def _should_reconnect_for_stale_ticker(self) -> bool:
+        if not self.ws_is_stale():
+            return False
+        if self._rest_quiet_mode() and self.is_ticker_cache_usable(min_symbols=10):
+            return False
+        return True
 
     def is_ticker_cache_usable(self, min_symbols: int = 1) -> bool:
         """Scanner may proceed when tickers are present (WS or REST)."""
@@ -384,9 +400,9 @@ class MarketDataHub:
             if self.is_ws_warming_up():
                 continue
             self._check_kline_sockets_health()
-            if self.needs_ticker_rest_fallback():
+            if not self._rest_quiet_mode() and self.needs_ticker_rest_fallback():
                 self.refresh_ticker_cache_from_rest()
-            if self.ws_is_stale():
+            if self._should_reconnect_for_stale_ticker():
                 self._request_reconnect("ticker stream stale — no events received")
 
     @staticmethod
@@ -449,6 +465,8 @@ class MarketDataHub:
             return
         if self.is_ws_warming_up():
             return
+        if self._rest_quiet_mode() and self.is_ticker_cache_usable(min_symbols=10):
+            return
 
         now = time.monotonic()
         if (now - self._last_reconnect_request_at) < Config.WS_RECONNECT_DEBOUNCE_SECONDS:
@@ -489,9 +507,13 @@ class MarketDataHub:
                 blocking=False,
             )
             self._start_ws_internal()
-            self._reconnect_policy.reset()
             self._ws_log.reset()
-            self.refresh_ticker_cache_from_rest(force=True)
+            if not self._rest_quiet_mode():
+                self.refresh_ticker_cache_from_rest(force=True)
+            elif self._ws_log.should_log("ws_reconnect_quiet"):
+                system_logger.debug(
+                    "WebSocket reconnected during REST ban — using cached tickers only."
+                )
             system_logger.info("WebSocket reconnected successfully.")
         except Exception as exc:
             if self._ws_log.should_log(f"reconnect_failed:{exc}"):
@@ -822,6 +844,7 @@ class MarketDataHub:
             payload = message.get("data", message)
             rows = payload if isinstance(payload, list) else [payload]
             now = time.monotonic()
+            updated = False
             with self._lock:
                 for row in rows:
                     if not isinstance(row, dict):
@@ -843,7 +866,11 @@ class MarketDataHub:
                         "openPrice": safe_float(row.get("o")),
                         "updated_at": now,
                     }
-                self._last_ticker_event_at = now
+                    updated = True
+                if updated:
+                    self._last_ticker_event_at = now
+            if updated:
+                self._reconnect_policy.reset()
         except Exception as exc:
             error_logger.warning("Ticker WS parse error: %s", exc)
 

@@ -373,6 +373,26 @@ class BinanceExchangeManager:
         message = str(exc.message).lower()
         return "429" in message or "418" in message or "rate limit" in message
 
+    def _resolve_rest_lane(
+        self, *, execution_priority: bool
+    ) -> RestLane:
+        if execution_priority or self._is_execution_priority():
+            return RestLane.EXECUTION
+        if self._is_bootstrap_priority():
+            return RestLane.BOOTSTRAP
+        return RestLane.BACKGROUND
+
+    def can_make_background_rest_call(self, weight: int = 1) -> bool:
+        """True when a non-execution REST call is allowed (ban, hard-stop, budget)."""
+        if self._market_data and self._market_data.is_rest_blocked()[0]:
+            return False
+        if self._rest_token_bucket.is_hard_stopped():
+            return False
+        if not Config.ENABLE_STRICT_RATE_LIMIT:
+            return True
+        lane = RestLane.BOOTSTRAP if self._is_bootstrap_priority() else RestLane.BACKGROUND
+        return self._rest_budget.has_budget_for(max(weight, 1), lane)
+
     def _throttled_call(
         self,
         func: Any,
@@ -395,18 +415,35 @@ class BinanceExchangeManager:
                 error_logger.warning("REST call blocked (ban active): %s", reason)
             raise ExchangeRateLimitError(reason)
 
+        if self._rest_token_bucket.is_hard_stopped():
+            remaining = self._rest_token_bucket.hard_stop_remaining()
+            raise ExchangeRateLimitError(
+                f"REST hard-stopped due to rate limit (~{int(remaining)}s remaining)"
+            )
+
         if self._scan_mode and self._scan_ws_only() and not priority:
             raise ExchangeError(
                 "REST API call rejected during scan cycle — use WebSocket cache."
             )
 
         call_weight = weight_for_call(func)
+        lane = self._resolve_rest_lane(execution_priority=priority)
+
         if Config.ENABLE_STRICT_RATE_LIMIT:
-            if priority:
-                lane = RestLane.EXECUTION
-            else:
-                lane = RestLane.BACKGROUND
-            self._rest_budget.acquire(call_weight, lane)
+            if lane != RestLane.EXECUTION:
+                if not self._rest_budget.acquire(call_weight, lane):
+                    if self._rest_block_log.should_log("rest_budget_reserve"):
+                        error_logger.warning(
+                            "REST call skipped — budget below %.0f%% reserve "
+                            "(used=%s/%s weight, endpoint=%s).",
+                            Config.REST_BUDGET_MIN_REMAINING_FRACTION * 100,
+                            self._rest_budget.current_window_weight(),
+                            self._rest_budget.max_weight_per_minute,
+                            getattr(func, "__name__", "unknown"),
+                        )
+                    raise ExchangeRateLimitError(
+                        "REST budget below reserve threshold"
+                    )
             self._rest_token_bucket.acquire(call_weight)
 
         limiter = self._execution_rate_limiter if priority else self._rate_limiter
@@ -616,12 +653,16 @@ class BinanceExchangeManager:
 
     def fetch_futures_ticker_map_rest(self) -> dict[str, dict[str, Any]]:
         """
-        Single futures_ticker() REST call to warm the cache.
-        Allowed during startup / WS outage — only blocked on active IP ban.
+        Single futures_ticker() REST call to warm the cache (weight=1, batched).
+        Skipped entirely during IP ban, hard-stop, or low REST budget reserve.
         """
         if self._market_data and self._market_data.is_rest_blocked()[0]:
             return {}
         if self.in_scan_mode and Config.SCAN_WS_ONLY:
+            return {}
+        if not self.can_make_background_rest_call(
+            weight_for_call(self.client.futures_ticker)
+        ):
             return {}
 
         try:
@@ -1008,6 +1049,8 @@ class BinanceExchangeManager:
             if (
                 Config.ENABLE_REST_TICKER_FALLBACK
                 or self._market_data.needs_ticker_rest_fallback()
+            ) and self.can_make_background_rest_call(
+                weight_for_call(self.client.futures_ticker)
             ):
                 self._market_data.refresh_ticker_cache_from_rest()
                 cached = self._market_data.get_ticker_map()
@@ -1020,6 +1063,11 @@ class BinanceExchangeManager:
                 return cached
 
         if not Config.ENABLE_REST_TICKER_FALLBACK:
+            return self._market_data.get_ticker_map() if self._market_data else {}
+
+        if not self.can_make_background_rest_call(
+            weight_for_call(self.client.futures_ticker)
+        ):
             return self._market_data.get_ticker_map() if self._market_data else {}
 
         result = self.fetch_futures_ticker_map_rest()
