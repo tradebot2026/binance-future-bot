@@ -24,7 +24,18 @@ class UniverseFilterStats:
     rejected_atr: int = 0
     rejected_blacklist: int = 0
     rejected_no_price: int = 0
+    filter_profile: str = "strict"
     candidates: list[tuple[str, float, float, float]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class _FilterProfile:
+    label: str
+    min_volume: float
+    min_range_pct: float
+    min_atr_pct: float
+    enable_atr: bool
+    skip_stagnant_when_range_unknown: bool = True
 
 
 @dataclass
@@ -55,6 +66,38 @@ class UniverseBuilder:
         return symbol.endswith(Config.QUOTE_ASSET) and "_" not in symbol
 
     @staticmethod
+    def _strict_profile() -> _FilterProfile:
+        return _FilterProfile(
+            label="strict",
+            min_volume=Config.MIN_24H_VOLUME_USDT,
+            min_range_pct=Config.MIN_24H_RANGE_PCT,
+            min_atr_pct=Config.MIN_UNIVERSE_ATR_PCT,
+            enable_atr=Config.ENABLE_UNIVERSE_ATR_FILTER,
+        )
+
+    @staticmethod
+    def _testnet_profile() -> _FilterProfile:
+        return _FilterProfile(
+            label="testnet",
+            min_volume=Config.TESTNET_MIN_24H_VOLUME_USDT,
+            min_range_pct=Config.TESTNET_MIN_24H_RANGE_PCT,
+            min_atr_pct=0.0,
+            enable_atr=not Config.TESTNET_DISABLE_UNIVERSE_ATR_FILTER,
+            skip_stagnant_when_range_unknown=True,
+        )
+
+    @staticmethod
+    def _relaxed_profile() -> _FilterProfile:
+        return _FilterProfile(
+            label="relaxed",
+            min_volume=Config.RELAXED_MIN_24H_VOLUME_USDT,
+            min_range_pct=Config.RELAXED_MIN_24H_RANGE_PCT,
+            min_atr_pct=0.0,
+            enable_atr=False,
+            skip_stagnant_when_range_unknown=True,
+        )
+
+    @staticmethod
     def _compute_spread_pct(book: dict[str, Any]) -> Optional[float]:
         if book.get("is_proxy"):
             return None
@@ -68,15 +111,26 @@ class UniverseBuilder:
         return ((ask - bid) / mid) * 100.0
 
     @staticmethod
-    def _compute_24h_range_pct(ticker: dict[str, Any], last_price: float) -> float:
+    def _compute_24h_range_pct(
+        ticker: dict[str, Any], last_price: float
+    ) -> Optional[float]:
+        """
+        Return 24h range percent, or None when high/low are unavailable.
+        None means skip stagnant rejection (valid price but no range metadata).
+        """
         high = safe_float(ticker.get("highPrice"))
         low = safe_float(ticker.get("lowPrice"))
         if last_price <= 0 or high <= 0 or low <= 0 or high < low:
-            return 0.0
+            return None
         return ((high - low) / last_price) * 100.0
 
-    def _passes_atr_volatility_filter(self, symbol: str, last_price: float) -> bool:
-        if not Config.ENABLE_UNIVERSE_ATR_FILTER or last_price <= 0 or not self._hub:
+    def _passes_atr_volatility_filter(
+        self,
+        symbol: str,
+        last_price: float,
+        profile: _FilterProfile,
+    ) -> bool:
+        if not profile.enable_atr or last_price <= 0 or not self._hub:
             return True
 
         limit = max(Config.UNIVERSE_ATR_LOOKBACK_BARS + 14, 30)
@@ -94,12 +148,32 @@ class UniverseBuilder:
         atr = safe_float(atr_series.iloc[-1])
         if atr <= 0:
             return True
-        return (atr / last_price) * 100.0 >= Config.MIN_UNIVERSE_ATR_PCT
+        threshold = profile.min_atr_pct if profile.min_atr_pct > 0 else Config.MIN_UNIVERSE_ATR_PCT
+        return (atr / last_price) * 100.0 >= threshold
+
+    def _resolve_last_price(
+        self, symbol: str, ticker: dict[str, Any], book_map: dict[str, dict[str, Any]]
+    ) -> float:
+        last_price = safe_float(ticker.get("lastPrice"))
+        if last_price > 0:
+            return last_price
+        book = book_map.get(symbol, {})
+        bid = safe_float(book.get("bidPrice"))
+        ask = safe_float(book.get("askPrice"))
+        if bid > 0 and ask > 0 and not book.get("is_proxy"):
+            return (bid + ask) / 2.0
+        return 0.0
 
     def _build_candidates(
-        self, ticker_map: dict[str, dict[str, Any]], book_map: dict[str, dict[str, Any]]
+        self,
+        ticker_map: dict[str, dict[str, Any]],
+        book_map: dict[str, dict[str, Any]],
+        profile: _FilterProfile,
     ) -> UniverseFilterStats:
-        stats = UniverseFilterStats(total_tickers=len(ticker_map))
+        stats = UniverseFilterStats(
+            total_tickers=len(ticker_map),
+            filter_profile=profile.label,
+        )
         self.db.cleanup_expired_blacklist()
 
         for symbol, ticker in ticker_map.items():
@@ -108,33 +182,27 @@ class UniverseBuilder:
                 continue
 
             volume_24h = safe_float(ticker.get("quoteVolume"))
-            if volume_24h < Config.MIN_24H_VOLUME_USDT:
+            if volume_24h < profile.min_volume:
                 stats.rejected_volume += 1
                 continue
 
-            last_price = safe_float(ticker.get("lastPrice"))
-            book = book_map.get(symbol, {})
-            spread_pct = self._compute_spread_pct(book)
-
-            if spread_pct is not None and spread_pct > Config.MAX_SPREAD_PERCENT:
-                stats.rejected_spread += 1
-                continue
-
-            if last_price <= 0:
-                bid = safe_float(book.get("bidPrice"))
-                ask = safe_float(book.get("askPrice"))
-                if bid > 0 and ask > 0 and not book.get("is_proxy"):
-                    last_price = (bid + ask) / 2.0
+            last_price = self._resolve_last_price(symbol, ticker, book_map)
             if last_price <= 0:
                 stats.rejected_no_price += 1
                 continue
 
+            book = book_map.get(symbol, {})
+            spread_pct = self._compute_spread_pct(book)
+            if spread_pct is not None and spread_pct > Config.MAX_SPREAD_PERCENT:
+                stats.rejected_spread += 1
+                continue
+
             range_pct = self._compute_24h_range_pct(ticker, last_price)
-            if range_pct < Config.MIN_24H_RANGE_PCT:
+            if range_pct is not None and range_pct < profile.min_range_pct:
                 stats.rejected_stagnant += 1
                 continue
 
-            if not self._passes_atr_volatility_filter(symbol, last_price):
+            if not self._passes_atr_volatility_filter(symbol, last_price, profile):
                 stats.rejected_atr += 1
                 continue
 
@@ -142,9 +210,95 @@ class UniverseBuilder:
                 stats.rejected_blacklist += 1
                 continue
 
-            stats.candidates.append((symbol, volume_24h, spread_pct or 0.0, range_pct))
+            stats.candidates.append(
+                (symbol, volume_24h, spread_pct or 0.0, range_pct or 0.0)
+            )
 
         stats.candidates.sort(key=lambda row: row[1], reverse=True)
+        return stats
+
+    def _build_volume_fallback(
+        self,
+        ticker_map: dict[str, dict[str, Any]],
+        book_map: dict[str, dict[str, Any]],
+    ) -> UniverseFilterStats:
+        """Last resort: top-N USDT perpetuals by 24h quote volume with valid price."""
+        stats = UniverseFilterStats(
+            total_tickers=len(ticker_map),
+            filter_profile="volume_fallback",
+        )
+        self.db.cleanup_expired_blacklist()
+        rows: list[tuple[str, float, float, float]] = []
+
+        for symbol, ticker in ticker_map.items():
+            if not self._is_usdt_perpetual(symbol):
+                stats.rejected_quote += 1
+                continue
+            if self.db.is_blacklisted(symbol):
+                stats.rejected_blacklist += 1
+                continue
+
+            last_price = self._resolve_last_price(symbol, ticker, book_map)
+            if last_price <= 0:
+                stats.rejected_no_price += 1
+                continue
+
+            volume_24h = safe_float(ticker.get("quoteVolume"))
+            range_pct = self._compute_24h_range_pct(ticker, last_price)
+            book = book_map.get(symbol, {})
+            spread_pct = self._compute_spread_pct(book) or 0.0
+            rows.append((symbol, volume_24h, spread_pct, range_pct or 0.0))
+
+        rows.sort(key=lambda row: row[1], reverse=True)
+        top_n = max(Config.UNIVERSE_FALLBACK_TOP_N, Config.UNIVERSE_RELAXED_MIN_SYMBOLS)
+        stats.candidates = rows[:top_n]
+        return stats
+
+    def _select_profile_chain(self) -> list[_FilterProfile]:
+        if Config.USE_TESTNET and Config.TESTNET_RELAX_UNIVERSE_FILTERS:
+            return [self._testnet_profile()]
+        return [self._strict_profile()]
+
+    def _build_with_relaxation(
+        self,
+        ticker_map: dict[str, dict[str, Any]],
+        book_map: dict[str, dict[str, Any]],
+    ) -> UniverseFilterStats:
+        target = Config.MIN_SCAN_UNIVERSE
+        stats = UniverseFilterStats(total_tickers=len(ticker_map))
+
+        for profile in self._select_profile_chain():
+            stats = self._build_candidates(ticker_map, book_map, profile)
+            if len(stats.candidates) >= target:
+                return stats
+
+        if (
+            Config.ENABLE_UNIVERSE_FILTER_RELAXATION
+            and len(stats.candidates) < target
+            and stats.filter_profile != "relaxed"
+        ):
+            relaxed = self._build_candidates(
+                ticker_map, book_map, self._relaxed_profile()
+            )
+            if len(relaxed.candidates) > len(stats.candidates):
+                scanner_logger.info(
+                    "Universe filters relaxed (%s -> %s candidates, profile=%s).",
+                    len(stats.candidates),
+                    len(relaxed.candidates),
+                    relaxed.filter_profile,
+                )
+                stats = relaxed
+
+        min_floor = max(Config.UNIVERSE_RELAXED_MIN_SYMBOLS, 1)
+        if len(stats.candidates) < min_floor:
+            fallback = self._build_volume_fallback(ticker_map, book_map)
+            if len(fallback.candidates) > len(stats.candidates):
+                scanner_logger.info(
+                    "Universe volume fallback selected top %s symbols by 24h quote volume.",
+                    len(fallback.candidates),
+                )
+                stats = fallback
+
         return stats
 
     def build(
@@ -165,7 +319,7 @@ class UniverseBuilder:
                 return UniverseResult([], {}, {}, [], UniverseFilterStats())
 
             book_map = self.exchange.get_book_ticker_map()
-            stats = self._build_candidates(ticker_map, book_map)
+            stats = self._build_with_relaxation(ticker_map, book_map)
             selected = stats.candidates[: Config.MAX_SCAN_UNIVERSE]
             symbols = self._prioritize([row[0] for row in selected], priority_symbols)
 
@@ -175,7 +329,7 @@ class UniverseBuilder:
                 volume_ranks[symbol] = rank
                 if symbol in symbols:
                     ticker = ticker_map.get(symbol, {})
-                    price = safe_float(ticker.get("lastPrice"))
+                    price = self._resolve_last_price(symbol, ticker, book_map)
                     if price > 0:
                         price_map[symbol] = price
 
@@ -214,11 +368,12 @@ class UniverseBuilder:
 
         scanner_logger.info(
             "Universe created: %s active high-volume pairs selected for scanning "
-            "(target %s-%s | tickers=%s | rejected: volume=%s spread=%s stagnant=%s "
-            "atr=%s blacklist=%s no_price=%s).",
+            "(target %s-%s | profile=%s | tickers=%s | rejected: volume=%s spread=%s "
+            "stagnant=%s atr=%s blacklist=%s no_price=%s).",
             len(symbols),
             Config.MIN_SCAN_UNIVERSE,
             Config.MAX_SCAN_UNIVERSE,
+            stats.filter_profile,
             stats.total_tickers,
             stats.rejected_volume,
             stats.rejected_spread,
@@ -231,7 +386,8 @@ class UniverseBuilder:
 
         if len(symbols) < Config.MIN_SCAN_UNIVERSE:
             scanner_logger.warning(
-                "Universe below target minimum (%s/%s) — loosen filters or wait for WS book cache.",
+                "Universe below target minimum (%s/%s) — profile=%s.",
                 len(symbols),
                 Config.MIN_SCAN_UNIVERSE,
+                stats.filter_profile,
             )

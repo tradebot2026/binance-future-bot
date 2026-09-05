@@ -205,8 +205,9 @@ class MarketScanner:
 
     def get_tradable_symbols(self) -> tuple[list[str], dict[str, float]]:
         """
-        Build dynamic scan universe (50-80 pairs) from WS ticker/book cache only.
-        Delegates to UniverseBuilder (backward-compatible wrapper).
+        Build dynamic scan universe from WS/REST ticker cache.
+        On Testnet (or when strict filters yield too few symbols), filters relax
+        automatically to keep at least UNIVERSE_RELAXED_MIN_SYMBOLS liquid pairs.
         """
         if self._hub is not None:
             self._hub.ensure_ticker_cache_ready(
@@ -214,6 +215,16 @@ class MarketScanner:
             )
         result = self._universe_builder.build(priority_symbols=self._scan_priority)
         self._pipeline._last_universe_symbols = result.symbols
+        if (
+            result.symbols
+            and result.stats.filter_profile != "strict"
+            and Config.USE_TESTNET
+        ):
+            scanner_logger.debug(
+                "Testnet universe built with profile=%s (%s symbols).",
+                result.stats.filter_profile,
+                len(result.symbols),
+            )
         return result.symbols, result.price_map
 
     def _fetch_candles_with_retry(

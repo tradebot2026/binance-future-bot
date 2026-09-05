@@ -1229,6 +1229,9 @@ class MarketDataHub:
                     "price": price,
                     "quoteVolume": safe_float(row.get("quoteVolume")),
                     "volume": safe_float(row.get("volume")),
+                    "highPrice": safe_float(row.get("highPrice")),
+                    "lowPrice": safe_float(row.get("lowPrice")),
+                    "openPrice": safe_float(row.get("openPrice")),
                     "updated_at": now,
                 }
 
