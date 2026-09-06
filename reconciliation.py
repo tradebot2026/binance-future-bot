@@ -185,21 +185,24 @@ def reconcile_positions(
 
     if exchange.rest_account_reads_blocked():
         system_logger.info(
-            "Reconciliation REST limited — will verify closes via direct REST when needed."
+            "Reconciliation REST limited — using WS/cache; REST verify on close only."
         )
 
     recovered = recover_orphan_fills_from_disk(db)
     if recovered:
         system_logger.info("Recovered %s orphan fill(s) from disk into DB.", recovered)
 
-    rest_positions = exchange.fetch_all_open_positions_rest()
-    if rest_positions is not None:
-        exchange_positions = rest_positions
+    if context == "startup" and not exchange.rest_account_reads_blocked():
+        rest_positions = exchange.fetch_all_open_positions_rest(force=True)
+        if rest_positions is not None:
+            exchange_positions = rest_positions
+        else:
+            exchange_positions = exchange.fetch_open_positions(force_refresh=False)
+            system_logger.warning(
+                "Startup reconciliation using cached/WS positions — REST unavailable."
+            )
     else:
         exchange_positions = exchange.fetch_open_positions(force_refresh=False)
-        system_logger.warning(
-            "Reconciliation using cached/WS positions — REST snapshot unavailable."
-        )
     db_trades = db.get_open_trades()
 
     exchange_keys = {

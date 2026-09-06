@@ -25,7 +25,7 @@ def _build_exchange_position_map(
     exchange: Any,
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], str]:
     """Return ((symbol, side) -> position dict, data source label)."""
-    rest_positions = exchange.fetch_all_open_positions_rest()
+    rest_positions = exchange.fetch_all_open_positions_rest(force=True)
     if rest_positions is not None:
         positions = rest_positions
         source = "REST"

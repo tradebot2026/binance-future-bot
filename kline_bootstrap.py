@@ -36,6 +36,7 @@ async def _fetch_pair(
     limit: int,
     rest_fetcher: Callable[[str, str, int], pd.DataFrame],
     request_timeout: float,
+    inter_request_delay: float,
 ) -> tuple[str, str, Optional[pd.DataFrame], Optional[str]]:
     async with semaphore:
         try:
@@ -48,8 +49,13 @@ async def _fetch_pair(
             return sym, interval, df, None
         except asyncio.TimeoutError:
             return sym, interval, None, "timeout"
+        except ExchangeRateLimitError as exc:
+            return sym, interval, None, f"rate_limit:{exc}"
         except Exception as exc:
             return sym, interval, None, str(exc)
+        finally:
+            if inter_request_delay > 0:
+                await asyncio.sleep(inter_request_delay)
 
 
 async def _run_parallel_fetch(
@@ -60,12 +66,21 @@ async def _run_parallel_fetch(
     concurrency: int,
     request_timeout: float,
     overall_timeout: float,
+    inter_request_delay: float,
 ) -> list[tuple[str, str, Optional[pd.DataFrame], Optional[str]]]:
     semaphore = asyncio.Semaphore(max(concurrency, 1))
     task_map: dict[asyncio.Task, tuple[str, str]] = {}
     for sym, interval in pairs:
         task = asyncio.create_task(
-            _fetch_pair(semaphore, sym, interval, limit, rest_fetcher, request_timeout)
+            _fetch_pair(
+                semaphore,
+                sym,
+                interval,
+                limit,
+                rest_fetcher,
+                request_timeout,
+                inter_request_delay,
+            )
         )
         task_map[task] = (sym, interval)
 
@@ -107,6 +122,11 @@ def run_parallel_kline_bootstrap(
     concurrency = Config.WS_KLINE_BOOTSTRAP_CONCURRENCY
     request_timeout = Config.WS_KLINE_BOOTSTRAP_REQUEST_TIMEOUT_SECONDS
     overall_timeout = Config.WS_KLINE_BOOTSTRAP_OVERALL_TIMEOUT_SECONDS
+    inter_request_delay = max(
+        Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
+        Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
+        0.2,
+    )
     started = time.monotonic()
 
     system_logger.info(
@@ -128,6 +148,7 @@ def run_parallel_kline_bootstrap(
             concurrency=concurrency,
             request_timeout=request_timeout,
             overall_timeout=overall_timeout,
+            inter_request_delay=inter_request_delay,
         )
 
     # Keep asyncio off the main thread so python-binance WS never shares its loop.
@@ -143,6 +164,12 @@ def run_parallel_kline_bootstrap(
         if err == "overall_timeout":
             failed += 1
             continue
+        if err and str(err).startswith("rate_limit:"):
+            failed += 1
+            system_logger.warning(
+                "Kline bootstrap halted on rate limit for %s %s", sym, interval
+            )
+            break
         if err == "timeout":
             timed_out += 1
             failed += 1
@@ -207,9 +234,15 @@ def run_batched_kline_bootstrap(
         batch_cooldown_seconds or Config.KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS,
         0.0,
     )
+    default_delay = max(
+        Config.KLINE_REST_MIN_INTERVAL_SECONDS,
+        Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
+        Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
+        0.2,
+    )
     delay = max(
-        request_delay_seconds if request_delay_seconds is not None else 0.0,
-        0.0,
+        request_delay_seconds if request_delay_seconds is not None else default_delay,
+        0.2,
     )
 
     by_symbol: dict[str, list[str]] = defaultdict(list)

@@ -175,6 +175,9 @@ class BinanceExchangeManager:
         self._kline_bootstrap_halted = False
         self._kline_rest_lock = threading.Lock()
         self._last_kline_rest_at: float = 0.0
+        self._symbol_position_rest_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+        self._all_positions_rest_at: float = 0.0
+        self._all_positions_rest_data: Optional[list[dict[str, Any]]] = None
         self._critical_alerts: Any = None
         self._market_data: Any = None
         self._full_init_done = False
@@ -551,12 +554,25 @@ class BinanceExchangeManager:
 
     def _enforce_kline_rest_pace(self) -> None:
         """Minimum gap between consecutive futures_klines REST calls."""
-        min_gap = max(Config.KLINE_REST_MIN_INTERVAL_SECONDS, 1.0)
+        min_gap = max(
+            Config.KLINE_REST_MIN_INTERVAL_SECONDS,
+            Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
+            0.2,
+        )
         with self._kline_rest_lock:
             elapsed = time.monotonic() - self._last_kline_rest_at
             if elapsed < min_gap:
                 time.sleep(min_gap - elapsed)
             self._last_kline_rest_at = time.monotonic()
+
+    @staticmethod
+    def _default_kline_request_delay() -> float:
+        return max(
+            Config.KLINE_REST_MIN_INTERVAL_SECONDS,
+            Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
+            Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
+            0.2,
+        )
 
     def _account_endpoint_gate_reason(
         self,
@@ -868,6 +884,13 @@ class BinanceExchangeManager:
             "Symbol rules cache miss for %s — using conservative defaults.", symbol
         )
         return self.DEFAULT_RULES
+
+    def format_quantity(self, symbol: str, quantity: float) -> float:
+        """Format quantity to Binance LOT_SIZE step / precision for symbol."""
+        rules = self.get_symbol_rules(symbol)
+        return amount_to_precision(
+            quantity, rules.step_size, rules.quantity_precision
+        )
 
     # ---------------- Balance ----------------
 
@@ -1533,12 +1556,24 @@ class BinanceExchangeManager:
         """Return cached non-zero hedge-mode positions (REST refresh throttled)."""
         return self._refresh_positions_cache(force=force_refresh)
 
-    def fetch_symbol_positions_rest(self, symbol: str) -> Optional[list[dict[str, Any]]]:
+    def fetch_symbol_positions_rest(
+        self, symbol: str, *, force: bool = False
+    ) -> Optional[list[dict[str, Any]]]:
         """
         Authoritative per-symbol REST snapshot via futures_position_information.
         Returns None when REST is unavailable (never falls back to WS/cache).
         """
         symbol = symbol.upper()
+        if self.is_rest_blocked()[0]:
+            return None
+
+        now = time.monotonic()
+        min_interval = max(Config.POSITION_REST_VERIFY_MIN_INTERVAL_SECONDS, 5.0)
+        if not force:
+            cached = self._symbol_position_rest_cache.get(symbol)
+            if cached and (now - cached[0]) < min_interval:
+                return cached[1]
+
         try:
             with self.execution_context():
                 raw = self._throttled_call(
@@ -1548,16 +1583,24 @@ class BinanceExchangeManager:
                     allow_during_scan=True,
                     bypass_account_cache=True,
                 )
+        except ExchangeRateLimitError as exc:
+            error_logger.warning(
+                "REST position verification rate-limited for %s: %s", symbol, exc
+            )
+            cached = self._symbol_position_rest_cache.get(symbol)
+            return cached[1] if cached else None
         except Exception as exc:
             error_logger.warning(
                 "REST position verification failed for %s: %s", symbol, exc
             )
-            return None
+            cached = self._symbol_position_rest_cache.get(symbol)
+            return cached[1] if cached else None
 
         if not isinstance(raw, list):
             return None
 
-        self._last_account_rest_at = time.monotonic()
+        self._last_account_rest_at = now
+        self._symbol_position_rest_cache[symbol] = (now, raw)
         return raw
 
     def get_position_quantity_rest(
@@ -1592,8 +1635,22 @@ class BinanceExchangeManager:
                 return True
         return False
 
-    def fetch_all_open_positions_rest(self) -> Optional[list[dict[str, Any]]]:
+    def fetch_all_open_positions_rest(
+        self, *, force: bool = False
+    ) -> Optional[list[dict[str, Any]]]:
         """Full REST snapshot of open positions; None when REST unavailable."""
+        if self.is_rest_blocked()[0]:
+            return None
+
+        now = time.monotonic()
+        min_interval = max(Config.POSITION_REST_FULL_MIN_INTERVAL_SECONDS, 30.0)
+        if (
+            not force
+            and self._all_positions_rest_data is not None
+            and (now - self._all_positions_rest_at) < min_interval
+        ):
+            return self._all_positions_rest_data
+
         try:
             with self.execution_context():
                 raw = self._throttled_call(
@@ -1602,15 +1659,20 @@ class BinanceExchangeManager:
                     allow_during_scan=True,
                     bypass_account_cache=True,
                 )
+        except ExchangeRateLimitError as exc:
+            error_logger.warning("REST open-positions fetch rate-limited: %s", exc)
+            return self._all_positions_rest_data
         except Exception as exc:
             error_logger.warning("REST open-positions fetch failed: %s", exc)
-            return None
+            return self._all_positions_rest_data
 
         if not isinstance(raw, list):
-            return None
+            return self._all_positions_rest_data
 
-        self._last_account_rest_at = time.monotonic()
-        return self._parse_open_positions(raw or [])
+        parsed = self._parse_open_positions(raw or [])
+        self._all_positions_rest_at = now
+        self._all_positions_rest_data = parsed
+        return parsed
 
     def get_unrealized_pnl_total(self, force_refresh: bool = False) -> float:
         """Sum unrealized PnL from the shared position cache."""

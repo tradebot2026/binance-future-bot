@@ -97,6 +97,23 @@ class TradeExecutor:
             round_step_size(tp3, rules.tick_size, rules.price_precision),
         )
 
+    @staticmethod
+    def _format_quantity(
+        exchange: BinanceExchangeManager,
+        quantity: float,
+        rules: SymbolRules,
+        symbol: str,
+    ) -> float:
+        try:
+            return exchange.format_quantity(symbol, quantity)
+        except Exception as exc:
+            error_logger.debug(
+                "Exchange format_quantity fallback for %s: %s", symbol, exc
+            )
+            return amount_to_precision(
+                quantity, rules.step_size, rules.quantity_precision
+            )
+
     def calculate_position_size(
         self,
         entry_price: float,
@@ -104,6 +121,7 @@ class TradeExecutor:
         rules: SymbolRules,
         score: float = 80.0,
         strategy: str = "DEFAULT",
+        symbol: str = "",
     ) -> float:
         """Risk-based position sizing with tiered score multiplier."""
         balance = self.exchange.get_futures_balance(force_refresh=False)
@@ -124,9 +142,14 @@ class TradeExecutor:
 
         quantity = risk_amount / sl_distance
         try:
-            quantity = amount_to_precision(
-                quantity, rules.step_size, rules.quantity_precision
-            )
+            if symbol:
+                quantity = self._format_quantity(
+                    self.exchange, quantity, rules, symbol
+                )
+            else:
+                quantity = amount_to_precision(
+                    quantity, rules.step_size, rules.quantity_precision
+                )
         except Exception as exc:
             error_logger.error(
                 "Quantity precision formatting failed | step=%s prec=%s | %s",
@@ -401,7 +424,12 @@ class TradeExecutor:
 
         try:
             quantity = self.calculate_position_size(
-                current_price, sl, rules, score=score, strategy=strategy
+                current_price,
+                sl,
+                rules,
+                score=score,
+                strategy=strategy,
+                symbol=symbol,
             )
         except OrderExecutionError as exc:
             log_execution_rejected(symbol, f"position sizing failed — {exc}", strategy=strategy)

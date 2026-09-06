@@ -444,7 +444,8 @@ class MarketDataHub:
             if self.is_ws_warming_up():
                 continue
             self._check_kline_sockets_health()
-            if not self._rest_quiet_mode() and self.needs_ticker_rest_fallback():
+            blocked, _ = self.is_rest_blocked()
+            if not blocked and not self._rest_quiet_mode() and self.needs_ticker_rest_fallback():
                 self.refresh_ticker_cache_from_rest()
             if self._should_reconnect_for_stale_ticker():
                 self._request_reconnect("ticker stream stale — no events received")
@@ -1294,6 +1295,12 @@ class MarketDataHub:
             seed_fn=self.seed_klines_from_dataframe,
             mark_bootstrapped=_mark_bootstrapped,
             can_fetch=can_fetch,
+            request_delay_seconds=max(
+                Config.KLINE_REST_MIN_INTERVAL_SECONDS,
+                Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
+                Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
+                0.2,
+            ),
         )
         if result.aborted:
             system_logger.warning(
@@ -1344,6 +1351,12 @@ class MarketDataHub:
             mark_bootstrapped=_mark_bootstrapped,
             can_fetch=can_fetch,
             max_pairs=max_pairs,
+            request_delay_seconds=max(
+                Config.KLINE_REST_MIN_INTERVAL_SECONDS,
+                Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
+                Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
+                0.2,
+            ),
         )
         return result.seeded
 
