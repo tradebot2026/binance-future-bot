@@ -27,6 +27,7 @@ from smc_engine import (
 )
 from reconciliation import symbol_blocked_for_new_entry
 from utils import (
+    amount_to_precision,
     cap_quantity_to_notional,
     minimum_order_quantity,
     round_step_size,
@@ -122,7 +123,18 @@ class TradeExecutor:
             return 0.0
 
         quantity = risk_amount / sl_distance
-        quantity = amount_to_precision(quantity, rules.step_size, rules.quantity_precision)
+        try:
+            quantity = amount_to_precision(
+                quantity, rules.step_size, rules.quantity_precision
+            )
+        except Exception as exc:
+            error_logger.error(
+                "Quantity precision formatting failed | step=%s prec=%s | %s",
+                rules.step_size,
+                rules.quantity_precision,
+                exc,
+            )
+            return 0.0
 
         min_valid_qty = minimum_order_quantity(
             entry_price,
@@ -393,6 +405,14 @@ class TradeExecutor:
             )
         except OrderExecutionError as exc:
             log_execution_rejected(symbol, f"position sizing failed — {exc}", strategy=strategy)
+            return None
+        except Exception as exc:
+            error_logger.error(
+                "Unexpected position sizing error for %s: %s", symbol, exc, exc_info=True
+            )
+            log_execution_rejected(
+                symbol, f"position sizing failed — {exc}", strategy=strategy
+            )
             return None
 
         if quantity <= 0:
