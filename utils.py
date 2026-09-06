@@ -61,6 +61,64 @@ def minimum_order_quantity(
     return round_step_size_up(raw_min, step_size, precision)
 
 
+def cap_quantity_to_notional(
+    quantity: float,
+    entry_price: float,
+    max_notional: float,
+    min_qty: float,
+    min_notional: float,
+    step_size: float,
+    precision: int,
+) -> tuple[float, float]:
+    """
+    Cap quantity so notional <= max_notional while respecting LOT_SIZE / minQty.
+    Floors to step size within the cap; bumps up to exchange minimum when it still fits.
+    Returns (quantity, notional). quantity=0 when no valid size fits the cap.
+    """
+    if entry_price <= 0 or max_notional <= 0:
+        return 0.0, 0.0
+
+    min_valid_qty = minimum_order_quantity(
+        entry_price, min_qty, min_notional, step_size, precision
+    )
+    min_valid_notional = min_valid_qty * entry_price
+
+    if min_valid_notional > max_notional + 1e-9:
+        return 0.0, 0.0
+
+    current_notional = quantity * entry_price
+    if current_notional <= max_notional + 1e-9:
+        if quantity >= min_valid_qty and current_notional >= min_notional - 1e-9:
+            return quantity, current_notional
+        if min_valid_notional <= max_notional + 1e-9:
+            return min_valid_qty, min_valid_notional
+        return 0.0, 0.0
+
+    capped_qty = round_step_size(max_notional / entry_price, step_size, precision)
+    if capped_qty <= 0 and step_size > 0:
+        one_step_notional = step_size * entry_price
+        if one_step_notional <= max_notional + 1e-9:
+            capped_qty = round_step_size_up(step_size, step_size, precision)
+
+    if capped_qty < min_valid_qty:
+        capped_qty = min_valid_qty
+
+    capped_notional = capped_qty * entry_price
+    if capped_notional > max_notional + 1e-9:
+        capped_qty = round_step_size(max_notional / entry_price, step_size, precision)
+        capped_notional = capped_qty * entry_price
+
+    if (
+        capped_qty <= 0
+        or capped_qty < min_qty
+        or capped_notional < min_notional - 1e-9
+        or capped_notional > max_notional + 1e-9
+    ):
+        return 0.0, 0.0
+
+    return capped_qty, capped_notional
+
+
 def escape_html(text: object) -> str:
     """Escape dynamic text for Telegram HTML parse mode."""
     return html.escape(str(text), quote=False)

@@ -327,6 +327,23 @@ class MarketScanner:
             return []
         return self.orchestrator.tier2_summary()
 
+    def get_watchlist_tiers(self) -> dict[str, Any]:
+        """Return Tier-1 hot/background/full universe and Tier-2 candidates."""
+        if self.orchestrator is None:
+            return {
+                "tier1_hot": [],
+                "tier1_background": [],
+                "tier1_full": [],
+                "tier2": [],
+            }
+        orchestrator = self.orchestrator
+        return {
+            "tier1_hot": orchestrator.priority_queue.hot_symbols,
+            "tier1_background": orchestrator.priority_queue.background_symbols,
+            "tier1_full": orchestrator.tier1_symbols,
+            "tier2": orchestrator.tier2_summary(),
+        }
+
     def _prepare_scan_universe(self) -> tuple[List[str], dict[str, float]]:
         """Build universe and subscribe WS klines (REST bootstrap via ensure_scan_klines_ready)."""
         symbols, price_map = self.get_tradable_symbols()

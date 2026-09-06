@@ -6,7 +6,8 @@ from typing import TYPE_CHECKING
 
 from config import Config
 from core.types import AllocationResult, SignalCandidate
-from utils import safe_float
+from reconciliation import symbol_blocked_for_new_entry
+from utils import cap_quantity_to_notional, minimum_order_quantity, safe_float
 
 if TYPE_CHECKING:
     from database import DatabaseManager
@@ -48,6 +49,12 @@ class PortfolioAllocator:
         balance = self.exchange.get_futures_balance(force_refresh=False)
         if balance <= 0:
             return AllocationResult(False, reason="balance_unavailable")
+
+        blocked, block_reason = symbol_blocked_for_new_entry(
+            self.exchange, self.db, candidate.symbol
+        )
+        if blocked:
+            return AllocationResult(False, reason=block_reason)
 
         if Config.ENABLE_GLOBAL_STRATEGY_KILL_SWITCH:
             paused, reason = self.db.is_global_entries_paused()
@@ -100,6 +107,12 @@ class PortfolioAllocator:
         risk_budget = min(trade_risk, strategy_headroom, available_headroom)
         if risk_budget <= 0:
             return AllocationResult(False, reason="no_risk_headroom")
+
+        sizing_ok, sizing_reason = self._validate_capped_order_floor(
+            candidate, balance
+        )
+        if not sizing_ok:
+            return AllocationResult(False, reason=sizing_reason)
 
         net_ok, net_reason = self._check_net_exposure(candidate, balance)
         if not net_ok:
@@ -170,6 +183,75 @@ class PortfolioAllocator:
             qty = safe_float(trade.get("quantity"))
             risk += abs(entry - sl) * qty
         return min(risk, balance)
+
+    def _validate_capped_order_floor(
+        self, candidate: SignalCandidate, balance: float
+    ) -> tuple[bool, str]:
+        """Ensure max-notional cap still allows a valid exchange minimum order."""
+        entry_price = candidate.price
+        if entry_price <= 0:
+            return False, "invalid entry price for sizing"
+
+        max_notional = balance * Config.MAX_POSITION_VALUE_MULTIPLIER
+        try:
+            rules = self.exchange.get_symbol_rules(candidate.symbol)
+        except Exception:
+            return True, ""
+
+        min_valid_qty = minimum_order_quantity(
+            entry_price,
+            rules.min_qty,
+            rules.min_notional,
+            rules.step_size,
+            rules.quantity_precision,
+        )
+        min_valid_notional = min_valid_qty * entry_price
+
+        if max_notional < rules.min_notional:
+            return (
+                False,
+                f"Position cap ${max_notional:.2f} below exchange min notional "
+                f"${rules.min_notional:.2f}",
+            )
+
+        if min_valid_notional > max_notional:
+            return (
+                False,
+                f"Minimum order ${min_valid_notional:.2f} exceeds position cap "
+                f"${max_notional:.2f}",
+            )
+
+        sl_distance = self._estimate_sl_distance(candidate)
+        if sl_distance > 0:
+            raw_qty = (balance * (Config.RISK_PER_TRADE_PERCENT / 100.0)) / sl_distance
+            capped_qty, capped_notional = cap_quantity_to_notional(
+                raw_qty,
+                entry_price,
+                max_notional,
+                rules.min_qty,
+                rules.min_notional,
+                rules.step_size,
+                rules.quantity_precision,
+            )
+            if capped_qty <= 0 or capped_notional < rules.min_notional:
+                return (
+                    False,
+                    f"Capped size ${capped_notional:.2f} below exchange minimum "
+                    f"${rules.min_notional:.2f}",
+                )
+
+        return True, ""
+
+    @staticmethod
+    def _estimate_sl_distance(candidate: SignalCandidate) -> float:
+        structure = candidate.structure_metadata or {}
+        sl = safe_float(structure.get("stop_loss") or structure.get("sl"))
+        if sl > 0:
+            return abs(candidate.price - sl)
+        atr = candidate.atr
+        if atr > 0:
+            return atr * 1.5
+        return 0.0
 
     def _check_net_exposure(
         self, candidate: SignalCandidate, balance: float

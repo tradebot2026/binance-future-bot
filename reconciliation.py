@@ -83,6 +83,82 @@ class PositionReconcileGuard:
 
 position_reconcile_guard = PositionReconcileGuard()
 
+
+def rest_position_quantity(
+    exchange: "BinanceExchangeManager",
+    symbol: str,
+    position_side: str,
+) -> Optional[float]:
+    """REST-backed quantity; None means verification unavailable."""
+    return exchange.get_position_quantity_rest(symbol, position_side)
+
+
+def confirm_external_close_allowed(
+    exchange: "BinanceExchangeManager",
+    trade: dict[str, Any],
+) -> bool:
+    """
+    True only when miss threshold is met AND REST confirms positionAmt == 0.
+    Never closes on WS/cache misses alone.
+    """
+    trade_id = str(trade["trade_id"])
+    symbol = str(trade["symbol"]).upper()
+    position_side = str(trade.get("side", "LONG")).upper()
+
+    if is_within_position_grace_period(trade):
+        return False
+
+    if not position_reconcile_guard.should_confirm_external_close(trade):
+        return False
+
+    rest_qty = rest_position_quantity(exchange, symbol, position_side)
+    if rest_qty is None:
+        system_logger.warning(
+            "Deferring external close — REST verification unavailable: %s %s | id=%s",
+            symbol,
+            position_side,
+            trade_id[:8],
+        )
+        return False
+
+    if rest_qty > 0:
+        position_reconcile_guard.note_present(trade_id)
+        system_logger.info(
+            "External close cancelled — REST confirms open position: %s %s qty=%.8f",
+            symbol,
+            position_side,
+            rest_qty,
+        )
+        return False
+
+    return True
+
+
+def symbol_blocked_for_new_entry(
+    exchange: "BinanceExchangeManager",
+    db: "DatabaseManager",
+    symbol: str,
+) -> tuple[bool, str]:
+    """
+    True when a new entry must not be opened on this symbol.
+    REST is authoritative; WS/cache used only when REST is unavailable.
+    """
+    symbol = symbol.upper()
+
+    if db.get_open_trades_for_symbol(symbol):
+        return True, f"Active DB trade exists for {symbol}"
+
+    rest_open = exchange.symbol_has_open_position_rest(symbol)
+    if rest_open is True:
+        return True, f"Exchange REST confirms open position on {symbol}"
+
+    for side in ("LONG", "SHORT"):
+        if exchange.has_open_position(symbol, side):
+            return True, f"{side} position visible on {symbol} (WS/cache)"
+
+    return False, ""
+
+
 def reconcile_positions_at_startup(
     exchange: "BinanceExchangeManager",
     db: "DatabaseManager",
@@ -109,14 +185,21 @@ def reconcile_positions(
 
     if exchange.rest_account_reads_blocked():
         system_logger.info(
-            "Reconciliation using WebSocket/cached positions only (REST limited)."
+            "Reconciliation REST limited — will verify closes via direct REST when needed."
         )
 
     recovered = recover_orphan_fills_from_disk(db)
     if recovered:
         system_logger.info("Recovered %s orphan fill(s) from disk into DB.", recovered)
 
-    exchange_positions = exchange.fetch_open_positions(force_refresh=False)
+    rest_positions = exchange.fetch_all_open_positions_rest()
+    if rest_positions is not None:
+        exchange_positions = rest_positions
+    else:
+        exchange_positions = exchange.fetch_open_positions(force_refresh=False)
+        system_logger.warning(
+            "Reconciliation using cached/WS positions — REST snapshot unavailable."
+        )
     db_trades = db.get_open_trades()
 
     exchange_keys = {
@@ -147,6 +230,15 @@ def reconcile_positions(
                 "Trade missing on exchange (%s/%s) — deferring phantom purge: %s %s | id=%s",
                 miss_count,
                 Config.POSITION_RECONCILE_MISS_THRESHOLD,
+                trade["symbol"],
+                trade["side"],
+                trade_id[:8],
+            )
+            continue
+
+        if not confirm_external_close_allowed(exchange, trade):
+            system_logger.warning(
+                "Phantom purge deferred — REST did not confirm flat: %s %s | id=%s",
                 trade["symbol"],
                 trade["side"],
                 trade_id[:8],

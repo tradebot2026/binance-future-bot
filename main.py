@@ -260,7 +260,9 @@ def _execute_candidates(
                 break
 
             allowed, reason = risk.can_open_trade(
-                symbol, strategy=normalized["strategy"]
+                symbol,
+                strategy=normalized["strategy"],
+                entry_price=normalized["price"],
             )
             if not allowed:
                 log_execution_rejected(symbol, reason, strategy=normalized["strategy"])

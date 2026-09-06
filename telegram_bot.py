@@ -18,6 +18,7 @@ from config import Config
 from constants import strategy_display_label
 from database import DatabaseManager
 from logger import error_logger, system_logger
+from telegram_alerts import format_active_positions_message, format_watchlist_message
 from utils import escape_html, safe_float, utc_today_str
 
 if TYPE_CHECKING:
@@ -539,23 +540,36 @@ class TelegramManager:
             balance = self.exchange.get_futures_balance(force_refresh=False)
             self.bot.reply_to(message, f"💵 <b>Available balance:</b> ${balance:.2f}")
 
-        @self.bot.message_handler(commands=["active", "watchlist"])
+        @self.bot.message_handler(commands=["active"])
         @authorized
         def active_handler(message: telebot.types.Message) -> None:
+            if not self.exchange:
+                self.bot.reply_to(message, "⚠️ Exchange not attached.")
+                return
+            text = format_active_positions_message(self.db, self.exchange)
+            if len(text) > 4000:
+                text = text[:3990] + "\n…"
+            self.bot.reply_to(message, text)
+
+        @self.bot.message_handler(commands=["watchlist"])
+        @authorized
+        def watchlist_handler(message: telebot.types.Message) -> None:
             scanner = getattr(self, "scanner", None)
-            if scanner is None or not hasattr(scanner, "get_tier2_summary"):
+            if scanner is None or not hasattr(scanner, "get_watchlist_tiers"):
                 self.bot.reply_to(message, "⚠️ Event scan not available.")
                 return
-            rows = scanner.get_tier2_summary()
-            if not rows:
-                self.bot.reply_to(message, "🔥 <b>Active</b>\n<i>No Tier 2 coins.</i>")
-                return
-            lines = [
-                f"{escape_html(sym)} | {escape_html(strat)} | {score:.0f}"
-                for sym, strat, score in rows[: Config.TIER2_HOT_SIZE]
-            ]
-            body = "\n".join(lines)
-            self.bot.reply_to(message, f"🔥 <b>Active ({len(rows)})</b>\n{body}")
+            tiers = scanner.get_watchlist_tiers()
+            text = format_watchlist_message(
+                tier1_hot=tiers.get("tier1_hot", []),
+                tier1_background=tiers.get("tier1_background", []),
+                tier1_full=tiers.get("tier1_full", []),
+                tier2_rows=tiers.get("tier2", []),
+                hot_scan_interval=Config.HOT_SCAN_INTERVAL_SECONDS,
+                tier2_display_limit=Config.TIER2_HOT_SIZE,
+            )
+            if len(text) > 4000:
+                text = text[:3990] + "\n…"
+            self.bot.reply_to(message, text)
 
         @self.bot.message_handler(commands=["help"])
         @authorized
@@ -574,8 +588,8 @@ class TelegramManager:
                 "/restart — graceful bot restart\n"
                 "/errors — recent critical errors\n"
                 "/balance — live futures balance\n"
-                "/active — Tier 2 scored coins\n"
-                "/watchlist — alias for /active\n"
+                "/active — open positions (DB + Binance REST)\n"
+                "/watchlist — Tier 1 hot scan + Tier 2 candidates\n"
                 "/ping — bot health\n"
                 "/help — this message",
             )

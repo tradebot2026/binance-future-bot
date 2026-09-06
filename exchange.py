@@ -558,9 +558,20 @@ class BinanceExchangeManager:
                 time.sleep(min_gap - elapsed)
             self._last_kline_rest_at = time.monotonic()
 
-    def _account_endpoint_gate_reason(self, func: Any, *, execution_priority: bool) -> str:
+    def _account_endpoint_gate_reason(
+        self,
+        func: Any,
+        *,
+        execution_priority: bool,
+        bypass_account_cache: bool = False,
+    ) -> str:
         name = getattr(func, "__name__", "")
         if name not in ACCOUNT_REST_ENDPOINTS:
+            return ""
+        if bypass_account_cache and execution_priority:
+            blocked, reason = self.is_rest_blocked()
+            if blocked:
+                return reason
             return ""
         blocked, reason = self.is_rest_blocked()
         if blocked:
@@ -606,6 +617,7 @@ class BinanceExchangeManager:
         *args: Any,
         allow_during_scan: bool = False,
         execution_priority: bool = False,
+        bypass_account_cache: bool = False,
         **kwargs: Any,
     ) -> Any:
         priority = (
@@ -613,9 +625,19 @@ class BinanceExchangeManager:
         )
 
         account_gate = self._account_endpoint_gate_reason(
-            func, execution_priority=priority
+            func,
+            execution_priority=priority,
+            bypass_account_cache=bypass_account_cache,
         )
         if account_gate and self._is_account_rest_call(func):
+            if bypass_account_cache and priority:
+                if self._rest_block_log.should_log(f"account_rest_required:{account_gate}"):
+                    system_logger.warning(
+                        "%s required but blocked (%s).",
+                        getattr(func, "__name__", "account"),
+                        account_gate,
+                    )
+                raise ExchangeRateLimitError(account_gate)
             cached = self._return_cached_account_call(func)
             if self._rest_block_log.should_log(f"account_cache:{account_gate}"):
                 system_logger.debug(
@@ -636,6 +658,8 @@ class BinanceExchangeManager:
         blocked, reason = self._rest_block_applies(priority)
         if blocked:
             if self._is_account_rest_call(func):
+                if bypass_account_cache and priority:
+                    raise ExchangeRateLimitError(reason)
                 return self._return_cached_account_call(func)
             if is_bootstrap_kline:
                 self.halt_kline_bootstrap(reason)
@@ -650,6 +674,11 @@ class BinanceExchangeManager:
 
         if self._rest_token_bucket.is_hard_stopped():
             if self._is_account_rest_call(func):
+                if bypass_account_cache and priority:
+                    remaining = self._rest_token_bucket.hard_stop_remaining()
+                    raise ExchangeRateLimitError(
+                        f"REST hard-stopped (~{int(remaining)}s remaining)"
+                    )
                 return self._return_cached_account_call(func)
             if is_bootstrap_kline:
                 self.halt_kline_bootstrap("rest_hard_stop")
@@ -675,6 +704,10 @@ class BinanceExchangeManager:
             if lane != RestLane.EXECUTION:
                 if not self._rest_budget.acquire(call_weight, lane):
                     if self._is_account_rest_call(func):
+                        if bypass_account_cache and priority:
+                            raise ExchangeRateLimitError(
+                                "REST budget below reserve threshold"
+                            )
                         return self._return_cached_account_call(func)
                     if is_bootstrap_kline:
                         self.halt_kline_bootstrap("rest_budget_reserve")
@@ -1499,6 +1532,85 @@ class BinanceExchangeManager:
     def get_all_open_positions(self, force_refresh: bool = False) -> list[dict[str, Any]]:
         """Return cached non-zero hedge-mode positions (REST refresh throttled)."""
         return self._refresh_positions_cache(force=force_refresh)
+
+    def fetch_symbol_positions_rest(self, symbol: str) -> Optional[list[dict[str, Any]]]:
+        """
+        Authoritative per-symbol REST snapshot via futures_position_information.
+        Returns None when REST is unavailable (never falls back to WS/cache).
+        """
+        symbol = symbol.upper()
+        try:
+            with self.execution_context():
+                raw = self._throttled_call(
+                    self.client.futures_position_information,
+                    symbol=symbol,
+                    execution_priority=True,
+                    allow_during_scan=True,
+                    bypass_account_cache=True,
+                )
+        except Exception as exc:
+            error_logger.warning(
+                "REST position verification failed for %s: %s", symbol, exc
+            )
+            return None
+
+        if not isinstance(raw, list):
+            return None
+
+        self._last_account_rest_at = time.monotonic()
+        return raw
+
+    def get_position_quantity_rest(
+        self, symbol: str, position_side: str
+    ) -> Optional[float]:
+        """
+        REST-backed position quantity for reconciliation.
+        None = REST unavailable (defer close decision).
+        0.0 = REST confirms positionAmt == 0.
+        """
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        raw = self.fetch_symbol_positions_rest(symbol)
+        if raw is None:
+            return None
+        for pos in raw:
+            if str(pos.get("positionSide", "")).upper() == position_side:
+                return abs(safe_float(pos.get("positionAmt")))
+        return 0.0
+
+    def symbol_has_open_position_rest(self, symbol: str) -> Optional[bool]:
+        """
+        True when REST confirms any non-zero positionAmt for symbol.
+        None when REST unavailable.
+        """
+        symbol = symbol.upper()
+        raw = self.fetch_symbol_positions_rest(symbol)
+        if raw is None:
+            return None
+        for pos in raw:
+            if abs(safe_float(pos.get("positionAmt"))) > 0:
+                return True
+        return False
+
+    def fetch_all_open_positions_rest(self) -> Optional[list[dict[str, Any]]]:
+        """Full REST snapshot of open positions; None when REST unavailable."""
+        try:
+            with self.execution_context():
+                raw = self._throttled_call(
+                    self.client.futures_position_information,
+                    execution_priority=True,
+                    allow_during_scan=True,
+                    bypass_account_cache=True,
+                )
+        except Exception as exc:
+            error_logger.warning("REST open-positions fetch failed: %s", exc)
+            return None
+
+        if not isinstance(raw, list):
+            return None
+
+        self._last_account_rest_at = time.monotonic()
+        return self._parse_open_positions(raw or [])
 
     def get_unrealized_pnl_total(self, force_refresh: bool = False) -> float:
         """Sum unrealized PnL from the shared position cache."""

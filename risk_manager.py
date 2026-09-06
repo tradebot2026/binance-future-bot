@@ -14,7 +14,7 @@ from constants import DAILY_STATUS_PAUSED, STRATEGY_RANGE_REVERSION, TRADE_STATU
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from logger import performance_logger, system_logger, trade_logger
-from utils import safe_float, utc_now, utc_today_str
+from utils import minimum_order_quantity, safe_float, utc_now, utc_today_str
 
 
 @dataclass
@@ -115,7 +115,10 @@ class RiskManager:
         return self.exchange.get_open_positions_count()
 
     def can_open_trade(
-        self, symbol: Optional[str] = None, strategy: Optional[str] = None
+        self,
+        symbol: Optional[str] = None,
+        strategy: Optional[str] = None,
+        entry_price: Optional[float] = None,
     ) -> tuple[bool, str]:
         """
         Return (True, '') if a new entry is permitted, else (False, reason).
@@ -124,6 +127,13 @@ class RiskManager:
         snapshot = self.get_risk_snapshot()
         if not snapshot.entries_allowed:
             return False, snapshot.block_reason
+
+        if symbol and entry_price and entry_price > 0:
+            floor_ok, floor_reason = self.validate_minimum_order_floor(
+                symbol, entry_price
+            )
+            if not floor_ok:
+                return False, floor_reason
 
         if strategy and is_range_strategy(strategy):
             paused, pause_reason = self.db.is_strategy_entries_paused(
@@ -164,6 +174,50 @@ class RiskManager:
                     return False, (
                         f"Exchange position already open for {symbol} {side}."
                     )
+
+        return True, ""
+
+    def validate_minimum_order_floor(
+        self, symbol: str, entry_price: float
+    ) -> tuple[bool, str]:
+        """
+        Reject early when the max position cap cannot fit a valid exchange order.
+        Prevents approved signals from failing with zero-quantity at execution.
+        """
+        balance = self.exchange.get_futures_balance(force_refresh=False)
+        if balance <= 0:
+            return False, "Balance unavailable for minimum order check."
+
+        max_notional = balance * Config.MAX_POSITION_VALUE_MULTIPLIER
+        try:
+            rules = self.exchange.get_symbol_rules(symbol)
+        except Exception as exc:
+            trade_logger.debug(
+                "Skipping min-order floor check for %s: %s", symbol, exc
+            )
+            return True, ""
+
+        if max_notional < rules.min_notional:
+            return (
+                False,
+                f"Position cap ${max_notional:.2f} below exchange min notional "
+                f"${rules.min_notional:.2f}.",
+            )
+
+        min_valid_qty = minimum_order_quantity(
+            entry_price,
+            rules.min_qty,
+            rules.min_notional,
+            rules.step_size,
+            rules.quantity_precision,
+        )
+        min_valid_notional = min_valid_qty * entry_price
+        if min_valid_notional > max_notional:
+            return (
+                False,
+                f"Minimum order ${min_valid_notional:.2f} exceeds position cap "
+                f"${max_notional:.2f}.",
+            )
 
         return True, ""
 

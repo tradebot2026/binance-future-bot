@@ -25,8 +25,9 @@ from smc_engine import (
     compute_structural_sl,
     size_multiplier_for_score,
 )
+from reconciliation import symbol_blocked_for_new_entry
 from utils import (
-    amount_to_precision,
+    cap_quantity_to_notional,
     minimum_order_quantity,
     round_step_size,
     safe_float,
@@ -171,7 +172,29 @@ class TradeExecutor:
                 notional,
                 max_notional,
             )
-            return 0.0
+            quantity, notional = cap_quantity_to_notional(
+                quantity,
+                entry_price,
+                max_notional,
+                rules.min_qty,
+                rules.min_notional,
+                rules.step_size,
+                rules.quantity_precision,
+            )
+            if quantity <= 0:
+                trade_logger.warning(
+                    "Capped size invalid: max_notional=$%.2f min_notional=$%.2f "
+                    "min_qty=%.8f.",
+                    max_notional,
+                    rules.min_notional,
+                    rules.min_qty,
+                )
+                return 0.0
+            trade_logger.info(
+                "Position capped to max notional | qty=%.8f notional=$%.2f",
+                quantity,
+                notional,
+            )
 
         if notional < rules.min_notional:
             if (
@@ -313,15 +336,14 @@ class TradeExecutor:
             )
             return None
 
-        position_side = action
-        if self.exchange.has_open_position(symbol, position_side):
-            log_execution_rejected(
-                symbol,
-                f"{position_side} position already open on exchange",
-                strategy=strategy,
-            )
+        blocked, block_reason = symbol_blocked_for_new_entry(
+            self.exchange, self.db, symbol
+        )
+        if blocked:
+            log_execution_rejected(symbol, block_reason, strategy=strategy)
             return None
 
+        position_side = action
         rules = self.exchange.get_symbol_rules(symbol)
         structure = structure_metadata or {}
         range_mode = is_range_strategy(strategy)
@@ -374,7 +396,11 @@ class TradeExecutor:
             return None
 
         if quantity <= 0:
-            log_execution_rejected(symbol, "position size rounds to zero", strategy=strategy)
+            log_execution_rejected(
+                symbol,
+                "position size rounds to zero after capping/minimum checks",
+                strategy=strategy,
+            )
             return None
 
         try:
