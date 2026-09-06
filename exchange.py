@@ -172,6 +172,9 @@ class BinanceExchangeManager:
         self._execution_lock = threading.Lock()
         self._bootstrap_depth = 0
         self._bootstrap_lock = threading.Lock()
+        self._kline_bootstrap_halted = False
+        self._kline_rest_lock = threading.Lock()
+        self._last_kline_rest_at: float = 0.0
         self._critical_alerts: Any = None
         self._market_data: Any = None
         self._full_init_done = False
@@ -517,6 +520,44 @@ class BinanceExchangeManager:
             )
         return raw_cached
 
+    @staticmethod
+    def _is_kline_rest_call(func: Any) -> bool:
+        return getattr(func, "__name__", "") == "futures_klines"
+
+    def is_kline_bootstrap_halted(self) -> bool:
+        return self._kline_bootstrap_halted
+
+    def halt_kline_bootstrap(self, reason: str) -> None:
+        self._kline_bootstrap_halted = True
+        if self._rest_block_log.should_log(f"kline_bootstrap_halt:{reason[:40]}"):
+            system_logger.warning(
+                "Kline bootstrap REST circuit breaker tripped — %s. "
+                "Waiting for live WebSocket candles.",
+                reason,
+            )
+
+    def can_bootstrap_klines_rest(self) -> bool:
+        """True when bootstrap may issue another futures_klines REST call."""
+        if self._kline_bootstrap_halted:
+            return False
+        if self._market_data and self._market_data.is_rest_blocked()[0]:
+            return False
+        if self._rest_token_bucket.is_hard_stopped():
+            return False
+        if not Config.ENABLE_STRICT_RATE_LIMIT:
+            return True
+        reserve = max(Config.REST_BUDGET_MIN_REMAINING_FRACTION, 0.0)
+        return self._rest_budget.remaining_fraction() >= reserve
+
+    def _enforce_kline_rest_pace(self) -> None:
+        """Minimum gap between consecutive futures_klines REST calls."""
+        min_gap = max(Config.KLINE_REST_MIN_INTERVAL_SECONDS, 1.0)
+        with self._kline_rest_lock:
+            elapsed = time.monotonic() - self._last_kline_rest_at
+            if elapsed < min_gap:
+                time.sleep(min_gap - elapsed)
+            self._last_kline_rest_at = time.monotonic()
+
     def _account_endpoint_gate_reason(self, func: Any, *, execution_priority: bool) -> str:
         name = getattr(func, "__name__", "")
         if name not in ACCOUNT_REST_ENDPOINTS:
@@ -584,10 +625,21 @@ class BinanceExchangeManager:
                 )
             return cached
 
+        is_bootstrap_kline = (
+            self._is_kline_rest_call(func) and self._is_bootstrap_priority()
+        )
+        if is_bootstrap_kline:
+            if not self.can_bootstrap_klines_rest():
+                self.halt_kline_bootstrap("budget_or_ban_gate")
+                return []
+
         blocked, reason = self._rest_block_applies(priority)
         if blocked:
             if self._is_account_rest_call(func):
                 return self._return_cached_account_call(func)
+            if is_bootstrap_kline:
+                self.halt_kline_bootstrap(reason)
+                return []
             if self._market_data:
                 remaining = self._market_data.get_rest_block_remaining_seconds()
                 if remaining > 0:
@@ -599,6 +651,9 @@ class BinanceExchangeManager:
         if self._rest_token_bucket.is_hard_stopped():
             if self._is_account_rest_call(func):
                 return self._return_cached_account_call(func)
+            if is_bootstrap_kline:
+                self.halt_kline_bootstrap("rest_hard_stop")
+                return []
             remaining = self._rest_token_bucket.hard_stop_remaining()
             raise ExchangeRateLimitError(
                 f"REST hard-stopped due to rate limit (~{int(remaining)}s remaining)"
@@ -607,6 +662,8 @@ class BinanceExchangeManager:
         if self._scan_mode and self._scan_ws_only() and not priority:
             if self._is_account_rest_call(func):
                 return self._return_cached_account_call(func)
+            if is_bootstrap_kline:
+                return []
             raise ExchangeError(
                 "REST API call rejected during scan cycle — use WebSocket cache."
             )
@@ -619,6 +676,9 @@ class BinanceExchangeManager:
                 if not self._rest_budget.acquire(call_weight, lane):
                     if self._is_account_rest_call(func):
                         return self._return_cached_account_call(func)
+                    if is_bootstrap_kline:
+                        self.halt_kline_bootstrap("rest_budget_reserve")
+                        return []
                     if self._rest_block_log.should_log("rest_budget_reserve"):
                         error_logger.warning(
                             "REST call skipped — budget below %.0f%% reserve "
@@ -638,6 +698,8 @@ class BinanceExchangeManager:
         for attempt in range(1, network_retries + 1):
             if Config.ENABLE_STRICT_RATE_LIMIT:
                 limiter.wait()
+            if is_bootstrap_kline:
+                self._enforce_kline_rest_pace()
             try:
                 result = func(*args, **kwargs)
                 if getattr(func, "__name__", "") == "futures_account" and isinstance(
@@ -652,6 +714,9 @@ class BinanceExchangeManager:
                     self._apply_rate_limit_halt(exc)
                     if self._is_account_rest_call(func):
                         return self._return_cached_account_call(func)
+                    if is_bootstrap_kline:
+                        self.halt_kline_bootstrap(str(exc.message))
+                        return []
                     raise ExchangeRateLimitError(str(exc.message)) from exc
                 if self._critical_alerts and exc.code in (-1021, -2015, -2014):
                     self._critical_alerts.notify(
@@ -1130,15 +1195,14 @@ class BinanceExchangeManager:
     ) -> pd.DataFrame:
         """
         Rate-limited REST kline fetch for startup bootstrap only.
-        Routes through token-bucket + RestBudgetManager (200 weight/min cap).
+        Returns empty DataFrame on ban/budget — never raises uncaught exceptions.
         """
         if not self._is_bootstrap_priority():
             raise ExchangeError(
                 "Bootstrap kline fetch requires exchange.bootstrap_context()"
             )
-        blocked, reason = self._rest_block_applies(execution_priority=False)
-        if blocked:
-            raise ExchangeRateLimitError(reason)
+        if not self.can_bootstrap_klines_rest():
+            return pd.DataFrame()
 
         try:
             klines = self._throttled_call(
@@ -1147,15 +1211,37 @@ class BinanceExchangeManager:
                 interval=timeframe,
                 limit=limit,
             )
-        except ExchangeRateLimitError:
-            raise
+        except ExchangeRateLimitError as exc:
+            self.halt_kline_bootstrap(str(exc))
+            return pd.DataFrame()
         except BinanceAPIException as exc:
             if self._is_rate_limit_error(exc):
                 self._apply_rate_limit_halt(exc)
-                raise ExchangeRateLimitError(str(exc.message)) from exc
-            raise ExchangeError(str(exc.message)) from exc
+                self.halt_kline_bootstrap(str(exc.message))
+                return pd.DataFrame()
+            error_logger.warning(
+                "Bootstrap kline fetch failed for %s %s: %s",
+                symbol,
+                timeframe,
+                exc.message,
+            )
+            return pd.DataFrame()
+        except ExchangeError as exc:
+            error_logger.warning(
+                "Bootstrap kline fetch failed for %s %s: %s",
+                symbol,
+                timeframe,
+                exc,
+            )
+            return pd.DataFrame()
         except (ConnectionError, TimeoutError, OSError) as exc:
-            raise ExchangeError(str(exc)) from exc
+            error_logger.warning(
+                "Bootstrap kline network error for %s %s: %s",
+                symbol,
+                timeframe,
+                exc,
+            )
+            return pd.DataFrame()
 
         if not klines:
             return pd.DataFrame()

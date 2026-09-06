@@ -1,16 +1,22 @@
-"""Parallel one-time kline bootstrap — async REST fetch with concurrency + timeouts."""
+"""Paced one-time kline bootstrap — WS-first with batched REST fallback."""
 
 from __future__ import annotations
 
 import asyncio
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from typing import Callable, Optional
 
 import pandas as pd
 
 from config import Config
+from exceptions import ExchangeRateLimitError
 from logger import error_logger, system_logger
+
+
+class KlineBootstrapAborted(Exception):
+    """Raised internally when REST kline bootstrap must stop (ban / budget)."""
 
 
 @dataclass
@@ -20,6 +26,7 @@ class BootstrapResult:
     timed_out: int = 0
     elapsed_seconds: float = 0.0
     pending: int = 0
+    aborted: bool = False
 
 
 async def _fetch_pair(
@@ -174,6 +181,165 @@ def run_parallel_kline_bootstrap(
     )
 
 
+def run_batched_kline_bootstrap(
+    pairs: list[tuple[str, str]],
+    rest_fetcher: Callable[[str, str, int], pd.DataFrame],
+    limit: int,
+    min_bars: int,
+    seed_fn: Callable[[str, str, pd.DataFrame], None],
+    mark_bootstrapped: Callable[[str, str], None],
+    *,
+    can_fetch: Callable[[], bool] | None = None,
+    max_symbols_per_batch: int | None = None,
+    batch_cooldown_seconds: float | None = None,
+    request_delay_seconds: float | None = None,
+    max_pairs: int | None = None,
+) -> BootstrapResult:
+    """
+    REST bootstrap in symbol batches — min 1s between requests, cooldown between batches.
+    Aborts cleanly when can_fetch() returns False (ban / budget circuit breaker).
+    """
+    if not pairs:
+        return BootstrapResult()
+
+    batch_size = max(max_symbols_per_batch or Config.KLINE_BOOTSTRAP_BATCH_SYMBOLS, 1)
+    batch_pause = max(
+        batch_cooldown_seconds or Config.KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS,
+        0.0,
+    )
+    delay = max(
+        request_delay_seconds if request_delay_seconds is not None else 0.0,
+        0.0,
+    )
+
+    by_symbol: dict[str, list[str]] = defaultdict(list)
+    for sym, interval in pairs:
+        by_symbol[sym.upper()].append(interval)
+
+    symbol_order = list(by_symbol.keys())
+    if max_pairs is not None:
+        trimmed: dict[str, list[str]] = defaultdict(list)
+        count = 0
+        for sym in symbol_order:
+            for interval in by_symbol[sym]:
+                if count >= max_pairs:
+                    break
+                trimmed[sym].append(interval)
+                count += 1
+            if count >= max_pairs:
+                break
+        by_symbol = trimmed
+        symbol_order = list(by_symbol.keys())
+
+    started = time.monotonic()
+    seeded = 0
+    failed = 0
+    aborted = False
+
+    system_logger.info(
+        "Batched kline bootstrap — %s symbols, %s series "
+        "(batch=%s symbols, delay=%ss, batch_pause=%ss).",
+        len(symbol_order),
+        sum(len(v) for v in by_symbol.values()),
+        batch_size,
+        delay,
+        batch_pause,
+    )
+
+    for batch_idx in range(0, len(symbol_order), batch_size):
+        if can_fetch is not None and not can_fetch():
+            system_logger.warning(
+                "Kline bootstrap REST aborted — budget/ban circuit breaker "
+                "(seeded=%s, batch=%s).",
+                seeded,
+                batch_idx // batch_size + 1,
+            )
+            aborted = True
+            break
+
+        batch_symbols = symbol_order[batch_idx : batch_idx + batch_size]
+        for sym in batch_symbols:
+            for interval in by_symbol[sym]:
+                if can_fetch is not None and not can_fetch():
+                    aborted = True
+                    break
+                try:
+                    df = rest_fetcher(sym, interval, limit)
+                except ExchangeRateLimitError as exc:
+                    system_logger.warning(
+                        "Kline bootstrap halted on rate limit for %s %s: %s",
+                        sym,
+                        interval,
+                        exc,
+                    )
+                    aborted = True
+                    break
+                except KlineBootstrapAborted as exc:
+                    system_logger.warning(
+                        "Kline bootstrap circuit breaker: %s", exc
+                    )
+                    aborted = True
+                    break
+                except Exception as exc:
+                    failed += 1
+                    error_logger.debug(
+                        "Kline bootstrap skip %s %s: %s", sym, interval, exc
+                    )
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+
+                if df is None or df.empty or len(df) < min_bars:
+                    failed += 1
+                    if delay > 0:
+                        time.sleep(delay)
+                    continue
+
+                try:
+                    seed_fn(sym, interval, df)
+                    mark_bootstrapped(sym, interval)
+                    seeded += 1
+                except Exception as exc:
+                    failed += 1
+                    error_logger.warning(
+                        "Kline bootstrap seed failed for %s %s: %s",
+                        sym,
+                        interval,
+                        exc,
+                    )
+                if delay > 0:
+                    time.sleep(delay)
+
+            if aborted:
+                break
+
+        if aborted:
+            break
+
+        if batch_idx + batch_size < len(symbol_order) and batch_pause > 0:
+            time.sleep(batch_pause)
+
+    elapsed = time.monotonic() - started
+    pending = max(len(pairs) - seeded - failed, 0)
+    system_logger.info(
+        "Batched kline bootstrap finished in %.1fs — seeded=%s failed=%s "
+        "aborted=%s pending~=%s.",
+        elapsed,
+        seeded,
+        failed,
+        aborted,
+        pending,
+    )
+    return BootstrapResult(
+        seeded=seeded,
+        failed=failed,
+        timed_out=0,
+        elapsed_seconds=elapsed,
+        pending=pending,
+        aborted=aborted,
+    )
+
+
 def run_paced_kline_bootstrap(
     pairs: list[tuple[str, str]],
     rest_fetcher: Callable[[str, str, int], pd.DataFrame],
@@ -186,78 +352,21 @@ def run_paced_kline_bootstrap(
     can_fetch: Callable[[], bool] | None = None,
     max_pairs: int | None = None,
 ) -> BootstrapResult:
-    """
-    Fetch historical klines one pair at a time with a sleep between requests.
-    Keeps REST weight usage low during startup and background seeding.
-    """
-    if not pairs:
-        return BootstrapResult()
-
-    delay = (
-        delay_seconds
-        if delay_seconds is not None
-        else Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS
+    """Legacy paced bootstrap — delegates to batched runner (1 symbol per batch)."""
+    delay = max(
+        delay_seconds if delay_seconds is not None else Config.KLINE_REST_MIN_INTERVAL_SECONDS,
+        1.0,
     )
-    delay = max(delay, 0.0)
-    work = pairs if max_pairs is None else pairs[: max(max_pairs, 0)]
-    started = time.monotonic()
-    seeded = 0
-    failed = 0
-
-    system_logger.info(
-        "Paced kline bootstrap starting — %s series (limit=%s bars, delay=%ss).",
-        len(work),
+    return run_batched_kline_bootstrap(
+        pairs,
+        rest_fetcher,
         limit,
-        delay,
-    )
-
-    for sym, interval in work:
-        if can_fetch is not None and not can_fetch():
-            system_logger.info(
-                "Paced kline bootstrap paused — budget/ban gate (seeded=%s).",
-                seeded,
-            )
-            break
-        try:
-            df = rest_fetcher(sym, interval, limit)
-        except Exception as exc:
-            failed += 1
-            error_logger.debug("Paced kline bootstrap skip %s %s: %s", sym, interval, exc)
-            if delay > 0:
-                time.sleep(delay)
-            continue
-
-        if df is None or df.empty or len(df) < min_bars:
-            failed += 1
-            if delay > 0:
-                time.sleep(delay)
-            continue
-
-        try:
-            seed_fn(sym, interval, df)
-            mark_bootstrapped(sym, interval)
-            seeded += 1
-        except Exception as exc:
-            failed += 1
-            error_logger.warning(
-                "Paced kline bootstrap seed failed for %s %s: %s", sym, interval, exc
-            )
-
-        if delay > 0:
-            time.sleep(delay)
-
-    elapsed = time.monotonic() - started
-    system_logger.info(
-        "Paced kline bootstrap finished in %.1fs — seeded=%s failed=%s of %s series.",
-        elapsed,
-        seeded,
-        failed,
-        len(work),
-    )
-    return BootstrapResult(
-        seeded=seeded,
-        failed=failed,
-        timed_out=0,
-        elapsed_seconds=elapsed,
-        pending=max(len(pairs) - len(work), 0),
+        min_bars,
+        seed_fn,
+        mark_bootstrapped,
+        can_fetch=can_fetch,
+        max_symbols_per_batch=1,
+        batch_cooldown_seconds=0.0,
+        request_delay_seconds=delay,
+        max_pairs=max_pairs,
     )

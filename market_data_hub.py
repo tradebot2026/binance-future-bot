@@ -21,7 +21,7 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 from config import Config
-from kline_bootstrap import run_parallel_kline_bootstrap, run_paced_kline_bootstrap
+from kline_bootstrap import run_batched_kline_bootstrap
 from logger import error_logger, system_logger
 from utils import safe_float
 from ws_reconnect import (
@@ -1156,35 +1156,87 @@ class MarketDataHub:
         rest_fetcher: Optional[Callable[[str, str, int], pd.DataFrame]] = None,
     ) -> int:
         """
-        Subscribe WS kline streams, then one-time REST bootstrap for new pairs.
+        Subscribe WS kline streams first, warm up from live WS cache, then paced REST.
         Must be called outside scan_context (via exchange.bootstrap_context()).
         """
         self.subscribe_kline_streams(symbols)
         if not rest_fetcher or not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP:
-            return 0
+            return self._seed_bootstrapped_from_ws_cache(symbols, intervals)
+
+        warmup = max(Config.WS_KLINE_BOOTSTRAP_WARMUP_SECONDS, 0.0)
+        if warmup > 0:
+            self._wait_for_ws_kline_warmup(symbols, intervals, warmup)
+
         return self.bootstrap_klines_on_subscribe(symbols, intervals, rest_fetcher)
 
-    def bootstrap_klines_on_subscribe(
+    def _seed_bootstrapped_from_ws_cache(
         self,
         symbols: list[str],
         intervals: list[str],
-        rest_fetcher: Callable[[str, str, int], pd.DataFrame],
     ) -> int:
-        """
-        One-time REST historical kline load per (symbol, interval) into WS cache.
-        Skips pairs already bootstrapped or with sufficient cached bars.
-        """
-        blocked, reason = self.is_rest_blocked()
-        if blocked:
-            system_logger.warning(
-                "Kline startup bootstrap skipped — REST blocked: %s", reason
-            )
-            return 0
-
+        """Mark pairs ready when WS kline buffer already has enough bars."""
         limit = Config.CANDLE_FETCH_LIMIT
         min_bars = max(Config.WS_KLINE_BOOTSTRAP_MIN_BARS, 10)
-        pending: list[tuple[str, str]] = []
+        seeded = 0
+        for symbol in symbols:
+            sym = symbol.upper()
+            for interval in intervals:
+                pair = (sym, interval)
+                if pair in self._bootstrapped_pairs:
+                    continue
+                cached = self.get_candles_cached_only(sym, interval, limit)
+                if not cached.empty and len(cached) >= min_bars:
+                    self._bootstrapped_pairs.add(pair)
+                    seeded += 1
+        if seeded:
+            system_logger.info(
+                "WS kline cache satisfied %s/%s series — REST bootstrap skipped for those.",
+                seeded,
+                len(symbols) * len(intervals),
+            )
+        return seeded
 
+    def _wait_for_ws_kline_warmup(
+        self,
+        symbols: list[str],
+        intervals: list[str],
+        timeout_seconds: float,
+    ) -> None:
+        """Allow live WS kline streams to populate buffers before REST backfill."""
+        deadline = time.monotonic() + timeout_seconds
+        min_partial = max(Config.WS_KLINE_BOOTSTRAP_MIN_BARS // 5, 20)
+        limit = min(Config.CANDLE_FETCH_LIMIT, 120)
+        check_symbols = [s.upper() for s in symbols[: Config.HOT_SCAN_SIZE]]
+
+        while time.monotonic() < deadline:
+            ready = 0
+            for sym in check_symbols:
+                for interval in intervals:
+                    cached = self.get_candles_cached_only(sym, interval, limit)
+                    if len(cached) >= min_partial:
+                        ready += 1
+            if ready >= min(len(check_symbols) * len(intervals), 3):
+                system_logger.info(
+                    "WS kline warmup ready — %s series have partial history.",
+                    ready,
+                )
+                return
+            time.sleep(0.5)
+
+        system_logger.debug(
+            "WS kline warmup timeout (%.1fs) — proceeding with paced REST backfill.",
+            timeout_seconds,
+        )
+
+    def _pending_bootstrap_pairs(
+        self,
+        symbols: list[str],
+        intervals: list[str],
+        *,
+        min_bars: int,
+        limit: int,
+    ) -> list[tuple[str, str]]:
+        pending: list[tuple[str, str]] = []
         for symbol in symbols:
             sym = symbol.upper()
             for interval in intervals:
@@ -1196,36 +1248,58 @@ class MarketDataHub:
                     self._bootstrapped_pairs.add(pair)
                     continue
                 pending.append(pair)
+        return pending
+
+    def bootstrap_klines_on_subscribe(
+        self,
+        symbols: list[str],
+        intervals: list[str],
+        rest_fetcher: Callable[[str, str, int], pd.DataFrame],
+    ) -> int:
+        """
+        WS-first historical warmup — REST backfill only for missing series.
+        """
+        blocked, reason = self.is_rest_blocked()
+        if blocked:
+            system_logger.warning(
+                "Kline REST backfill skipped — REST blocked: %s (WS cache only).",
+                reason,
+            )
+            return self._seed_bootstrapped_from_ws_cache(symbols, intervals)
+
+        limit = Config.CANDLE_FETCH_LIMIT
+        min_bars = max(Config.WS_KLINE_BOOTSTRAP_MIN_BARS, 10)
+
+        ws_seeded = self._seed_bootstrapped_from_ws_cache(symbols, intervals)
+        pending = self._pending_bootstrap_pairs(
+            symbols, intervals, min_bars=min_bars, limit=limit
+        )
 
         if not pending:
-            return 0
+            return ws_seeded
+
+        exchange = getattr(rest_fetcher, "__self__", None)
+        can_fetch = None
+        if exchange is not None and hasattr(exchange, "can_bootstrap_klines_rest"):
+            can_fetch = exchange.can_bootstrap_klines_rest
 
         def _mark_bootstrapped(sym: str, interval: str) -> None:
             self._bootstrapped_pairs.add((sym.upper(), interval))
 
-        use_paced = (
-            Config.ENABLE_PACED_KLINE_BOOTSTRAP
-            or Config.WS_KLINE_BOOTSTRAP_CONCURRENCY <= 1
+        result = run_batched_kline_bootstrap(
+            pending,
+            rest_fetcher,
+            limit,
+            min_bars,
+            seed_fn=self.seed_klines_from_dataframe,
+            mark_bootstrapped=_mark_bootstrapped,
+            can_fetch=can_fetch,
         )
-        if use_paced:
-            result = run_paced_kline_bootstrap(
-                pending,
-                rest_fetcher,
-                limit,
-                min_bars,
-                seed_fn=self.seed_klines_from_dataframe,
-                mark_bootstrapped=_mark_bootstrapped,
+        if result.aborted:
+            system_logger.warning(
+                "Kline REST backfill aborted — continuing with WebSocket live candles."
             )
-        else:
-            result = run_parallel_kline_bootstrap(
-                pending,
-                rest_fetcher,
-                limit,
-                min_bars,
-                seed_fn=self.seed_klines_from_dataframe,
-                mark_bootstrapped=_mark_bootstrapped,
-            )
-        return result.seeded
+        return ws_seeded + result.seeded
 
     def bootstrap_klines_for_symbols(
         self,
@@ -1247,33 +1321,28 @@ class MarketDataHub:
 
         limit = Config.CANDLE_FETCH_LIMIT
         min_bars = max(Config.WS_KLINE_BOOTSTRAP_MIN_BARS, 10)
-        pending: list[tuple[str, str]] = []
-
-        for symbol in symbols:
-            sym = symbol.upper()
-            for interval in intervals:
-                pair = (sym, interval)
-                if pair in self._bootstrapped_pairs:
-                    continue
-                cached = self.get_candles_cached_only(sym, interval, limit)
-                if not cached.empty and len(cached) >= min_bars:
-                    self._bootstrapped_pairs.add(pair)
-                    continue
-                pending.append(pair)
-
+        pending = self._pending_bootstrap_pairs(
+            symbols, intervals, min_bars=min_bars, limit=limit
+        )
         if not pending:
             return 0
+
+        exchange = getattr(rest_fetcher, "__self__", None)
+        can_fetch = None
+        if exchange is not None and hasattr(exchange, "can_bootstrap_klines_rest"):
+            can_fetch = exchange.can_bootstrap_klines_rest
 
         def _mark_bootstrapped(sym: str, interval: str) -> None:
             self._bootstrapped_pairs.add((sym.upper(), interval))
 
-        result = run_paced_kline_bootstrap(
+        result = run_batched_kline_bootstrap(
             pending,
             rest_fetcher,
             limit,
             min_bars,
             seed_fn=self.seed_klines_from_dataframe,
             mark_bootstrapped=_mark_bootstrapped,
+            can_fetch=can_fetch,
             max_pairs=max_pairs,
         )
         return result.seeded
