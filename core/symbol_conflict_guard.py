@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional
 
 from config import Config
 from core.types import SignalCandidate
+from executor import log_execution_rejected
 from logger import signal_logger
 
 if TYPE_CHECKING:
@@ -92,12 +93,14 @@ class SymbolConflictGuard:
         reason: str,
         context: str = "conflict_guard",
     ) -> None:
+        log_execution_rejected(candidate.symbol, reason, strategy=candidate.strategy)
         signal_logger.info(
-            "CONFLICT_REJECTED %s %s | strategy=%s | reason=%s",
+            "CONFLICT_REJECTED %s %s | strategy=%s | reason=%s | context=%s",
             candidate.symbol,
             candidate.action,
             candidate.strategy,
             reason,
+            context,
         )
         self.db.log_signal_conflict(
             symbol=candidate.symbol,

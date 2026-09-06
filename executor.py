@@ -34,6 +34,17 @@ from utils import (
 )
 
 
+def log_execution_rejected(symbol: str, reason: str, *, strategy: str = "") -> None:
+    """Explicit WARNING when an approved signal fails at execution gates."""
+    suffix = f" | strategy={strategy}" if strategy else ""
+    trade_logger.warning(
+        "[EXECUTION_REJECTED] %s - Reason: %s%s",
+        symbol,
+        reason,
+        suffix,
+    )
+
+
 class TradeExecutor:
     """Opens futures positions with validated sizing and structured DB metadata."""
 
@@ -257,12 +268,21 @@ class TradeExecutor:
         Returns result dict on success, else None.
         """
         if atr <= 0:
-            error_logger.error("Execution aborted: invalid ATR (%.8f) for %s.", atr, symbol)
+            log_execution_rejected(symbol, f"invalid ATR ({atr})", strategy=strategy)
             return None
 
         if action not in ("LONG", "SHORT"):
-            error_logger.error("Execution aborted: invalid action %s.", action)
+            log_execution_rejected(symbol, f"invalid action {action}", strategy=strategy)
             return None
+
+        trade_logger.info(
+            "[EXECUTION_ATTEMPT] %s %s | strategy=%s | score=%.1f | price=%.6f",
+            symbol,
+            action,
+            strategy,
+            score,
+            current_price,
+        )
 
         with self.exchange.execution_context():
             return self._execute_trade_inner(
@@ -288,15 +308,17 @@ class TradeExecutor:
         """Execute entry under high-priority REST path (not blocked by scan loops)."""
         on_cooldown, cooldown_reason = self.db.is_symbol_on_cooldown(symbol)
         if on_cooldown:
-            trade_logger.info(
-                "Execution skipped: %s on cooldown (%s).", symbol, cooldown_reason
+            log_execution_rejected(
+                symbol, f"symbol on cooldown ({cooldown_reason})", strategy=strategy
             )
             return None
 
         position_side = action
         if self.exchange.has_open_position(symbol, position_side):
-            trade_logger.warning(
-                "Execution skipped: %s %s already open on exchange.", symbol, position_side
+            log_execution_rejected(
+                symbol,
+                f"{position_side} position already open on exchange",
+                strategy=strategy,
             )
             return None
 
@@ -316,12 +338,7 @@ class TradeExecutor:
             tp3 = round_step_size(tp3, rules.tick_size, rules.price_precision)
             sl_ok, sl_reason = self._validate_stop_loss(action, current_price, sl)
             if not sl_ok:
-                error_logger.error(
-                    "Execution aborted %s %s RANGE: invalid SL — %s",
-                    symbol,
-                    action,
-                    sl_reason,
-                )
+                log_execution_rejected(symbol, f"invalid stop loss — {sl_reason}", strategy=strategy)
                 self.db.log_signal_rejection(
                     symbol, action, score, [sl_reason], strategy=strategy
                 )
@@ -332,12 +349,7 @@ class TradeExecutor:
             )
             sl_ok, sl_reason = self._validate_stop_loss(action, current_price, sl)
             if not sl_ok:
-                error_logger.error(
-                    "Execution aborted %s %s SMC: invalid SL — %s",
-                    symbol,
-                    action,
-                    sl_reason,
-                )
+                log_execution_rejected(symbol, f"invalid stop loss — {sl_reason}", strategy=strategy)
                 self.db.log_signal_rejection(
                     symbol, action, score, [sl_reason], strategy=strategy
                 )
@@ -347,7 +359,7 @@ class TradeExecutor:
                 action, current_price, sl, opposing
             )
             if not rr_ok:
-                trade_logger.info("Execution skipped %s: %s", symbol, rr_reason)
+                log_execution_rejected(symbol, rr_reason, strategy=strategy)
                 self.db.log_signal_rejection(
                     symbol, action, score, [rr_reason], strategy=strategy
                 )
@@ -358,17 +370,17 @@ class TradeExecutor:
                 current_price, sl, rules, score=score, strategy=strategy
             )
         except OrderExecutionError as exc:
-            error_logger.error("Sizing failed for %s: %s", symbol, exc)
+            log_execution_rejected(symbol, f"position sizing failed — {exc}", strategy=strategy)
             return None
 
         if quantity <= 0:
-            error_logger.error("Execution aborted: zero quantity for %s.", symbol)
+            log_execution_rejected(symbol, "position size rounds to zero", strategy=strategy)
             return None
 
         try:
             metadata = self._build_partial_quantities(quantity, rules)
         except OrderExecutionError as exc:
-            error_logger.error("Partition failed for %s: %s", symbol, exc)
+            log_execution_rejected(symbol, f"TP partition invalid — {exc}", strategy=strategy)
             return None
 
         metadata["atr_at_entry"] = atr
@@ -390,7 +402,9 @@ class TradeExecutor:
         try:
             leverage = self.exchange.optimize_and_set_leverage(symbol)
         except Exception as exc:
-            error_logger.error("Leverage setup failed for %s: %s", symbol, exc)
+            log_execution_rejected(
+                symbol, f"leverage setup failed — {exc}", strategy=strategy
+            )
             leverage = Config.MAX_LEVERAGE
 
         trade_side = "BUY" if action == "LONG" else "SELL"
@@ -402,10 +416,13 @@ class TradeExecutor:
                 quantity=quantity,
             )
         except OrderExecutionError as exc:
-            error_logger.error("Order rejected for %s: %s", symbol, exc)
+            log_execution_rejected(symbol, f"order rejected — {exc}", strategy=strategy)
             return None
 
         if not response:
+            log_execution_rejected(
+                symbol, "exchange returned empty order response", strategy=strategy
+            )
             return None
 
         fill_price = self.exchange.get_fill_price_from_order(

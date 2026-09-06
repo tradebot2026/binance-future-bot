@@ -14,6 +14,7 @@ from core.symbol_conflict_guard import SymbolConflictGuard
 from core.types import CandleCloseEvent, SignalCandidate
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
+from executor import log_execution_rejected
 from logger import scanner_logger
 from pipeline.snapshot_factory import SnapshotFactory
 from pipeline.universe_builder import UniverseBuilder
@@ -165,6 +166,10 @@ class EventScanOrchestrator:
         dict_results = [c.to_dict() for c in candidates]
         if dict_results:
             self.db.update_watchlist(dict_results)
+            scanner_logger.info(
+                "Priority scan dispatching %s execution candidate(s).",
+                len(dict_results),
+            )
         return dict_results
 
     def process_hot_scan_cycle(self) -> list[SignalCandidate]:
@@ -346,11 +351,21 @@ class EventScanOrchestrator:
                 symbol, mark_event.timeframe, mark_event.bar_open_ms
             )
 
-        if not self.assignment_manager.is_hot(symbol):
+        if best.score < best.min_score:
+            log_execution_rejected(
+                symbol,
+                f"score {best.score:.1f} below strategy minimum {best.min_score:.1f}",
+                strategy=best.strategy,
+            )
             return None
 
         signal = self.scoring_engine.signal_for_assignment(snapshot, best)
         if signal is None:
+            log_execution_rejected(
+                symbol,
+                "signal revalidation failed after strategy approval",
+                strategy=best.strategy,
+            )
             return None
 
         ok, reason = self.conflict_guard.approve(signal)

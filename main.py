@@ -15,12 +15,13 @@ from typing import Any, Optional
 from bot_controller import BotController
 from config import Config
 from critical_alerts import CriticalAlertService
-from constants import is_range_strategy
+from constants import STRATEGY_SMC_TREND, is_range_strategy
 from smc_engine import effective_smc_min_score
+from core.scoring_engine import ScoringEngine
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from exceptions import DatabaseError, ExchangeError, ExchangeRateLimitError, OrderExecutionError
-from executor import TradeExecutor
+from executor import TradeExecutor, log_execution_rejected
 from logger import error_logger, system_logger
 from manager import TradeManager
 from risk_manager import RiskManager
@@ -168,13 +169,15 @@ def _validate_candidate(candidate: dict[str, Any]) -> tuple[bool, str, dict[str,
         return False, f"invalid price ({price})", {}
     if is_range_strategy(strategy):
         min_required = Config.RANGE_MIN_SCORE
-    else:
+    elif strategy == STRATEGY_SMC_TREND:
         structure = candidate.get("structure_metadata") or {}
         confluence = str(
             candidate.get("confluence") or structure.get("confluence_type", "")
         )
         macro = str(candidate.get("macro_trend") or structure.get("macro_trend", "NEUTRAL"))
         min_required = effective_smc_min_score(confluence, macro)
+    else:
+        min_required = ScoringEngine.strategy_min_score(strategy)
 
     if score < min_required:
         return False, f"score {score:.1f} below minimum {min_required:.1f}", {}
@@ -224,6 +227,11 @@ def _execute_candidates(
 ) -> None:
     entries_this_cycle = 0
 
+    if not candidates:
+        return
+
+    system_logger.info("Dispatching %s execution candidate(s) to executor.", len(candidates))
+
     for candidate in candidates:
         if entries_this_cycle >= Config.MAX_ENTRIES_PER_CYCLE:
             system_logger.info(
@@ -236,10 +244,10 @@ def _execute_candidates(
         try:
             valid, validation_reason, normalized = _validate_candidate(candidate)
             if not valid:
-                system_logger.info(
-                    "Skipping invalid candidate %s: %s",
-                    candidate.get("symbol", "?"),
-                    validation_reason,
+                log_execution_rejected(
+                    str(candidate.get("symbol", "?")),
+                    f"candidate validation failed — {validation_reason}",
+                    strategy=str(candidate.get("strategy", "")),
                 )
                 continue
 
@@ -248,14 +256,14 @@ def _execute_candidates(
 
             allowed, gate_reason = _entries_allowed(scheduler, risk, db)
             if not allowed:
-                system_logger.info("Entry gate closed: %s", gate_reason)
+                log_execution_rejected(symbol, f"entry gate closed — {gate_reason}")
                 break
 
             allowed, reason = risk.can_open_trade(
                 symbol, strategy=normalized["strategy"]
             )
             if not allowed:
-                system_logger.info("Skipping %s: %s", symbol, reason)
+                log_execution_rejected(symbol, reason, strategy=normalized["strategy"])
                 continue
 
             result: Optional[dict[str, Any]] = executor.execute_trade(
