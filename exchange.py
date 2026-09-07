@@ -359,12 +359,25 @@ class BinanceExchangeManager:
         """Hard-stop all REST for ban duration — no retries."""
         from market_data_hub import parse_ban_until_ms
 
-        halt_seconds = max(Config.REST_BAN_MIN_SLEEP_SECONDS, Config.RATE_LIMIT_HALT_SECONDS)
-        if exc.code == -1003:
-            halt_seconds = max(halt_seconds, Config.IP_BAN_HALT_SECONDS)
-        until_ms = parse_ban_until_ms(str(exc.message))
+        message = str(exc.message)
+        until_ms = parse_ban_until_ms(message)
         if until_ms:
-            halt_seconds = max(halt_seconds, int((until_ms / 1000.0) - time.time()))
+            halt_seconds = max(
+                int((until_ms / 1000.0) - time.time()),
+                Config.RATE_LIMIT_HALT_SECONDS,
+            )
+        elif exc.code == -1003:
+            halt_seconds = max(
+                Config.RATE_LIMIT_SOFT_HALT_SECONDS,
+                Config.RATE_LIMIT_HALT_SECONDS,
+            )
+            halt_seconds = min(halt_seconds, 120)
+        else:
+            halt_seconds = max(
+                Config.REST_BAN_MIN_SLEEP_SECONDS,
+                Config.RATE_LIMIT_HALT_SECONDS,
+            )
+
         self._rest_token_bucket.trigger_hard_stop(float(halt_seconds))
         already_blocked = False
         if self._market_data:
@@ -557,7 +570,7 @@ class BinanceExchangeManager:
         min_gap = max(
             Config.KLINE_REST_MIN_INTERVAL_SECONDS,
             Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
-            0.2,
+            0.3,
         )
         with self._kline_rest_lock:
             elapsed = time.monotonic() - self._last_kline_rest_at
@@ -1394,28 +1407,29 @@ class BinanceExchangeManager:
             return 0.0
 
     def get_futures_ticker_map(self) -> dict[str, dict[str, Any]]:
-        """Return futures tickers — WS cache with automatic REST fallback when stale."""
+        """Return futures tickers — WS cache first; REST only when WS is empty/stale."""
         if self._market_data:
             cached = self._market_data.get_ticker_map()
-            if cached and not self._market_data.needs_ticker_rest_fallback():
+            if cached and self._market_data.is_ticker_cache_usable(min_symbols=10):
+                if not self._market_data.needs_ticker_rest_fallback():
+                    return cached
+            if self.is_rest_blocked()[0]:
                 return cached
             if (
                 Config.ENABLE_REST_TICKER_FALLBACK
-                or self._market_data.needs_ticker_rest_fallback()
-            ) and self.can_make_background_rest_call(
-                weight_for_call(self.client.futures_ticker)
+                and self._market_data.needs_ticker_rest_fallback()
+                and self.can_make_background_rest_call(
+                    weight_for_call(self.client.futures_ticker)
+                )
             ):
                 self._market_data.refresh_ticker_cache_from_rest()
                 cached = self._market_data.get_ticker_map()
                 if cached:
                     return cached
-            if (
-                self._market_data.ws_is_running()
-                and not Config.ENABLE_REST_TICKER_FALLBACK
-            ):
+            if self._market_data.ws_is_running():
                 return cached
 
-        if not Config.ENABLE_REST_TICKER_FALLBACK:
+        if not Config.ENABLE_REST_TICKER_FALLBACK or self.is_rest_blocked()[0]:
             return self._market_data.get_ticker_map() if self._market_data else {}
 
         if not self.can_make_background_rest_call(
@@ -1688,7 +1702,7 @@ class BinanceExchangeManager:
             return avg_price
 
         order_id = order_response.get("orderId")
-        if order_id is not None:
+        if order_id is not None and not self.is_rest_blocked()[0]:
             try:
                 with self.execution_context():
                     order_info = self._throttled_call(
@@ -1716,6 +1730,40 @@ class BinanceExchangeManager:
         if live_price is not None and live_price > 0:
             return live_price
         return fallback
+
+    def seed_position_after_fill(
+        self,
+        symbol: str,
+        position_side: str,
+        quantity: float,
+        entry_price: float,
+    ) -> None:
+        """Update WS/local position caches immediately after a fill (no REST)."""
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        if self._market_data:
+            self._market_data.seed_open_position(
+                symbol, position_side, quantity, entry_price
+            )
+
+        merged = False
+        for pos in self._position_cache.positions:
+            if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
+                pos["quantity"] = quantity
+                pos["entry_price"] = entry_price
+                merged = True
+                break
+        if not merged:
+            self._position_cache.positions.append(
+                {
+                    "symbol": symbol,
+                    "positionSide": position_side,
+                    "quantity": quantity,
+                    "entry_price": entry_price,
+                    "unrealized_pnl": 0.0,
+                }
+            )
+        self._position_cache.updated_at = time.monotonic()
 
     def has_open_position(self, symbol: str, position_side: str) -> bool:
         symbol = symbol.upper()

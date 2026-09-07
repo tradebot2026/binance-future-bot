@@ -64,55 +64,100 @@ class TradeManager:
             if not self.exchange.rest_account_reads_blocked():
                 self.exchange.ensure_positions_cached(force=False)
 
+            qty_map = self._position_qty_map(active_trades)
+
             for trade in active_trades:
-                symbol = trade["symbol"]
-                position_side = trade.get("side", "LONG")
-
-                live_qty = self.exchange.get_position_quantity(symbol, position_side)
-                if live_qty <= 0:
-                    rest_qty = self.exchange.get_position_quantity_rest(
-                        symbol, position_side
+                try:
+                    self._monitor_single_trade(trade, qty_map)
+                except Exception as exc:
+                    error_logger.error(
+                        "Trade monitor failed for %s: %s",
+                        trade.get("symbol", "?"),
+                        exc,
                     )
-                    if rest_qty is not None and rest_qty > 0:
-                        position_reconcile_guard.note_present(str(trade["trade_id"]))
-                        trade_logger.info(
-                            "[%s] WS/cache missed position — REST confirms qty=%.8f",
-                            symbol,
-                            rest_qty,
-                        )
-                        live_qty = rest_qty
-
-                if live_qty <= 0:
-                    if self._defer_external_close(trade, symbol):
-                        continue
-                    self._mark_trade_closed(
-                        trade,
-                        reason="RECONCILED_EXTERNAL_CLOSE",
-                        exit_price=safe_float(self.exchange.get_market_price(symbol)),
-                    )
-                    position_reconcile_guard.note_present(str(trade["trade_id"]))
-                    continue
-
-                position_reconcile_guard.note_present(str(trade["trade_id"]))
-
-                price = self.exchange.get_market_price(symbol)
-                if price is None or price <= 0:
-                    continue
-
-                fresh = self.db.get_trade(trade["trade_id"])
-                if fresh:
-                    trade = fresh
-
-                if is_range_strategy(str(trade.get("strategy", ""))):
-                    if self._check_range_hard_exits(trade, price):
-                        continue
-
-                if position_side == "LONG":
-                    self._manage_long_trade(trade, price)
-                elif position_side == "SHORT":
-                    self._manage_short_trade(trade, price)
         except Exception as exc:
             error_logger.error("Trade monitoring failed: %s", exc)
+
+    def _position_qty_map(
+        self, active_trades: list[dict[str, Any]]
+    ) -> dict[tuple[str, str], float]:
+        """WS/cache quantities; one bulk refresh when any trade appears flat."""
+        qty_map: dict[tuple[str, str], float] = {}
+        for trade in active_trades:
+            symbol = str(trade.get("symbol", "")).upper()
+            side = str(trade.get("side", "LONG")).upper()
+            qty = self.exchange.get_position_quantity(symbol, side)
+            if qty > 0:
+                qty_map[(symbol, side)] = qty
+
+        needs_bulk = any(
+            qty_map.get(
+                (str(t.get("symbol", "")).upper(), str(t.get("side", "LONG")).upper()),
+                0.0,
+            )
+            <= 0
+            for t in active_trades
+        )
+        if needs_bulk and not self.exchange.rest_account_reads_blocked():
+            for pos in self.exchange.get_all_open_positions(force_refresh=False):
+                symbol = str(pos.get("symbol", "")).upper()
+                side = str(pos.get("positionSide", "")).upper()
+                qty = safe_float(pos.get("quantity"))
+                if qty > 0:
+                    qty_map[(symbol, side)] = qty
+        return qty_map
+
+    def _monitor_single_trade(
+        self,
+        trade: dict[str, Any],
+        qty_map: dict[tuple[str, str], float],
+    ) -> None:
+        symbol = trade["symbol"]
+        position_side = trade.get("side", "LONG")
+        key = (str(symbol).upper(), str(position_side).upper())
+
+        live_qty = qty_map.get(key, 0.0)
+        if live_qty <= 0 and not self.exchange.rest_account_reads_blocked():
+            rest_qty = self.exchange.get_position_quantity_rest(symbol, position_side)
+            if rest_qty is not None and rest_qty > 0:
+                position_reconcile_guard.note_present(str(trade["trade_id"]))
+                trade_logger.info(
+                    "[%s] WS/cache missed position — REST confirms qty=%.8f",
+                    symbol,
+                    rest_qty,
+                )
+                live_qty = rest_qty
+                qty_map[key] = rest_qty
+
+        if live_qty <= 0:
+            if self._defer_external_close(trade, symbol):
+                return
+            self._mark_trade_closed(
+                trade,
+                reason="RECONCILED_EXTERNAL_CLOSE",
+                exit_price=safe_float(self.exchange.get_market_price(symbol)),
+            )
+            position_reconcile_guard.note_present(str(trade["trade_id"]))
+            return
+
+        position_reconcile_guard.note_present(str(trade["trade_id"]))
+
+        price = self.exchange.get_market_price(symbol)
+        if price is None or price <= 0:
+            return
+
+        fresh = self.db.get_trade(trade["trade_id"])
+        if fresh:
+            trade = fresh
+
+        if is_range_strategy(str(trade.get("strategy", ""))):
+            if self._check_range_hard_exits(trade, price):
+                return
+
+        if position_side == "LONG":
+            self._manage_long_trade(trade, price)
+        elif position_side == "SHORT":
+            self._manage_short_trade(trade, price)
 
     _TF_BAR_SECONDS: dict[str, int] = {
         "1m": 60,

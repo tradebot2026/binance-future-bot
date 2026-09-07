@@ -90,6 +90,8 @@ def rest_position_quantity(
     position_side: str,
 ) -> Optional[float]:
     """REST-backed quantity; None means verification unavailable."""
+    if exchange.is_rest_blocked()[0]:
+        return None
     return exchange.get_position_quantity_rest(symbol, position_side)
 
 
@@ -211,59 +213,69 @@ def reconcile_positions(
     db_keys = {(trade["symbol"], trade["side"]) for trade in db_trades}
 
     closed_externally = 0
-    for trade in db_trades:
-        key = (trade["symbol"], trade["side"])
-        trade_id = str(trade["trade_id"])
-        if key in exchange_keys:
-            position_reconcile_guard.note_present(trade_id)
-            continue
+    try:
+        for trade in db_trades:
+            try:
+                key = (trade["symbol"], trade["side"])
+                trade_id = str(trade["trade_id"])
+                if key in exchange_keys:
+                    position_reconcile_guard.note_present(trade_id)
+                    continue
 
-        if is_within_position_grace_period(trade):
-            system_logger.debug(
-                "Deferring phantom purge — position grace period: %s %s | id=%s",
-                trade["symbol"],
-                trade["side"],
-                trade_id[:8],
-            )
-            continue
+                if is_within_position_grace_period(trade):
+                    system_logger.debug(
+                        "Deferring phantom purge — position grace period: %s %s | id=%s",
+                        trade["symbol"],
+                        trade["side"],
+                        trade_id[:8],
+                    )
+                    continue
 
-        miss_count, should_close = position_reconcile_guard.register_missing(trade)
-        if not should_close:
-            system_logger.warning(
-                "Trade missing on exchange (%s/%s) — deferring phantom purge: %s %s | id=%s",
-                miss_count,
-                Config.POSITION_RECONCILE_MISS_THRESHOLD,
-                trade["symbol"],
-                trade["side"],
-                trade_id[:8],
-            )
-            continue
+                miss_count, should_close = position_reconcile_guard.register_missing(trade)
+                if not should_close:
+                    system_logger.warning(
+                        "Trade missing on exchange (%s/%s) — deferring phantom purge: %s %s | id=%s",
+                        miss_count,
+                        Config.POSITION_RECONCILE_MISS_THRESHOLD,
+                        trade["symbol"],
+                        trade["side"],
+                        trade_id[:8],
+                    )
+                    continue
 
-        if not confirm_external_close_allowed(exchange, trade):
-            system_logger.warning(
-                "Phantom purge deferred — REST did not confirm flat: %s %s | id=%s",
-                trade["symbol"],
-                trade["side"],
-                trade_id[:8],
-            )
-            continue
+                if not confirm_external_close_allowed(exchange, trade):
+                    system_logger.warning(
+                        "Phantom purge deferred — REST did not confirm flat: %s %s | id=%s",
+                        trade["symbol"],
+                        trade["side"],
+                        trade_id[:8],
+                    )
+                    continue
 
-        db.update_trade(
-            trade_id,
-            {
-                "status": TRADE_STATUS_CLOSED,
-                "closed_at": utc_now().isoformat(),
-                "exit_reason": "RECONCILED_PHANTOM_PURGE",
-            },
-        )
-        position_reconcile_guard.note_present(trade_id)
-        closed_externally += 1
-        system_logger.warning(
-            "Purged phantom DB trade (exchange flat): %s %s | id=%s",
-            trade["symbol"],
-            trade["side"],
-            trade_id[:8],
-        )
+                db.update_trade(
+                    trade_id,
+                    {
+                        "status": TRADE_STATUS_CLOSED,
+                        "closed_at": utc_now().isoformat(),
+                        "exit_reason": "RECONCILED_PHANTOM_PURGE",
+                    },
+                )
+                position_reconcile_guard.note_present(trade_id)
+                closed_externally += 1
+                system_logger.warning(
+                    "Purged phantom DB trade (exchange flat): %s %s | id=%s",
+                    trade["symbol"],
+                    trade["side"],
+                    trade_id[:8],
+                )
+            except Exception as exc:
+                error_logger.error(
+                    "Reconciliation failed for trade %s: %s",
+                    trade.get("trade_id", "?"),
+                    exc,
+                )
+    except Exception as exc:
+        error_logger.error("Reconciliation phantom purge loop failed: %s", exc)
 
     orphan_exchange: list[dict[str, Any]] = []
     for pos in exchange_positions:

@@ -499,9 +499,16 @@ class TradeExecutor:
             )
             return None
 
-        fill_price = self.exchange.get_fill_price_from_order(
-            symbol, response, fallback=current_price
-        )
+        exchange_order_id = str(response.get("orderId", ""))
+        fill_price = safe_float(response.get("avgPrice"))
+        if fill_price <= 0:
+            executed = safe_float(response.get("executedQty"))
+            cum_quote = safe_float(response.get("cumQuote"))
+            if executed > 0 and cum_quote > 0:
+                fill_price = cum_quote / executed
+        if fill_price <= 0:
+            fill_price = current_price
+
         if range_mode:
             rmeta = RangeMetadata()
             for key, value in structure.items():
@@ -525,6 +532,19 @@ class TradeExecutor:
                 action,
                 sl_reason,
             )
+            orphan_data = {
+                "trade_id": str(uuid.uuid4()),
+                "symbol": symbol,
+                "side": action,
+                "entry_price": fill_price,
+                "quantity": quantity,
+                "status": TRADE_STATUS_OPEN,
+                "exchange_order_id": exchange_order_id,
+                "opened_at": utc_now().isoformat(),
+                "strategy": strategy,
+                "metadata": metadata,
+            }
+            self._persist_orphan_fill(orphan_data)
             try:
                 self.exchange.close_position_quantity(symbol, position_side, quantity)
             except Exception as exc:
@@ -536,7 +556,6 @@ class TradeExecutor:
 
         trade_id = str(uuid.uuid4())
         opened_at = utc_now().isoformat()
-        exchange_order_id = str(response.get("orderId", ""))
         margin_estimate = (quantity * fill_price) / max(leverage, 1)
 
         trade_data = {
@@ -564,16 +583,46 @@ class TradeExecutor:
             "exchange_order_id": exchange_order_id,
         }
 
-        db_logged = self._persist_trade_with_retry(trade_data)
-        if not db_logged:
-            error_logger.error(
-                "CRITICAL ORPHAN FILL | %s %s | orderId=%s | trade_id=%s",
+        db_logged = False
+        try:
+            db_logged = self._persist_trade_with_retry(trade_data)
+            if not db_logged:
+                error_logger.error(
+                    "CRITICAL ORPHAN FILL | %s %s | orderId=%s | trade_id=%s",
+                    symbol,
+                    action,
+                    exchange_order_id,
+                    trade_id,
+                )
+                self._persist_orphan_fill(trade_data)
+
+            self.exchange.seed_position_after_fill(
+                symbol, position_side, quantity, fill_price
+            )
+
+            if safe_float(response.get("avgPrice")) <= 0 and not self.exchange.is_rest_blocked()[0]:
+                refined = self.exchange.get_fill_price_from_order(
+                    symbol, response, fallback=fill_price
+                )
+                if refined > 0 and abs(refined - fill_price) > 1e-12:
+                    fill_price = refined
+                    trade_data["entry_price"] = fill_price
+                    self.db.update_trade(trade_id, {"entry_price": fill_price})
+                    self.exchange.seed_position_after_fill(
+                        symbol, position_side, quantity, fill_price
+                    )
+        except Exception as exc:
+            error_logger.critical(
+                "Post-fill processing failed for %s %s — persisting orphan: %s",
                 symbol,
                 action,
-                exchange_order_id,
-                trade_id,
+                exc,
             )
             self._persist_orphan_fill(trade_data)
+            self.exchange.seed_position_after_fill(
+                symbol, position_side, quantity, fill_price
+            )
+            return None
 
         trade_logger.info(
             "Entry executed | %s %s | strategy=%s | qty=%s | fill=%.6f | SL=%.6f | TP1=%.6f | "

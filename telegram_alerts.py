@@ -25,13 +25,13 @@ def _build_exchange_position_map(
     exchange: Any,
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], str]:
     """Return ((symbol, side) -> position dict, data source label)."""
-    rest_positions = exchange.fetch_all_open_positions_rest(force=True)
-    if rest_positions is not None:
-        positions = rest_positions
-        source = "REST"
-    else:
-        positions = exchange.get_all_open_positions(force_refresh=False)
-        source = "cache/WS"
+    positions = exchange.get_all_open_positions(force_refresh=False)
+    source = "WS/cache"
+    if not positions and not exchange.is_rest_blocked()[0]:
+        rest_positions = exchange.fetch_all_open_positions_rest(force=False)
+        if rest_positions is not None:
+            positions = rest_positions
+            source = "REST"
 
     pos_map: dict[tuple[str, str], dict[str, Any]] = {}
     for pos in positions:

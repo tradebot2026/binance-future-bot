@@ -533,7 +533,7 @@ class DatabaseManager:
                         return
                     conn.execute(
                         """
-                        INSERT INTO daily_stats (
+                        INSERT OR IGNORE INTO daily_stats (
                             date, start_balance, current_balance, total_pnl,
                             trades_count, entries_count, status
                         ) VALUES (?, ?, ?, 0.0, 0, 0, ?)
@@ -541,11 +541,15 @@ class DatabaseManager:
                         (date_str, start_balance, start_balance, DAILY_STATUS_ACTIVE),
                     )
                     conn.commit()
+                    if conn.total_changes == 0:
+                        return
                     system_logger.info(
                         "Initialized daily stats for %s with balance $%.2f",
                         date_str,
                         start_balance,
                     )
+            except sqlite3.IntegrityError:
+                return
             except sqlite3.Error as exc:
                 error_logger.error("Failed to initialize daily stats: %s", exc)
                 raise DatabaseError("initialize_daily_stats failed") from exc
@@ -730,19 +734,29 @@ class DatabaseManager:
 
     def update_watchlist(self, candidates: List[dict[str, Any]]) -> None:
         now = utc_now().isoformat()
+        deduped: dict[str, dict[str, Any]] = {}
+        for candidate in candidates:
+            symbol = str(candidate.get("symbol", "")).upper()
+            if not symbol:
+                continue
+            deduped[symbol] = candidate
+
         with self._write_lock:
             try:
                 with self.connection() as conn:
                     conn.execute("DELETE FROM watchlist")
-                    for candidate in candidates:
-                        direction = candidate.get("direction") or candidate.get("action", "LONG")
+                    for candidate in deduped.values():
+                        direction = candidate.get("direction") or candidate.get(
+                            "action", "LONG"
+                        )
                         conn.execute(
                             """
-                            INSERT INTO watchlist (symbol, score, added_at, direction)
+                            INSERT OR REPLACE INTO watchlist
+                                (symbol, score, added_at, direction)
                             VALUES (?, ?, ?, ?)
                             """,
                             (
-                                candidate["symbol"],
+                                str(candidate["symbol"]).upper(),
                                 candidate.get("score", 0.0),
                                 now,
                                 direction,

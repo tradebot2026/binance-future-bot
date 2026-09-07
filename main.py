@@ -527,7 +527,10 @@ def main(controller: Optional[BotController] = None) -> str:
                 ",".join(Config.get_scan_trigger_timeframes()),
             )
 
-        reconcile_positions_at_startup(exchange, db, tg)
+        try:
+            reconcile_positions_at_startup(exchange, db, tg)
+        except Exception as exc:
+            error_logger.error("Startup reconciliation failed (continuing): %s", exc)
 
         if (
             scanner is not None

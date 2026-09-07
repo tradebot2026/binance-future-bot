@@ -207,7 +207,12 @@ class MarketDataHub:
         """True when WS ticker cache is empty or stale beyond the REST threshold."""
         if not Config.ENABLE_REST_TICKER_FALLBACK and not Config.STARTUP_TICKER_REST_SEED:
             return False
-        threshold = max(Config.TICKER_REST_FALLBACK_AFTER_SECONDS, 1.0)
+        if self.is_ticker_cache_usable(min_symbols=30):
+            threshold = max(Config.TICKER_REST_FALLBACK_AFTER_SECONDS, 60.0)
+            if self._last_ticker_event_at > 0:
+                return (time.monotonic() - self._last_ticker_event_at) >= threshold
+            return self.ticker_cache_age_seconds() >= threshold
+        threshold = max(Config.TICKER_REST_FALLBACK_AFTER_SECONDS, 30.0)
         if not self._tickers:
             return self.ticker_cache_age_seconds() >= threshold
         if self._last_ticker_event_at <= 0:
@@ -232,7 +237,7 @@ class MarketDataHub:
             return len(self._tickers)
 
         now = time.monotonic()
-        min_interval = max(Config.TICKER_REST_MIN_INTERVAL_SECONDS, 5.0)
+        min_interval = max(Config.TICKER_REST_MIN_INTERVAL_SECONDS, 60.0)
         if (
             not force
             and self._tickers
@@ -240,9 +245,16 @@ class MarketDataHub:
         ):
             return len(self._tickers)
 
+        if not force and self.is_ticker_cache_usable(min_symbols=30):
+            return len(self._tickers)
+
         try:
             result = fetcher()
         except Exception as exc:
+            from binance.exceptions import BinanceAPIException
+
+            if isinstance(exc, BinanceAPIException) and exc.code == -1003:
+                self.handle_rate_limit_error(exc)
             if self._ws_log.should_log(f"ticker_rest_fail:{exc}"):
                 error_logger.warning("Ticker REST fallback failed: %s", exc)
             return len(self._tickers)
@@ -1299,7 +1311,7 @@ class MarketDataHub:
                 Config.KLINE_REST_MIN_INTERVAL_SECONDS,
                 Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
                 Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
-                0.2,
+                0.3,
             ),
         )
         if result.aborted:
@@ -1355,7 +1367,7 @@ class MarketDataHub:
                 Config.KLINE_REST_MIN_INTERVAL_SECONDS,
                 Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
                 Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
-                0.2,
+                0.3,
             ),
         )
         return result.seeded
@@ -1497,12 +1509,37 @@ class MarketDataHub:
         symbol = symbol.upper()
         position_side = position_side.upper()
         with self._lock:
-            if self._last_user_event_at <= 0:
-                return 0.0
             for pos in self._positions:
                 if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
                     return safe_float(pos.get("quantity"))
         return 0.0
+
+    def seed_open_position(
+        self,
+        symbol: str,
+        position_side: str,
+        quantity: float,
+        entry_price: float,
+    ) -> None:
+        """Seed user-stream position cache immediately after local fill (no REST)."""
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        with self._lock:
+            self._last_user_event_at = time.monotonic()
+            for pos in self._positions:
+                if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
+                    pos["quantity"] = quantity
+                    pos["entry_price"] = entry_price
+                    return
+            self._positions.append(
+                {
+                    "symbol": symbol,
+                    "positionSide": position_side,
+                    "quantity": quantity,
+                    "entry_price": entry_price,
+                    "unrealized_pnl": 0.0,
+                }
+            )
 
     # ---------------- Candles ----------------
 

@@ -125,7 +125,7 @@ def run_parallel_kline_bootstrap(
     inter_request_delay = max(
         Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
         Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
-        0.2,
+        0.3,
     )
     started = time.monotonic()
 
@@ -238,11 +238,11 @@ def run_batched_kline_bootstrap(
         Config.KLINE_REST_MIN_INTERVAL_SECONDS,
         Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
         Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
-        0.2,
+        0.3,
     )
     delay = max(
         request_delay_seconds if request_delay_seconds is not None else default_delay,
-        0.2,
+        0.3,
     )
 
     by_symbol: dict[str, list[str]] = defaultdict(list)
