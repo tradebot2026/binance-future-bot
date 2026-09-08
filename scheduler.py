@@ -176,6 +176,11 @@ class DailyScheduler:
         enriched["computed_pnl_percent"] = metrics.total_pnl_percent
         enriched["computed_realized_pnl_percent"] = metrics.realized_pnl_percent
         enriched["unrealized_pnl"] = metrics.unrealized_pnl
+        live_balance = self.exchange.get_futures_balance(force_refresh=False)
+        if live_balance <= 0:
+            live_balance = self.exchange.get_futures_balance(force_refresh=True)
+        if live_balance > 0:
+            enriched["current_balance"] = live_balance
         return enriched
 
     # ---------------- Internal helpers ----------------

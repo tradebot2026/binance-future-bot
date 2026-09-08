@@ -261,6 +261,10 @@ def reconcile_positions(
                     },
                 )
                 position_reconcile_guard.note_present(trade_id)
+                exchange.clear_position_cache(
+                    str(trade["symbol"]).upper(),
+                    str(trade.get("side", "LONG")).upper(),
+                )
                 closed_externally += 1
                 system_logger.warning(
                     "Purged phantom DB trade (exchange flat): %s %s | id=%s",

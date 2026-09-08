@@ -186,6 +186,8 @@ class RiskManager:
         """
         balance = self.exchange.get_futures_balance(force_refresh=False)
         if balance <= 0:
+            balance = self.exchange.get_futures_balance(force_refresh=True)
+        if balance <= 0:
             return False, "Balance unavailable for minimum order check."
 
         max_notional = balance * Config.MAX_POSITION_VALUE_MULTIPLIER
@@ -276,6 +278,8 @@ class RiskManager:
         )
 
         current_balance = self.exchange.get_futures_balance(force_refresh=False)
+        if current_balance <= 0:
+            current_balance = self.exchange.get_futures_balance(force_refresh=True)
         block_reason = ""
 
         if daily_stats.get("status") == DAILY_STATUS_PAUSED:

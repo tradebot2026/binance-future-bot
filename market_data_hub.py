@@ -156,6 +156,7 @@ class MarketDataHub:
         self._candle_close_listeners: list[
             Callable[[str, str, int], None]
         ] = []
+        self._price_tick_listeners: list[Callable[[str, float], None]] = []
         self._ws_running = False
         self._last_ticker_event_at: float = 0.0
         self._last_user_event_at: float = 0.0
@@ -926,6 +927,7 @@ class MarketDataHub:
             rows = payload if isinstance(payload, list) else [payload]
             now = time.monotonic()
             updated = False
+            tick_prices: dict[str, float] = {}
             with self._lock:
                 for row in rows:
                     if not isinstance(row, dict):
@@ -947,11 +949,14 @@ class MarketDataHub:
                         "openPrice": safe_float(row.get("o")),
                         "updated_at": now,
                     }
+                    tick_prices[symbol] = price
                     updated = True
                 if updated:
                     self._last_ticker_event_at = now
             if updated:
                 self._reconnect_policy.reset()
+                for sym, tick_price in tick_prices.items():
+                    self._emit_price_tick(sym, tick_price)
         except Exception as exc:
             error_logger.warning("Ticker WS parse error: %s", exc)
 
@@ -960,37 +965,56 @@ class MarketDataHub:
             event = message.get("e")
             if event == "ACCOUNT_UPDATE":
                 account = message.get("a", {})
-                balances_raw = account.get("B", [])
-                positions_raw = account.get("P", [])
-                parsed: list[dict[str, Any]] = []
-                unrealized_total = 0.0
-                for pos in positions_raw:
-                    quantity = abs(safe_float(pos.get("pa")))
-                    if quantity <= 0:
-                        continue
-                    upnl = safe_float(pos.get("up"))
-                    unrealized_total += upnl
-                    parsed.append(
-                        {
-                            "symbol": str(pos.get("s", "")).upper(),
-                            "positionSide": str(pos.get("ps", "")),
-                            "quantity": quantity,
-                            "entry_price": safe_float(pos.get("ep")),
-                            "unrealized_pnl": upnl,
-                        }
-                    )
+                balances_raw = account.get("B", []) or []
+                positions_raw = account.get("P", []) or []
                 with self._lock:
-                    for bal in balances_raw:
-                        asset = str(bal.get("a", "")).upper()
-                        if not asset:
-                            continue
-                        cross_wallet = safe_float(bal.get("cw"))
-                        wallet = safe_float(bal.get("wb"))
-                        value = cross_wallet if cross_wallet > 0 else wallet
-                        if value > 0:
-                            self._wallet_balances[asset] = value
-                    self._positions = parsed
-                    self._unrealized_pnl_total = unrealized_total
+                    if balances_raw:
+                        for bal in balances_raw:
+                            asset = str(bal.get("a", "")).upper()
+                            if not asset:
+                                continue
+                            cross_wallet = safe_float(bal.get("cw"))
+                            wallet = safe_float(bal.get("wb"))
+                            value = cross_wallet if cross_wallet > 0 else wallet
+                            if value > 0:
+                                self._wallet_balances[asset] = value
+                    if positions_raw:
+                        pos_by_key: dict[tuple[str, str], dict[str, Any]] = {
+                            (
+                                str(p.get("symbol", "")).upper(),
+                                str(p.get("positionSide", "")).upper(),
+                            ): dict(p)
+                            for p in self._positions
+                        }
+                        for pos in positions_raw:
+                            symbol = str(pos.get("s", "")).upper()
+                            position_side = str(pos.get("ps", "")).upper()
+                            if not symbol or not position_side:
+                                continue
+                            quantity = abs(safe_float(pos.get("pa")))
+                            key = (symbol, position_side)
+                            if quantity <= 0:
+                                pos_by_key.pop(key, None)
+                                continue
+                            existing = pos_by_key.get(key, {})
+                            pos_by_key[key] = {
+                                "symbol": symbol,
+                                "positionSide": position_side,
+                                "quantity": quantity,
+                                "entry_price": safe_float(pos.get("ep"))
+                                or safe_float(existing.get("entry_price")),
+                                "unrealized_pnl": (
+                                    safe_float(pos.get("up"))
+                                    if pos.get("up") is not None
+                                    else safe_float(existing.get("unrealized_pnl"))
+                                ),
+                                "mark_price": safe_float(pos.get("mp"))
+                                or safe_float(existing.get("mark_price")),
+                            }
+                        self._positions = list(pos_by_key.values())
+                        self._unrealized_pnl_total = sum(
+                            safe_float(p.get("unrealized_pnl")) for p in self._positions
+                        )
                     self._last_user_event_at = time.monotonic()
             elif event in ("ORDER_TRADE_UPDATE", "ACCOUNT_CONFIG_UPDATE"):
                 self._last_user_event_at = time.monotonic()
@@ -1046,6 +1070,20 @@ class MarketDataHub:
         """Register callback(symbol, interval, bar_open_ms) on closed kline WS events."""
         if listener not in self._candle_close_listeners:
             self._candle_close_listeners.append(listener)
+
+    def register_price_tick_listener(
+        self, listener: Callable[[str, float], None]
+    ) -> None:
+        """Register callback(symbol, price) on miniTicker WS updates."""
+        if listener not in self._price_tick_listeners:
+            self._price_tick_listeners.append(listener)
+
+    def _emit_price_tick(self, symbol: str, price: float) -> None:
+        for listener in list(self._price_tick_listeners):
+            try:
+                listener(symbol, price)
+            except Exception as exc:
+                error_logger.warning("Price tick listener error for %s: %s", symbol, exc)
 
     def _emit_candle_close(self, symbol: str, interval: str, bar_open_ms: int) -> None:
         for listener in list(self._candle_close_listeners):
@@ -1513,6 +1551,38 @@ class MarketDataHub:
                 if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
                     return safe_float(pos.get("quantity"))
         return 0.0
+
+    def get_ws_mark_price(self, symbol: str, position_side: str = "LONG") -> Optional[float]:
+        """Mark price from the latest user-stream position update."""
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        with self._lock:
+            for pos in self._positions:
+                if pos.get("symbol") != symbol:
+                    continue
+                if pos.get("positionSide") != position_side:
+                    continue
+                mark = safe_float(pos.get("mark_price"))
+                if mark > 0:
+                    return mark
+        return None
+
+    def clear_position(self, symbol: str, position_side: str) -> None:
+        """Remove a closed position from the user-stream cache."""
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        with self._lock:
+            self._positions = [
+                pos
+                for pos in self._positions
+                if not (
+                    pos.get("symbol") == symbol
+                    and pos.get("positionSide") == position_side
+                )
+            ]
+            self._unrealized_pnl_total = sum(
+                safe_float(p.get("unrealized_pnl")) for p in self._positions
+            )
 
     def seed_open_position(
         self,

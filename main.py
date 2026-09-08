@@ -224,6 +224,7 @@ def _execute_candidates(
     db: DatabaseManager,
     tg: TelegramManager,
     critical_alerts: Optional[CriticalAlertService] = None,
+    manager: Optional[TradeManager] = None,
 ) -> None:
     entries_this_cycle = 0
 
@@ -282,6 +283,8 @@ def _execute_candidates(
 
             entries_this_cycle += 1
             risk.record_entry_opened()
+            if manager is not None:
+                manager.note_open_symbol(symbol)
 
             if result.get("orphan_fill"):
                 if critical_alerts:
@@ -513,6 +516,7 @@ def main(controller: Optional[BotController] = None) -> str:
         )
         tg.manager = manager
         tg.scanner = scanner
+        market_data.register_price_tick_listener(manager.on_price_tick)
 
         tg.start_listening()
         mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
@@ -602,6 +606,7 @@ def main(controller: Optional[BotController] = None) -> str:
                                 db=db,
                                 tg=tg,
                                 critical_alerts=critical_alerts,
+                                manager=manager,
                             )
                         elif Config.USE_UNIFIED_SCAN_PIPELINE:
                             unified = scanner.scan_unified()
@@ -613,6 +618,7 @@ def main(controller: Optional[BotController] = None) -> str:
                                 db=db,
                                 tg=tg,
                                 critical_alerts=critical_alerts,
+                                manager=manager,
                             )
                         else:
                             smc_candidates = scanner.scan_market()
@@ -624,6 +630,7 @@ def main(controller: Optional[BotController] = None) -> str:
                                 db=db,
                                 tg=tg,
                                 critical_alerts=critical_alerts,
+                                manager=manager,
                             )
 
                             if Config.ENABLE_RANGE_REGIME or Config.ENABLE_STRATEGY_RANGE:
@@ -643,6 +650,7 @@ def main(controller: Optional[BotController] = None) -> str:
                                     db=db,
                                     tg=tg,
                                     critical_alerts=critical_alerts,
+                                    manager=manager,
                                 )
                     elif gate_reason:
                         system_logger.info("Entries paused: %s", gate_reason)

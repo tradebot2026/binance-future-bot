@@ -470,14 +470,48 @@ class BinanceExchangeManager:
             return None
         quote = Config.QUOTE_ASSET
         ws_balance = self._market_data.get_ws_wallet_balance(quote)
+        if ws_balance <= 0:
+            return None
         self._balance_cache.set(ws_balance)
         return ws_balance
+
+    @staticmethod
+    def _extract_quote_balance(account_info: dict[str, Any], quote: str) -> float:
+        for key in (
+            "availableBalance",
+            "totalCrossWalletBalance",
+            "totalWalletBalance",
+        ):
+            value = safe_float(account_info.get(key))
+            if value > 0:
+                return value
+        for asset in account_info.get("assets", []):
+            if asset.get("asset") != quote:
+                continue
+            for field in ("availableBalance", "crossWalletBalance", "walletBalance"):
+                value = safe_float(asset.get(field))
+                if value > 0:
+                    return value
+        return 0.0
+
+    def _ws_margin_balance_estimate(self) -> Optional[float]:
+        """Wallet + unrealized PnL from user stream when REST balance is unavailable."""
+        if not self._market_data or not self._market_data.user_stream_has_account_data():
+            return None
+        quote = Config.QUOTE_ASSET
+        wallet = self._market_data.get_ws_wallet_balance(quote)
+        if wallet <= 0:
+            return None
+        unrealized = self._market_data.get_ws_unrealized_pnl_total()
+        return wallet + unrealized
 
     def _sync_account_cache_from_ws(self) -> None:
         if not self._market_data or not self._market_data.user_stream_has_account_data():
             return
         quote = Config.QUOTE_ASSET
         balance = self._market_data.get_ws_wallet_balance(quote)
+        if balance <= 0:
+            return
         assets = [
             {
                 "asset": quote,
@@ -913,6 +947,23 @@ class BinanceExchangeManager:
     def invalidate_position_cache(self) -> None:
         self._position_cache.updated_at = 0.0
 
+    def clear_position_cache(self, symbol: str, position_side: str) -> None:
+        """Drop a closed position from WS and local caches immediately."""
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        if self._market_data:
+            self._market_data.clear_position(symbol, position_side)
+        remaining: list[dict[str, Any]] = []
+        unrealized_total = 0.0
+        for pos in self._position_cache.positions:
+            if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
+                continue
+            remaining.append(pos)
+            unrealized_total += safe_float(pos.get("unrealized_pnl"))
+        self._position_cache.positions = remaining
+        self._position_cache.unrealized_pnl_total = unrealized_total
+        self._position_cache.updated_at = time.monotonic()
+
     def _parse_open_positions(self, raw_positions: list[dict[str, Any]]) -> list[dict[str, Any]]:
         open_positions: list[dict[str, Any]] = []
         unrealized_total = 0.0
@@ -941,8 +992,8 @@ class BinanceExchangeManager:
         now = time.monotonic()
 
         if self._market_data and self._market_data.user_stream_has_account_data():
-            if not self._market_data.user_stream_is_stale():
-                ws_positions = self._market_data.get_ws_positions()
+            ws_positions = self._market_data.get_ws_positions()
+            if ws_positions or not self._market_data.user_stream_is_stale():
                 self._position_cache.positions = ws_positions
                 self._position_cache.unrealized_pnl_total = (
                     self._market_data.get_ws_unrealized_pnl_total()
@@ -1047,14 +1098,10 @@ class BinanceExchangeManager:
         if self.rest_account_reads_blocked():
             cached = self._cached_futures_account_response()
             if cached:
-                for asset in cached.get("assets", []):
-                    if asset.get("asset") == quote:
-                        balance = safe_float(asset.get("availableBalance"))
-                        if balance <= 0:
-                            balance = safe_float(asset.get("crossWalletBalance"))
-                        if balance >= 0:
-                            self._balance_cache.set(balance)
-                            return balance
+                balance = self._extract_quote_balance(cached, quote)
+                if balance >= 0:
+                    self._balance_cache.set(balance)
+                    return balance
             return self._balance_cache.value
 
         try:
@@ -1062,12 +1109,8 @@ class BinanceExchangeManager:
                 self.client.futures_account,
                 **self.recv_window_param,
             )
-            for asset in account_info.get("assets", []):
-                if asset.get("asset") != quote:
-                    continue
-                balance = safe_float(asset.get("availableBalance"))
-                if balance <= 0:
-                    balance = safe_float(asset.get("crossWalletBalance"))
+            balance = self._extract_quote_balance(account_info, quote)
+            if balance >= 0:
                 self._balance_cache.set(balance)
                 return balance
         except ExchangeRateLimitError:
@@ -1086,41 +1129,62 @@ class BinanceExchangeManager:
         quote = Config.QUOTE_ASSET
 
         ws_balance = self._hydrate_balance_from_ws()
-        if ws_balance is not None:
+        if ws_balance is not None and ws_balance > 0:
             return ws_balance
 
         if force_refresh and not self._is_execution_priority():
             force_refresh = False
 
         if not force_refresh and self._balance_cache.is_valid():
-            return self._balance_cache.value
+            cached = self._balance_cache.value
+            if cached > 0:
+                return cached
 
         now = time.monotonic()
         poll_interval = max(float(Config.ACCOUNT_REST_MIN_INTERVAL_SECONDS), 60.0)
 
+        needs_rest = force_refresh or self._balance_cache.value <= 0
+
         if (
-            not force_refresh
+            not needs_rest
             and self._last_account_rest_at > 0
             and (now - self._last_account_rest_at) < poll_interval
         ):
+            cached = self._balance_cache.value
+            if cached > 0:
+                return cached
+            margin_est = self._ws_margin_balance_estimate()
+            return margin_est if margin_est is not None else cached
+
+        if now < self._balance_rest_backoff_until and not needs_rest:
+            cached = self._balance_cache.value
+            if cached > 0:
+                return cached
+            margin_est = self._ws_margin_balance_estimate()
+            return margin_est if margin_est is not None else cached
+
+        if not Config.ENABLE_REST_BALANCE_POLL and not needs_rest:
+            margin_est = self._ws_margin_balance_estimate()
+            if margin_est is not None and margin_est > 0:
+                return margin_est
             return self._balance_cache.value
 
-        if now < self._balance_rest_backoff_until:
+        if not self._rest_reads_allowed() and not self._is_execution_priority():
+            margin_est = self._ws_margin_balance_estimate()
+            if margin_est is not None and margin_est > 0:
+                return margin_est
             return self._balance_cache.value
 
-        if not Config.ENABLE_REST_BALANCE_POLL or not self._rest_reads_allowed():
-            return self._balance_cache.value
-
-        if self.rest_account_reads_blocked():
+        if self.rest_account_reads_blocked() and not self._is_execution_priority():
             cached = self._cached_futures_account_response()
             if cached:
-                for asset in cached.get("assets", []):
-                    if asset.get("asset") == quote:
-                        balance = safe_float(asset.get("availableBalance"))
-                        if balance <= 0:
-                            balance = safe_float(asset.get("crossWalletBalance"))
-                        self._balance_cache.set(balance)
-                        return balance
+                balance = self._extract_quote_balance(cached, quote)
+                if balance > 0:
+                    self._balance_cache.set(balance)
+                    return balance
+            margin_est = self._ws_margin_balance_estimate()
+            if margin_est is not None and margin_est > 0:
+                return margin_est
             return self._balance_cache.value
 
         try:
@@ -1128,26 +1192,34 @@ class BinanceExchangeManager:
                 self.client.futures_account,
                 **self.recv_window_param,
             )
-            for asset in account_info.get("assets", []):
-                if asset.get("asset") == quote:
-                    balance = safe_float(asset.get("availableBalance"))
-                    if balance <= 0:
-                        balance = safe_float(asset.get("crossWalletBalance"))
-                    self._balance_cache.set(balance)
-                    return balance
+            balance = self._extract_quote_balance(account_info, quote)
+            if balance > 0:
+                self._balance_cache.set(balance)
+                self._account_rest_cache.account_info = account_info
+                self._account_rest_cache.updated_at = now
+                return balance
+            margin_est = self._ws_margin_balance_estimate()
+            if margin_est is not None and margin_est > 0:
+                return margin_est
             return self._balance_cache.value
         except ExchangeRateLimitError:
             self._balance_rest_backoff_until = now + poll_interval
             cached = self._cached_futures_account_response()
             if cached:
-                for asset in cached.get("assets", []):
-                    if asset.get("asset") == quote:
-                        return safe_float(asset.get("availableBalance"))
+                balance = self._extract_quote_balance(cached, quote)
+                if balance > 0:
+                    return balance
+            margin_est = self._ws_margin_balance_estimate()
+            if margin_est is not None and margin_est > 0:
+                return margin_est
             return self._balance_cache.value
         except Exception as exc:
             self._balance_rest_backoff_until = now + min(poll_interval, 120.0)
             if self._rest_block_log.should_log("balance_fetch_failed"):
                 error_logger.warning("Balance REST fetch failed (cached fallback): %s", exc)
+            margin_est = self._ws_margin_balance_estimate()
+            if margin_est is not None and margin_est > 0:
+                return margin_est
             return self._balance_cache.value
 
     # ---------------- Market data ----------------
@@ -1350,11 +1422,32 @@ class BinanceExchangeManager:
             self.rest_fetch_klines_df,
         )
 
-    def get_market_price(self, symbol: str) -> Optional[float]:
+    def get_mark_price(
+        self, symbol: str, position_side: str = "LONG"
+    ) -> Optional[float]:
+        """Mark price from user-stream position cache."""
+        if self._market_data:
+            mark = self._market_data.get_ws_mark_price(symbol, position_side)
+            if mark is not None and mark > 0:
+                return mark
+        return None
+
+    def get_market_price(self, symbol: str, position_side: str = "LONG") -> Optional[float]:
         if self._market_data:
             cached = self._market_data.get_price(symbol)
             if cached is not None and cached > 0:
                 return cached
+
+        mark = self.get_mark_price(symbol, position_side)
+        if mark is not None and mark > 0:
+            return mark
+
+        if self._market_data:
+            df = self._market_data.get_candles_cached_only(symbol, "1m", 3)
+            if not df.empty:
+                close = safe_float(df.iloc[-1]["close"])
+                if close > 0:
+                    return close
 
         if not Config.ENABLE_REST_PRICE_FALLBACK or not self._rest_reads_allowed():
             return None
@@ -1690,6 +1783,11 @@ class BinanceExchangeManager:
 
     def get_unrealized_pnl_total(self, force_refresh: bool = False) -> float:
         """Sum unrealized PnL from the shared position cache."""
+        if self._market_data and self._market_data.user_stream_has_account_data():
+            ws_total = self._market_data.get_ws_unrealized_pnl_total()
+            if ws_total != 0 or self._market_data.get_ws_positions():
+                self._position_cache.unrealized_pnl_total = ws_total
+                return ws_total
         self._refresh_positions_cache(force=force_refresh)
         return self._position_cache.unrealized_pnl_total
 
@@ -1782,8 +1880,11 @@ class BinanceExchangeManager:
         symbol = symbol.upper()
         position_side = position_side.upper()
         if self._market_data and self._market_data.user_stream_has_account_data():
+            ws_qty = self._market_data.get_ws_position_quantity(symbol, position_side)
+            if ws_qty > 0:
+                return ws_qty
             if not self._market_data.user_stream_is_stale():
-                return self._market_data.get_ws_position_quantity(symbol, position_side)
+                return 0.0
         for pos in self._refresh_positions_cache():
             if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
                 return safe_float(pos.get("quantity"))
