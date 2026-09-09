@@ -335,6 +335,7 @@ class MarketScanner:
                 "tier1_background": [],
                 "tier1_full": [],
                 "tier2": [],
+                "tier2_near_miss": [],
             }
         orchestrator = self.orchestrator
         return {
@@ -342,6 +343,7 @@ class MarketScanner:
             "tier1_background": orchestrator.priority_queue.background_symbols,
             "tier1_full": orchestrator.tier1_symbols,
             "tier2": orchestrator.tier2_summary(),
+            "tier2_near_miss": orchestrator.assignment_manager.near_miss_summary(),
         }
 
     def _prepare_scan_universe(self) -> tuple[List[str], dict[str, float]]:

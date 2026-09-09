@@ -6,7 +6,6 @@ dynamic break-even and TP-trailing stop loss, and exchange reconciliation.
 
 from __future__ import annotations
 
-import queue
 import threading
 import time
 from datetime import datetime, timezone
@@ -59,13 +58,22 @@ class TradeManager:
         self.risk_manager = risk_manager
         self._monitored_symbols: set[str] = set()
         self._monitored_lock = threading.Lock()
-        self._tick_queue: queue.SimpleQueue[tuple[str, float]] = queue.SimpleQueue()
+        self._latest_ticks: dict[str, float] = {}
+        self._tick_lock = threading.Lock()
+        self._tick_event = threading.Event()
+        self._monitor_stop = threading.Event()
         self._tick_worker = threading.Thread(
             target=self._price_tick_worker,
             name="price-tick-worker",
             daemon=True,
         )
+        self._fast_monitor = threading.Thread(
+            target=self._fast_monitor_loop,
+            name="tp-sl-fast-monitor",
+            daemon=True,
+        )
         self._tick_worker.start()
+        self._fast_monitor.start()
 
     def note_open_symbol(self, symbol: str) -> None:
         """Register a symbol for immediate WS tick monitoring after entry."""
@@ -84,18 +92,46 @@ class TradeManager:
                 return
             with self._monitored_lock:
                 self._monitored_symbols.add(symbol)
-        self._tick_queue.put((symbol, price))
+        with self._tick_lock:
+            self._latest_ticks[symbol] = price
+        self._tick_event.set()
 
     def _price_tick_worker(self) -> None:
-        while True:
-            symbol, price = self._tick_queue.get()
+        """Coalesce miniTicker bursts — always evaluate the latest price per symbol."""
+        while not self._monitor_stop.is_set():
+            self._tick_event.wait(timeout=0.25)
+            self._tick_event.clear()
+            with self._tick_lock:
+                batch = dict(self._latest_ticks)
+                self._latest_ticks.clear()
+            for symbol, price in batch.items():
+                try:
+                    self._process_price_tick(symbol, price)
+                except Exception as exc:
+                    error_logger.error(
+                        "Price tick worker failed for %s: %s",
+                        symbol,
+                        exc,
+                        exc_info=True,
+                    )
+
+    def _fast_monitor_loop(self) -> None:
+        """Dedicated 1s TP/SL loop — never waits on REST."""
+        while not self._monitor_stop.wait(1.0):
             try:
-                self._process_price_tick(symbol, price)
+                self.monitor_open_trades(ws_only=True)
             except Exception as exc:
-                error_logger.error("Price tick worker failed for %s: %s", symbol, exc)
+                error_logger.error("Fast TP/SL monitor error: %s", exc, exc_info=True)
+
+    def _trade_quantity_from_db(self, trade: dict[str, Any]) -> float:
+        metadata = self.db.parse_trade_metadata(trade)
+        original = safe_float(metadata.get("original_quantity"))
+        if original > 0:
+            return original
+        return safe_float(trade.get("quantity"))
 
     def _process_price_tick(self, symbol: str, price: float) -> None:
-        """Evaluate open trades for a symbol (runs off the WebSocket callback thread)."""
+        """Evaluate open trades for a symbol (REST-free, off WS callback thread)."""
         active_trades = [
             trade
             for trade in self.db.get_open_trades()
@@ -106,21 +142,21 @@ class TradeManager:
                 self._monitored_symbols.discard(symbol)
             return
 
-        if not self.exchange.rest_account_reads_blocked():
-            self.exchange.ensure_positions_cached(force=False)
-
-        qty_map = self._position_qty_map(active_trades)
+        qty_map = self._position_qty_map(active_trades, ws_only=True)
         for trade in active_trades:
             try:
-                self._monitor_single_trade(trade, qty_map, price=price)
+                self._monitor_single_trade(
+                    trade, qty_map, price=price, ws_only=True
+                )
             except Exception as exc:
                 error_logger.error(
                     "Price tick monitor failed for %s: %s",
                     symbol,
                     exc,
+                    exc_info=True,
                 )
 
-    def monitor_open_trades(self) -> None:
+    def monitor_open_trades(self, *, ws_only: bool = False) -> None:
         """Evaluate all active DB trades against live prices and exchange state."""
         try:
             active_trades = self.db.get_open_trades()
@@ -131,34 +167,48 @@ class TradeManager:
             if not active_trades:
                 return
 
-            if not self.exchange.rest_account_reads_blocked():
+            if not ws_only and not self.exchange.rest_account_reads_blocked():
                 self.exchange.ensure_positions_cached(force=False)
 
-            qty_map = self._position_qty_map(active_trades)
+            qty_map = self._position_qty_map(active_trades, ws_only=ws_only)
 
             for trade in active_trades:
                 try:
-                    self._monitor_single_trade(trade, qty_map)
+                    self._monitor_single_trade(trade, qty_map, ws_only=ws_only)
                 except Exception as exc:
                     error_logger.error(
                         "Trade monitor failed for %s: %s",
                         trade.get("symbol", "?"),
                         exc,
+                        exc_info=True,
                     )
         except Exception as exc:
-            error_logger.error("Trade monitoring failed: %s", exc)
+            error_logger.error("Trade monitoring failed: %s", exc, exc_info=True)
 
     def _position_qty_map(
-        self, active_trades: list[dict[str, Any]]
+        self,
+        active_trades: list[dict[str, Any]],
+        *,
+        ws_only: bool = False,
     ) -> dict[tuple[str, str], float]:
-        """WS/cache quantities; one bulk refresh when any trade appears flat."""
+        """WS/cache/DB quantities; REST bulk refresh only on the slow monitor path."""
         qty_map: dict[tuple[str, str], float] = {}
         for trade in active_trades:
             symbol = str(trade.get("symbol", "")).upper()
             side = str(trade.get("side", "LONG")).upper()
-            qty = self.exchange.get_position_quantity(symbol, side)
+            if ws_only:
+                qty = self.exchange.get_position_quantity_cached(symbol, side)
+            else:
+                qty = self.exchange.get_position_quantity(symbol, side)
             if qty > 0:
                 qty_map[(symbol, side)] = qty
+                continue
+            db_qty = self._trade_quantity_from_db(trade)
+            if db_qty > 0:
+                qty_map[(symbol, side)] = db_qty
+
+        if ws_only:
+            return qty_map
 
         needs_bulk = any(
             qty_map.get(
@@ -182,13 +232,21 @@ class TradeManager:
         trade: dict[str, Any],
         qty_map: dict[tuple[str, str], float],
         price: Optional[float] = None,
+        *,
+        ws_only: bool = False,
     ) -> None:
         symbol = trade["symbol"]
         position_side = trade.get("side", "LONG")
         key = (str(symbol).upper(), str(position_side).upper())
 
         live_qty = qty_map.get(key, 0.0)
-        if live_qty <= 0 and not self.exchange.rest_account_reads_blocked():
+        if live_qty <= 0:
+            db_qty = self._trade_quantity_from_db(trade)
+            if db_qty > 0:
+                live_qty = db_qty
+                qty_map[key] = db_qty
+
+        if live_qty <= 0 and not ws_only and not self.exchange.rest_account_reads_blocked():
             rest_qty = self.exchange.get_position_quantity_rest(symbol, position_side)
             if rest_qty is not None and rest_qty > 0:
                 position_reconcile_guard.note_present(str(trade["trade_id"]))
@@ -201,6 +259,12 @@ class TradeManager:
                 qty_map[key] = rest_qty
 
         if live_qty <= 0:
+            if ws_only:
+                trade_logger.debug(
+                    "[%s] TP/SL eval skipped — qty unavailable (WS-only path).",
+                    symbol,
+                )
+                return
             if self._defer_external_close(trade, symbol):
                 return
             self._mark_trade_closed(
@@ -219,6 +283,10 @@ class TradeManager:
         if price is None or price <= 0:
             price = self.exchange.get_market_price(symbol, position_side)
         if price is None or price <= 0:
+            trade_logger.warning(
+                "[%s] TP/SL eval skipped — no mark/ticker price available.",
+                symbol,
+            )
             return
 
         fresh = self.db.get_trade(trade["trade_id"])
@@ -421,7 +489,13 @@ class TradeManager:
             metadata = self.db.parse_trade_metadata(trade)
 
             stop_loss = safe_float(trade.get("stop_loss"))
-            if current_price <= stop_loss:
+            if stop_loss > 0 and current_price <= stop_loss:
+                trade_logger.warning(
+                    "[%s] STOP LOSS breach LONG | price=%.6f <= sl=%.6f",
+                    trade.get("symbol"),
+                    current_price,
+                    stop_loss,
+                )
                 self._close_position(
                     trade,
                     quantity=self._remaining_close_quantity(trade),
@@ -439,12 +513,30 @@ class TradeManager:
 
             acted = False
             if tp3 > 0 and current_price >= tp3 and not metadata.get("tp3_executed"):
+                trade_logger.info(
+                    "[%s] TP3 breach LONG | price=%.6f >= tp3=%.6f",
+                    trade.get("symbol"),
+                    current_price,
+                    tp3,
+                )
                 self._handle_take_profit(trade, level="TP3", reason="TP3_FULL_CLOSE")
                 acted = True
             elif tp2 > 0 and current_price >= tp2 and not metadata.get("tp2_executed"):
+                trade_logger.info(
+                    "[%s] TP2 breach LONG | price=%.6f >= tp2=%.6f",
+                    trade.get("symbol"),
+                    current_price,
+                    tp2,
+                )
                 self._handle_take_profit(trade, level="TP2", reason="TP2")
                 acted = True
             elif tp1 > 0 and current_price >= tp1 and not metadata.get("tp1_executed"):
+                trade_logger.info(
+                    "[%s] TP1 breach LONG | price=%.6f >= tp1=%.6f",
+                    trade.get("symbol"),
+                    current_price,
+                    tp1,
+                )
                 self._handle_take_profit(trade, level="TP1", reason="TP1")
                 acted = True
 
@@ -460,7 +552,13 @@ class TradeManager:
             metadata = self.db.parse_trade_metadata(trade)
 
             stop_loss = safe_float(trade.get("stop_loss"))
-            if current_price >= stop_loss:
+            if stop_loss > 0 and current_price >= stop_loss:
+                trade_logger.warning(
+                    "[%s] STOP LOSS breach SHORT | price=%.6f >= sl=%.6f",
+                    trade.get("symbol"),
+                    current_price,
+                    stop_loss,
+                )
                 self._close_position(
                     trade,
                     quantity=self._remaining_close_quantity(trade),
@@ -478,12 +576,30 @@ class TradeManager:
 
             acted = False
             if tp3 > 0 and current_price <= tp3 and not metadata.get("tp3_executed"):
+                trade_logger.info(
+                    "[%s] TP3 breach SHORT | price=%.6f <= tp3=%.6f",
+                    trade.get("symbol"),
+                    current_price,
+                    tp3,
+                )
                 self._handle_take_profit(trade, level="TP3", reason="TP3_FULL_CLOSE")
                 acted = True
             elif tp2 > 0 and current_price <= tp2 and not metadata.get("tp2_executed"):
+                trade_logger.info(
+                    "[%s] TP2 breach SHORT | price=%.6f <= tp2=%.6f",
+                    trade.get("symbol"),
+                    current_price,
+                    tp2,
+                )
                 self._handle_take_profit(trade, level="TP2", reason="TP2")
                 acted = True
             elif tp1 > 0 and current_price <= tp1 and not metadata.get("tp1_executed"):
+                trade_logger.info(
+                    "[%s] TP1 breach SHORT | price=%.6f <= tp1=%.6f",
+                    trade.get("symbol"),
+                    current_price,
+                    tp1,
+                )
                 self._handle_take_profit(trade, level="TP1", reason="TP1")
                 acted = True
 
@@ -648,7 +764,11 @@ class TradeManager:
         position_side = trade.get("side", "LONG")
         rules = self.exchange.get_symbol_rules(symbol)
 
-        live_qty = self.exchange.get_position_quantity(symbol, position_side)
+        live_qty = self.exchange.get_position_quantity_cached(symbol, position_side)
+        if live_qty <= 0:
+            live_qty = self._trade_quantity_from_db(trade)
+        if live_qty <= 0:
+            live_qty = self.exchange.get_position_quantity(symbol, position_side)
         if live_qty <= 0:
             return 0.0
 

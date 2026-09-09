@@ -546,7 +546,9 @@ class TelegramManager:
             if not self.exchange:
                 self.bot.reply_to(message, "⚠️ Exchange not attached.")
                 return
-            text = format_active_positions_message(self.db, self.exchange)
+            text = format_active_positions_message(
+                self.db, self.exchange, telegram=self
+            )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"
             self.bot.reply_to(message, text)
@@ -559,6 +561,13 @@ class TelegramManager:
                 self.bot.reply_to(message, "⚠️ Event scan not available.")
                 return
             tiers = scanner.get_watchlist_tiers()
+            orchestrator = getattr(scanner, "orchestrator", None)
+            if orchestrator is not None and not tiers.get("tier2"):
+                try:
+                    orchestrator.process_hot_scan_cycle()
+                    tiers = scanner.get_watchlist_tiers()
+                except Exception as exc:
+                    error_logger.warning("/watchlist hot scan refresh failed: %s", exc)
             text = format_watchlist_message(
                 tier1_hot=tiers.get("tier1_hot", []),
                 tier1_background=tiers.get("tier1_background", []),
@@ -566,6 +575,7 @@ class TelegramManager:
                 tier2_rows=tiers.get("tier2", []),
                 hot_scan_interval=Config.HOT_SCAN_INTERVAL_SECONDS,
                 tier2_display_limit=Config.TIER2_HOT_SIZE,
+                tier2_near_miss=tiers.get("tier2_near_miss", []),
             )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"

@@ -60,6 +60,8 @@ def compute_daily_pnl_metrics(
     start_balance = safe_float(stats.get("start_balance"))
     realized_pnl = safe_float(stats.get("total_pnl"))
     unrealized_pnl = exchange.get_unrealized_pnl_total()
+    if unrealized_pnl == 0 and exchange.get_open_positions_count() > 0:
+        unrealized_pnl = exchange.get_unrealized_pnl_total(force_refresh=True)
     total_pnl = realized_pnl + unrealized_pnl
 
     if start_balance > 0:

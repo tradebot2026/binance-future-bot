@@ -6,6 +6,7 @@ from typing import Any, Optional
 
 from constants import strategy_display_label
 from database import DatabaseManager
+from reconciliation import sync_active_trades_on_demand
 from utils import escape_html, safe_float
 
 
@@ -23,21 +24,32 @@ def _position_pnl_percent(
 
 def _build_exchange_position_map(
     exchange: Any,
+    *,
+    force_rest: bool = False,
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], str]:
     """Return ((symbol, side) -> position dict, data source label)."""
-    positions = exchange.get_all_open_positions(force_refresh=False)
     source = "WS/cache"
-    if not positions and not exchange.is_rest_blocked()[0]:
-        rest_positions = exchange.fetch_all_open_positions_rest(force=False)
+    positions: list[dict[str, Any]] = []
+
+    if force_rest and not exchange.is_rest_blocked()[0]:
+        rest_positions = exchange.fetch_all_open_positions_rest(force=True)
         if rest_positions is not None:
             positions = rest_positions
-            source = "REST"
+            source = "REST (live)"
+
+    if not positions:
+        positions = exchange.get_all_open_positions(force_refresh=force_rest)
+        if not positions and not exchange.is_rest_blocked()[0]:
+            rest_positions = exchange.fetch_all_open_positions_rest(force=force_rest)
+            if rest_positions is not None:
+                positions = rest_positions
+                source = "REST"
 
     pos_map: dict[tuple[str, str], dict[str, Any]] = {}
     for pos in positions:
         symbol = str(pos.get("symbol", "")).upper()
         side = str(pos.get("positionSide", "")).upper()
-        if symbol and side:
+        if symbol and side and safe_float(pos.get("quantity")) > 0:
             pos_map[(symbol, side)] = pos
     return pos_map, source
 
@@ -45,17 +57,35 @@ def _build_exchange_position_map(
 def format_active_positions_message(
     db: DatabaseManager,
     exchange: Any,
+    telegram: Any = None,
 ) -> str:
-    """Format /active — open trades cross-verified against Binance positions."""
+    """Format /active — reconcile DB vs Binance then list verified open trades."""
+    sync_summary = sync_active_trades_on_demand(
+        exchange,
+        db,
+        telegram=telegram,
+        force_rest=True,
+    )
     trades = db.get_open_trades()
     if not trades:
+        closed_n = len(sync_summary.get("closed", []))
+        if closed_n:
+            return (
+                "📭 <b>Active Positions</b>\n"
+                f"<i>Synced with exchange — {closed_n} stale DB trade(s) purged.</i>"
+            )
         return "📭 <b>Active Positions</b>\n<i>No open trades in database.</i>"
 
-    pos_map, source = _build_exchange_position_map(exchange)
+    pos_map, source = _build_exchange_position_map(exchange, force_rest=True)
     lines = [
         f"📂 <b>Active Positions ({len(trades)})</b>",
-        f"<i>Exchange source: {escape_html(source)}</i>\n",
+        f"<i>Exchange source: {escape_html(source)}</i>",
     ]
+    if sync_summary.get("closed"):
+        lines.append(
+            f"<i>Reconciled: removed {len(sync_summary['closed'])} manually closed trade(s).</i>"
+        )
+    lines.append("")
 
     tracked_keys: set[tuple[str, str]] = set()
     for trade in trades[:20]:
@@ -64,7 +94,7 @@ def format_active_positions_message(
         tracked_keys.add((symbol, side))
 
         entry = safe_float(trade.get("entry_price"))
-        mark = safe_float(exchange.get_market_price(symbol))
+        mark = safe_float(exchange.get_market_price(symbol, side))
         tp1 = safe_float(trade.get("take_profit_1"))
         tp2 = safe_float(trade.get("take_profit_2"))
         tp3 = safe_float(trade.get("take_profit_3"))
@@ -73,6 +103,10 @@ def format_active_positions_message(
 
         exchange_pos = pos_map.get((symbol, side))
         exchange_qty = safe_float(exchange_pos.get("quantity")) if exchange_pos else 0.0
+        if exchange_pos:
+            mark_from_pos = safe_float(exchange_pos.get("mark_price"))
+            if mark_from_pos > 0:
+                mark = mark_from_pos
         if exchange_pos and mark <= 0:
             mark = entry
 
@@ -88,7 +122,7 @@ def format_active_positions_message(
             sync_note = f"qty={exchange_qty:.4f}"
         else:
             sync_icon = "⚠️"
-            sync_note = "missing on exchange"
+            sync_note = "missing on exchange (pending sync)"
 
         pnl_display = f"{pnl_pct:+.2f}%" if pnl_pct is not None else "n/a"
         mark_display = f"{mark:.6f}" if mark > 0 else "n/a"
@@ -134,6 +168,7 @@ def format_watchlist_message(
     tier2_rows: list[tuple[str, str, float]],
     hot_scan_interval: float,
     tier2_display_limit: int = 20,
+    tier2_near_miss: Optional[list[tuple[str, str, float, float]]] = None,
 ) -> str:
     """Format /watchlist — Tier 1 hot scan universe + Tier 2 execution candidates."""
     lines = ["📡 <b>Scan Watchlist</b>\n"]
@@ -173,5 +208,14 @@ def format_watchlist_message(
             )
     else:
         lines.append("<i>No Tier 2 candidates promoted yet.</i>")
+
+    near_miss = tier2_near_miss or []
+    if near_miss and not tier2_rows:
+        lines.append(f"\n📊 <b>Recent scan scores (not yet promoted)</b>")
+        for sym, strat, norm, raw in near_miss[:8]:
+            lines.append(
+                f"• {escape_html(sym)} | {escape_html(strategy_display_label(strat))} "
+                f"| raw={raw:.1f} norm={norm:.0f}"
+            )
 
     return "\n".join(lines)

@@ -136,6 +136,131 @@ def confirm_external_close_allowed(
     return True
 
 
+def sync_active_trades_on_demand(
+    exchange: "BinanceExchangeManager",
+    db: "DatabaseManager",
+    telegram: Optional["TelegramManager"] = None,
+    *,
+    force_rest: bool = True,
+) -> dict[str, Any]:
+    """
+    Authoritative sync for /active and on-demand checks.
+    Closes DB trades immediately when REST confirms the exchange is flat.
+    """
+    summary: dict[str, Any] = {
+        "closed": [],
+        "exchange_open": 0,
+        "rest_used": False,
+        "rest_blocked": exchange.is_rest_blocked()[0],
+    }
+
+    exchange_keys: set[tuple[str, str]] = set()
+    rest_blocked = exchange.is_rest_blocked()[0]
+
+    if force_rest and not rest_blocked:
+        rest_positions = exchange.fetch_all_open_positions_rest(force=True)
+        summary["rest_used"] = True
+        if rest_positions is not None:
+            for pos in rest_positions:
+                symbol = str(pos.get("symbol", "")).upper()
+                side = str(pos.get("positionSide", "")).upper()
+                qty = safe_float(pos.get("quantity"))
+                if symbol and side and qty > 0:
+                    exchange_keys.add((symbol, side))
+                    exchange.seed_position_after_fill(
+                        symbol,
+                        side,
+                        qty,
+                        safe_float(pos.get("entry_price")),
+                    )
+
+    if not exchange_keys:
+        for pos in exchange.get_all_open_positions(force_refresh=not rest_blocked):
+            symbol = str(pos.get("symbol", "")).upper()
+            side = str(pos.get("positionSide", "")).upper()
+            qty = safe_float(pos.get("quantity"))
+            if symbol and side and qty > 0:
+                exchange_keys.add((symbol, side))
+
+    summary["exchange_open"] = len(exchange_keys)
+
+    for trade in db.get_open_trades():
+        symbol = str(trade.get("symbol", "")).upper()
+        side = str(trade.get("side", "LONG")).upper()
+        trade_id = str(trade["trade_id"])
+        key = (symbol, side)
+
+        if key in exchange_keys:
+            position_reconcile_guard.note_present(trade_id)
+            continue
+
+        if is_within_position_grace_period(trade):
+            continue
+
+        rest_qty: Optional[float] = None
+        if not rest_blocked:
+            rest_qty = exchange.get_position_quantity_rest(symbol, side)
+            if rest_qty is None:
+                raw = exchange.fetch_symbol_positions_rest(symbol, force=True)
+                if raw is not None:
+                    rest_qty = 0.0
+                    for pos in raw:
+                        if str(pos.get("positionSide", "")).upper() == side:
+                            rest_qty = abs(safe_float(pos.get("positionAmt")))
+                            break
+
+        if rest_qty is None:
+            system_logger.warning(
+                "On-demand sync deferred close — REST unavailable: %s %s | id=%s",
+                symbol,
+                side,
+                trade_id[:8],
+            )
+            continue
+
+        if rest_qty > 0:
+            position_reconcile_guard.note_present(trade_id)
+            exchange.seed_position_after_fill(
+                symbol,
+                side,
+                rest_qty,
+                safe_float(trade.get("entry_price")),
+            )
+            exchange_keys.add(key)
+            continue
+
+        db.update_trade(
+            trade_id,
+            {
+                "status": TRADE_STATUS_CLOSED,
+                "closed_at": utc_now().isoformat(),
+                "exit_reason": "RECONCILED_MANUAL_CLOSE",
+            },
+        )
+        position_reconcile_guard.note_present(trade_id)
+        exchange.clear_position_cache(symbol, side)
+        summary["closed"].append(f"{symbol} {side}")
+        system_logger.warning(
+            "Purged manually closed trade from DB: %s %s | id=%s",
+            symbol,
+            side,
+            trade_id[:8],
+        )
+
+    summary["exchange_open"] = len(exchange_keys)
+
+    if summary["closed"] and telegram:
+        lines = [
+            "🔄 <b>Position sync</b>",
+            f"Closed {len(summary['closed'])} DB trade(s) no longer on exchange:",
+        ]
+        for row in summary["closed"][:10]:
+            lines.append(f"• {row}")
+        telegram.send_message("\n".join(lines))
+
+    return summary
+
+
 def symbol_blocked_for_new_entry(
     exchange: "BinanceExchangeManager",
     db: "DatabaseManager",

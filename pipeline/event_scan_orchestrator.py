@@ -317,6 +317,10 @@ class EventScanOrchestrator:
             volume_rank=volume_rank,
         )
         if snapshot is None:
+            scanner_logger.debug(
+                "Tier2 skip %s — snapshot unavailable (WS kline cache miss).",
+                symbol,
+            )
             if mark_event is not None:
                 self.event_scheduler.mark_evaluated(
                     symbol, mark_event.timeframe, mark_event.bar_open_ms
@@ -328,17 +332,29 @@ class EventScanOrchestrator:
             bar_open_ms=bar_open_ms,
             timeframe=timeframe,
         )
-        best = self.scoring_engine.pick_best(scores)
-        if best is None:
+        if not scores:
+            scanner_logger.debug("Tier2 skip %s — no strategy scores produced.", symbol)
             if mark_event is not None:
                 self.event_scheduler.mark_evaluated(
                     symbol, mark_event.timeframe, mark_event.bar_open_ms
                 )
             return None
 
-        promoted, demoted, gc_symbol = self.assignment_manager.update(
-            best, open_symbols=open_symbols
-        )
+        tier2_candidate = self.scoring_engine.pick_best_for_tier2(scores)
+        promoted, demoted, gc_symbol = False, False, None
+        if tier2_candidate is not None:
+            scanner_logger.debug(
+                "Tier2 check %s | strategy=%s raw=%.1f min=%.1f norm=%.1f",
+                symbol,
+                tier2_candidate.strategy,
+                tier2_candidate.score,
+                tier2_candidate.min_score,
+                tier2_candidate.normalized_score,
+            )
+            promoted, demoted, gc_symbol = self.assignment_manager.update(
+                tier2_candidate, open_symbols=open_symbols
+            )
+
         if gc_symbol and self._hub:
             self.assignment_manager.gc_demoted(
                 gc_symbol, self._hub.demote_symbol_klines
@@ -346,10 +362,14 @@ class EventScanOrchestrator:
         if promoted and self._hub:
             self._hub.subscribe_kline_streams([symbol])
 
+        best = self.scoring_engine.pick_best(scores)
         if mark_event is not None:
             self.event_scheduler.mark_evaluated(
                 symbol, mark_event.timeframe, mark_event.bar_open_ms
             )
+
+        if best is None:
+            return None
 
         if best.score < best.min_score:
             log_execution_rejected(

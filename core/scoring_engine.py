@@ -149,6 +149,24 @@ class ScoringEngine:
         )
 
     @staticmethod
+    def pick_best_for_tier2(scores: list[StrategyScore]) -> Optional[StrategyScore]:
+        """Best scoring result for Tier-2 tracking (includes raw scores at/above min)."""
+        valid = [s for s in scores if s.score >= s.min_score and s.score > 0]
+        if not valid:
+            valid = [s for s in scores if s.score > 0]
+        if not valid:
+            return None
+        return max(
+            valid,
+            key=lambda s: (
+                s.normalized_score,
+                s.score,
+                s.adjusted_score,
+                s.priority_weight,
+            ),
+        )
+
+    @staticmethod
     def qualifies_for_tier2(
         best: StrategyScore,
         *,
@@ -158,12 +176,15 @@ class ScoringEngine:
         Tier-2 promotion: normalized performance OR scaled adjusted threshold.
         Option A: normalized_score >= promote bar (strategy-relative).
         Option B: raw >= min AND adjusted >= dynamically scaled threshold.
+        Option C: raw score >= TIER2_PROMOTE_SCORE (absolute bar, e.g. 80).
         """
+        if best.score < best.min_score:
+            return False
+        if best.score >= Config.TIER2_PROMOTE_SCORE:
+            return True
         promote = promote_normalized or Config.TIER2_PROMOTE_NORMALIZED
         if best.normalized_score >= promote:
             return True
-        if best.score < best.min_score:
-            return False
         required_adjusted = ScoringEngine.scaled_adjusted_threshold(
             best.min_score,
             promote,

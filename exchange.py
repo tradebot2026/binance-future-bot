@@ -987,19 +987,48 @@ class BinanceExchangeManager:
         self._position_cache.updated_at = time.monotonic()
         return open_positions
 
+    def _merge_ws_positions_into_cache(
+        self, ws_positions: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Merge WS snapshot into local cache without dropping seeded REST/cache rows."""
+        if not ws_positions:
+            return list(self._position_cache.positions)
+
+        by_key: dict[tuple[str, str], dict[str, Any]] = {
+            (
+                str(p.get("symbol", "")).upper(),
+                str(p.get("positionSide", "")).upper(),
+            ): dict(p)
+            for p in self._position_cache.positions
+        }
+        for pos in ws_positions:
+            key = (
+                str(pos.get("symbol", "")).upper(),
+                str(pos.get("positionSide", "")).upper(),
+            )
+            by_key[key] = pos
+        merged = list(by_key.values())
+        unrealized_total = sum(safe_float(p.get("unrealized_pnl")) for p in merged)
+        self._position_cache.positions = merged
+        self._position_cache.unrealized_pnl_total = unrealized_total
+        self._position_cache.updated_at = time.monotonic()
+        return merged
+
     def _refresh_positions_cache(self, force: bool = False) -> list[dict[str, Any]]:
         """Prefer user-data WebSocket; REST refresh throttled to ACCOUNT_REST_MIN_INTERVAL."""
         now = time.monotonic()
 
         if self._market_data and self._market_data.user_stream_has_account_data():
             ws_positions = self._market_data.get_ws_positions()
-            if ws_positions or not self._market_data.user_stream_is_stale():
-                self._position_cache.positions = ws_positions
+            if ws_positions:
                 self._position_cache.unrealized_pnl_total = (
                     self._market_data.get_ws_unrealized_pnl_total()
                 )
-                self._position_cache.updated_at = now
-                return ws_positions
+                return self._merge_ws_positions_into_cache(ws_positions)
+            if self._position_cache.positions:
+                return list(self._position_cache.positions)
+            if not self._market_data.user_stream_is_stale():
+                return []
 
         if not force and self._position_cache.is_valid():
             return self._position_cache.positions
@@ -1781,15 +1810,67 @@ class BinanceExchangeManager:
         self._all_positions_rest_data = parsed
         return parsed
 
+    def _mark_to_market_unrealized(self, positions: list[dict[str, Any]]) -> float:
+        """Estimate uPnL from mark/ticker when exchange-reported uPnL is missing."""
+        total = 0.0
+        for pos in positions:
+            reported = safe_float(pos.get("unrealized_pnl"))
+            if reported != 0:
+                total += reported
+                continue
+            symbol = str(pos.get("symbol", "")).upper()
+            side = str(pos.get("positionSide", "LONG")).upper()
+            entry = safe_float(pos.get("entry_price"))
+            qty = safe_float(pos.get("quantity"))
+            if qty <= 0 or entry <= 0:
+                continue
+            mark = safe_float(pos.get("mark_price"))
+            if mark <= 0:
+                mark = safe_float(self.get_mark_price(symbol, side))
+            if mark <= 0:
+                mark = safe_float(self.get_market_price(symbol, side))
+            if mark <= 0:
+                continue
+            if side == "LONG":
+                total += (mark - entry) * qty
+            else:
+                total += (entry - mark) * qty
+        return total
+
     def get_unrealized_pnl_total(self, force_refresh: bool = False) -> float:
-        """Sum unrealized PnL from the shared position cache."""
-        if self._market_data and self._market_data.user_stream_has_account_data():
+        """Sum unrealized PnL from positions; mark-to-market when WS reports zero."""
+        positions = self._refresh_positions_cache(force=force_refresh)
+        if self._market_data and self._market_data.get_ws_positions():
             ws_total = self._market_data.get_ws_unrealized_pnl_total()
-            if ws_total != 0 or self._market_data.get_ws_positions():
+            if ws_total != 0:
                 self._position_cache.unrealized_pnl_total = ws_total
                 return ws_total
-        self._refresh_positions_cache(force=force_refresh)
+
+        reported_total = sum(safe_float(p.get("unrealized_pnl")) for p in positions)
+        if reported_total != 0:
+            self._position_cache.unrealized_pnl_total = reported_total
+            return reported_total
+
+        estimated = self._mark_to_market_unrealized(positions)
+        if estimated != 0:
+            self._position_cache.unrealized_pnl_total = estimated
+            return estimated
         return self._position_cache.unrealized_pnl_total
+
+    def get_position_quantity_cached(
+        self, symbol: str, position_side: str
+    ) -> float:
+        """WS + local cache only — never blocks on REST (for TP/SL tick path)."""
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        if self._market_data:
+            ws_qty = self._market_data.get_ws_position_quantity(symbol, position_side)
+            if ws_qty > 0:
+                return ws_qty
+        for pos in self._position_cache.positions:
+            if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
+                return safe_float(pos.get("quantity"))
+        return 0.0
 
     def get_fill_price_from_order(
         self, symbol: str, order_response: dict[str, Any], fallback: float
@@ -1861,30 +1942,20 @@ class BinanceExchangeManager:
                     "unrealized_pnl": 0.0,
                 }
             )
+        self._position_cache.unrealized_pnl_total = sum(
+            safe_float(p.get("unrealized_pnl")) for p in self._position_cache.positions
+        )
         self._position_cache.updated_at = time.monotonic()
 
     def has_open_position(self, symbol: str, position_side: str) -> bool:
-        symbol = symbol.upper()
-        position_side = position_side.upper()
-        if self._market_data and self._market_data.user_stream_has_account_data():
-            if not self._market_data.user_stream_is_stale():
-                return (
-                    self._market_data.get_ws_position_quantity(symbol, position_side) > 0
-                )
-        for pos in self._refresh_positions_cache():
-            if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
-                return safe_float(pos.get("quantity")) > 0
-        return False
+        return self.get_position_quantity(symbol, position_side) > 0
 
     def get_position_quantity(self, symbol: str, position_side: str) -> float:
         symbol = symbol.upper()
         position_side = position_side.upper()
-        if self._market_data and self._market_data.user_stream_has_account_data():
-            ws_qty = self._market_data.get_ws_position_quantity(symbol, position_side)
-            if ws_qty > 0:
-                return ws_qty
-            if not self._market_data.user_stream_is_stale():
-                return 0.0
+        cached = self.get_position_quantity_cached(symbol, position_side)
+        if cached > 0:
+            return cached
         for pos in self._refresh_positions_cache():
             if pos.get("symbol") == symbol and pos.get("positionSide") == position_side:
                 return safe_float(pos.get("quantity"))

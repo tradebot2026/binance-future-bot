@@ -131,7 +131,31 @@ class AssignmentManager:
             )
             return True, False, None
 
+        self.log_tier2_rejection(best)
         return False, False, None
+
+    def log_tier2_rejection(self, best: StrategyScore) -> None:
+        scanner_logger.debug(
+            "Tier2 reject %s | strategy=%s raw=%.1f min=%.1f norm=%.1f "
+            "promote_raw=%.1f promote_norm=%.1f",
+            best.symbol,
+            best.strategy,
+            best.score,
+            best.min_score,
+            best.normalized_score,
+            Config.TIER2_PROMOTE_SCORE,
+            self._promote_normalized,
+        )
+
+    def near_miss_summary(self, limit: int = 10) -> list[tuple[str, str, float, float]]:
+        """Recent best scores not yet in Tier 2 (symbol, strategy, norm, raw)."""
+        rows: list[tuple[str, str, float, float]] = []
+        for sym, score in self._last_best.items():
+            if sym in self._tier2:
+                continue
+            rows.append((sym, score.strategy, score.normalized_score, score.score))
+        rows.sort(key=lambda row: (row[2], row[3]), reverse=True)
+        return rows[:limit]
 
     def gc_demoted(
         self,
