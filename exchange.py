@@ -23,7 +23,12 @@ from rest_rate_guard import (
 )
 from config import Config
 from core.rest_budget import RestBudgetManager, RestLane
-from exceptions import ExchangeError, ExchangeRateLimitError, OrderExecutionError
+from exceptions import (
+    ExchangeError,
+    ExchangeRateLimitError,
+    OrderExecutionError,
+    PositionAlreadyClosedError,
+)
 from logger import error_logger, system_logger, trade_logger
 from utils import amount_to_precision, round_step_size, safe_float
 
@@ -806,6 +811,12 @@ class BinanceExchangeManager:
                     self._last_account_rest_at = time.monotonic()
                 return result
             except BinanceAPIException as exc:
+                if exc.code == -2022 or "reduceonly order is rejected" in str(
+                    exc.message
+                ).lower():
+                    raise PositionAlreadyClosedError(
+                        str(exc.message), code=int(exc.code)
+                    ) from exc
                 if self._is_rate_limit_error(exc):
                     self._apply_rate_limit_halt(exc)
                     if self._is_account_rest_call(func):
@@ -2021,7 +2032,15 @@ class BinanceExchangeManager:
                 reduce_only,
             )
             return response
+        except PositionAlreadyClosedError:
+            raise
         except BinanceAPIException as exc:
+            if exc.code == -2022 or "reduceonly order is rejected" in str(
+                exc.message
+            ).lower():
+                raise PositionAlreadyClosedError(
+                    str(exc.message), code=int(exc.code)
+                ) from exc
             error_logger.error(
                 "Binance rejected order on %s: %s (code=%s)",
                 symbol,
@@ -2035,6 +2054,10 @@ class BinanceExchangeManager:
                     exc=exc,
                 )
             raise OrderExecutionError(exc.message) from exc
+        except ExchangeError as exc:
+            if PositionAlreadyClosedError.matches(exc):
+                raise PositionAlreadyClosedError(str(exc)) from exc
+            raise OrderExecutionError(str(exc)) from exc
         except BinanceOrderException as exc:
             if self._critical_alerts:
                 self._critical_alerts.notify(
@@ -2058,13 +2081,27 @@ class BinanceExchangeManager:
         position_side: str,
         quantity: float,
     ) -> Optional[dict[str, Any]]:
-        close_side = "SELL" if position_side.upper() == "LONG" else "BUY"
-        response = self.execute_futures_order(
-            symbol=symbol,
-            side=close_side,
-            position_side=position_side,
-            quantity=quantity,
-        )
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        live_qty = self.get_position_quantity_cached(symbol, position_side)
+        if live_qty <= 0:
+            live_qty = self.get_position_quantity(symbol, position_side)
+        if live_qty <= 0:
+            raise PositionAlreadyClosedError(
+                f"No open {position_side} position on {symbol} — skip reduce-only close."
+            )
+        close_qty = min(quantity, live_qty)
+        close_side = "SELL" if position_side == "LONG" else "BUY"
+        try:
+            response = self.execute_futures_order(
+                symbol=symbol,
+                side=close_side,
+                position_side=position_side,
+                quantity=close_qty,
+            )
+        except PositionAlreadyClosedError:
+            self.clear_position_cache(symbol, position_side)
+            raise
         self.invalidate_balance_cache()
         self.invalidate_position_cache()
         return response

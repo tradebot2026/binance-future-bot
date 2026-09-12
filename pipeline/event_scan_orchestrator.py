@@ -94,6 +94,39 @@ class EventScanOrchestrator:
         )
         return self._tier1_symbols
 
+    def maybe_refresh_tier1_periodic(self) -> None:
+        """Rebuild Tier-1 from live volume ranks on a fixed interval (default 30 min)."""
+        now = time.monotonic()
+        if not self._tier1_symbols:
+            self.refresh_tier1_universe(force=True)
+            return
+        if (
+            now - self._last_universe_refresh_at
+        ) < Config.TIER1_REFRESH_INTERVAL_SECONDS:
+            return
+
+        old_symbols = set(self._tier1_symbols)
+        self.refresh_tier1_universe(force=True)
+        new_symbols = set(self._tier1_symbols)
+        added = new_symbols - old_symbols
+        dropped = old_symbols - new_symbols
+        if added or dropped:
+            scanner_logger.info(
+                "Tier1 rotation — added=%s dropped=%s (refresh every %ss).",
+                len(added),
+                len(dropped),
+                Config.TIER1_REFRESH_INTERVAL_SECONDS,
+            )
+        if dropped:
+            open_symbols = {
+                str(t.get("symbol", "")).upper()
+                for t in self.db.get_open_trades()
+            }
+            self.assignment_manager.prune_outside_watchlist(
+                self._tier1_symbols,
+                open_symbols=open_symbols,
+            )
+
     def on_candle_close(self, symbol: str, timeframe: str, bar_open_ms: int) -> None:
         """WS callback — enqueue staggered evaluation."""
         if symbol.upper() not in {s.upper() for s in self._tier1_symbols}:
@@ -125,6 +158,7 @@ class EventScanOrchestrator:
             scanner_logger.warning("Event scan skipped — %s", reason)
             return []
 
+        self.maybe_refresh_tier1_periodic()
         if not self._tier1_symbols:
             self.refresh_tier1_universe()
 
@@ -152,6 +186,7 @@ class EventScanOrchestrator:
             scanner_logger.warning("Priority scan skipped — %s", reason)
             return []
 
+        self.maybe_refresh_tier1_periodic()
         if not self._tier1_symbols:
             self.refresh_tier1_universe()
 

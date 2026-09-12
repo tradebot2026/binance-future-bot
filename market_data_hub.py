@@ -462,6 +462,33 @@ class MarketDataHub:
                 self.refresh_ticker_cache_from_rest()
             if self._should_reconnect_for_stale_ticker():
                 self._request_reconnect("ticker stream stale — no events received")
+            if self._should_reconnect_for_stale_user_stream():
+                self._request_reconnect(
+                    "user data stream stale — no account events received"
+                )
+
+    def _should_reconnect_for_stale_user_stream(self) -> bool:
+        if not self.user_stream_is_stale():
+            return False
+        if self._rest_quiet_mode():
+            return False
+        if not self.user_stream_has_account_data():
+            return True
+        with self._lock:
+            has_open_positions = any(
+                safe_float(p.get("quantity")) > 0 for p in self._positions
+            )
+        if has_open_positions:
+            return True
+        if not self.ws_is_stale():
+            idle = time.monotonic() - self._last_user_event_at
+            if idle < Config.WS_USER_IDLE_RECONNECT_SECONDS:
+                return False
+        if Config.USE_TESTNET:
+            with self._lock:
+                if self._wallet_balances:
+                    return False
+        return True
 
     @staticmethod
     def _kline_socket_chunk_size() -> int:

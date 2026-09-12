@@ -165,6 +165,30 @@ class AssignmentManager:
         """Flush memory and WS resources for a demoted symbol."""
         flush_fn(symbol.upper())
 
+    def prune_outside_watchlist(
+        self,
+        tier1_symbols: set[str] | list[str],
+        *,
+        open_symbols: set[str] | list[str],
+    ) -> list[str]:
+        """Drop Tier-2 entries no longer in the Tier-1 watchlist (except open/frozen)."""
+        watchlist = {s.upper() for s in tier1_symbols}
+        open_set = {s.upper() for s in open_symbols}
+        removed: list[str] = []
+        for sym in list(self._tier2.keys()):
+            if sym in watchlist:
+                continue
+            assign = self._tier2[sym]
+            if assign.frozen or sym in open_set:
+                continue
+            del self._tier2[sym]
+            removed.append(sym)
+            scanner_logger.info(
+                "Tier2 demote %s — removed from Tier1 watchlist refresh.",
+                sym,
+            )
+        return removed
+
     def _qualifies_for_promotion(self, best: StrategyScore) -> bool:
         return ScoringEngine.qualifies_for_tier2(
             best,

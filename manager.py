@@ -6,8 +6,10 @@ dynamic break-even and TP-trailing stop loss, and exchange reconciliation.
 
 from __future__ import annotations
 
+import queue
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -21,19 +23,30 @@ from constants import (
 )
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
-from exceptions import OrderExecutionError
+from exceptions import OrderExecutionError, PositionAlreadyClosedError
 from logger import error_logger, trade_logger
 from reconciliation import (
     confirm_external_close_allowed,
     is_within_position_grace_period,
     position_reconcile_guard,
 )
-from utils import round_step_size, safe_float, utc_now, utc_today_str
+from utils import escape_html, round_step_size, safe_float, utc_now, utc_today_str
 
 if TYPE_CHECKING:
     from telegram_bot import TelegramManager
     from scheduler import DailyScheduler
     from risk_manager import RiskManager
+
+
+@dataclass
+class _CloseTask:
+    trade: dict[str, Any]
+    quantity: float
+    reason: str
+    partial: bool
+    tp_level: Optional[str] = None
+    result_event: Optional[threading.Event] = None
+    result_box: Optional[list[bool]] = None
 
 
 class TradeManager:
@@ -62,6 +75,9 @@ class TradeManager:
         self._tick_lock = threading.Lock()
         self._tick_event = threading.Event()
         self._monitor_stop = threading.Event()
+        self._close_queue: queue.Queue[Optional[_CloseTask]] = queue.Queue()
+        self._close_inflight: set[str] = set()
+        self._close_lock = threading.Lock()
         self._tick_worker = threading.Thread(
             target=self._price_tick_worker,
             name="price-tick-worker",
@@ -72,8 +88,14 @@ class TradeManager:
             name="tp-sl-fast-monitor",
             daemon=True,
         )
+        self._close_worker = threading.Thread(
+            target=self._close_worker_loop,
+            name="close-order-worker",
+            daemon=True,
+        )
         self._tick_worker.start()
         self._fast_monitor.start()
+        self._close_worker.start()
 
     def note_open_symbol(self, symbol: str) -> None:
         """Register a symbol for immediate WS tick monitoring after entry."""
@@ -292,6 +314,8 @@ class TradeManager:
         fresh = self.db.get_trade(trade["trade_id"])
         if fresh:
             trade = fresh
+        if trade.get("status") == TRADE_STATUS_CLOSED:
+            return
 
         if is_range_strategy(str(trade.get("strategy", ""))):
             if self._check_range_hard_exits(trade, price):
@@ -636,11 +660,27 @@ class TradeManager:
         self.db.update_trade(trade["trade_id"], {"metadata": metadata})
         trade["metadata"] = metadata
 
-        if not self._close_position(trade, quantity=close_qty, reason=reason, partial=True):
-            metadata[executed_key] = False
-            self.db.update_trade(trade["trade_id"], {"metadata": metadata})
+        self._close_position(
+            trade,
+            quantity=close_qty,
+            reason=reason,
+            partial=True,
+            tp_level=level,
+        )
+
+    def _finalize_take_profit(
+        self,
+        trade: dict[str, Any],
+        level: str,
+        reason: str,
+    ) -> None:
+        fresh = self.db.get_trade(trade["trade_id"])
+        if fresh:
+            trade = fresh
+        if trade.get("status") == TRADE_STATUS_CLOSED:
             return
 
+        metadata = self.db.parse_trade_metadata(trade)
         updates: dict[str, Any] = {"metadata": metadata}
         new_sl: Optional[float] = None
 
@@ -668,7 +708,6 @@ class TradeManager:
             updates["status"] = TRADE_STATUS_CLOSED
 
         self.db.update_trade(trade["trade_id"], updates)
-        trade.update(updates)
 
         if self.telegram:
             self.telegram.send_tp_level_alert(
@@ -677,6 +716,59 @@ class TradeManager:
                 reason=reason,
                 new_sl=new_sl,
             )
+
+    def _rollback_tp_lock(self, trade: dict[str, Any], level: str) -> None:
+        executed_key = f"{level.lower()}_executed"
+        metadata = self.db.parse_trade_metadata(trade)
+        metadata[executed_key] = False
+        self.db.update_trade(trade["trade_id"], {"metadata": metadata})
+        trade_logger.warning(
+            "[%s] %s close failed — released TP lock for retry.",
+            trade.get("symbol"),
+            level,
+        )
+
+    def _close_worker_loop(self) -> None:
+        """Run close orders and retries off the TP/SL monitor threads."""
+        while not self._monitor_stop.is_set():
+            try:
+                task = self._close_queue.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            if task is None:
+                break
+            trade_id = str(task.trade.get("trade_id", ""))
+            try:
+                ok = self._execute_close_order(
+                    task.trade,
+                    task.quantity,
+                    task.reason,
+                    partial=task.partial,
+                )
+                if task.tp_level:
+                    if ok:
+                        self._finalize_take_profit(task.trade, task.tp_level, task.reason)
+                    else:
+                        self._rollback_tp_lock(task.trade, task.tp_level)
+                if task.result_box is not None:
+                    task.result_box[0] = ok
+            except Exception as exc:
+                error_logger.error(
+                    "Close worker failed for %s: %s",
+                    task.trade.get("symbol", "?"),
+                    exc,
+                    exc_info=True,
+                )
+                if task.tp_level:
+                    self._rollback_tp_lock(task.trade, task.tp_level)
+                if task.result_box is not None:
+                    task.result_box[0] = False
+            finally:
+                with self._close_lock:
+                    self._close_inflight.discard(trade_id)
+                if task.result_event is not None:
+                    task.result_event.set()
+                self._close_queue.task_done()
 
     def _apply_trailing_stop(
         self,
@@ -758,24 +850,112 @@ class TradeManager:
         self,
         trade: dict[str, Any],
         requested_qty: float,
+        *,
+        exchange_only: bool = True,
     ) -> float:
-        """Clamp requested quantity to live position size with step-size rounding."""
+        """Clamp requested quantity to live exchange position size."""
         symbol = trade["symbol"]
         position_side = trade.get("side", "LONG")
         rules = self.exchange.get_symbol_rules(symbol)
 
         live_qty = self.exchange.get_position_quantity_cached(symbol, position_side)
         if live_qty <= 0:
-            live_qty = self._trade_quantity_from_db(trade)
-        if live_qty <= 0:
             live_qty = self.exchange.get_position_quantity(symbol, position_side)
+        if live_qty <= 0 and not exchange_only:
+            live_qty = self._trade_quantity_from_db(trade)
         if live_qty <= 0:
             return 0.0
 
         qty = min(requested_qty, live_qty)
         return round_step_size(qty, rules.step_size, rules.quantity_precision)
 
+    def _reconcile_exchange_flat(
+        self,
+        trade: dict[str, Any],
+        reason: str,
+        *,
+        exit_reason: str = "RECONCILED_REDUCE_ONLY",
+    ) -> bool:
+        """Mark trade closed when the exchange has no open position."""
+        symbol = str(trade.get("symbol", ""))
+        position_side = str(trade.get("side", "LONG")).upper()
+        exit_price = safe_float(
+            self.exchange.get_market_price(symbol, position_side)
+        )
+        trade_logger.warning(
+            "[%s] Exchange flat — purging local trade | trigger=%s | exit_reason=%s",
+            symbol,
+            reason,
+            exit_reason,
+        )
+        self.exchange.clear_position_cache(symbol, position_side)
+        position_reconcile_guard.note_present(str(trade["trade_id"]))
+        if self.telegram:
+            self.telegram.send_message(
+                f"🔄 <b>{escape_html(symbol)}</b> synced: Already closed on exchange "
+                f"(ReduceOnly rejected)."
+            )
+        self._mark_trade_closed(
+            trade,
+            reason=exit_reason,
+            exit_price=exit_price,
+            notify=False,
+        )
+        return True
+
     def _close_position(
+        self,
+        trade: dict[str, Any],
+        quantity: float,
+        reason: str,
+        partial: bool = False,
+        *,
+        tp_level: Optional[str] = None,
+        blocking: bool = False,
+    ) -> bool:
+        """Enqueue close for monitor paths; blocking=True waits for close-all/manual."""
+        symbol = trade["symbol"]
+        trade_id = str(trade["trade_id"])
+
+        close_qty = self._resolve_close_quantity(trade, quantity, exchange_only=True)
+        if close_qty <= 0:
+            return self._reconcile_exchange_flat(trade, reason)
+
+        with self._close_lock:
+            if trade_id in self._close_inflight:
+                return True
+            self._close_inflight.add(trade_id)
+
+        task = _CloseTask(
+            trade=trade,
+            quantity=close_qty,
+            reason=reason,
+            partial=partial,
+            tp_level=tp_level,
+        )
+        if blocking:
+            task.result_event = threading.Event()
+            task.result_box = [False]
+            self._close_queue.put(task)
+            timeout = (
+                self.CLOSE_ORDER_MAX_RETRIES
+                * self.CLOSE_ORDER_RETRY_DELAY_SECONDS
+                * 3
+                + 15.0
+            )
+            if not task.result_event.wait(timeout=timeout):
+                error_logger.warning(
+                    "Blocking close timed out for %s (%s) after %.0fs.",
+                    symbol,
+                    reason,
+                    timeout,
+                )
+            return bool(task.result_box[0])
+
+        self._close_queue.put(task)
+        return True
+
+    def _execute_close_order(
         self,
         trade: dict[str, Any],
         quantity: float,
@@ -785,20 +965,7 @@ class TradeManager:
         symbol = trade["symbol"]
         position_side = trade.get("side", "LONG")
         trade_id = trade["trade_id"]
-
-        close_qty = self._resolve_close_quantity(trade, quantity)
-        if close_qty <= 0:
-            if self._defer_external_close(trade, symbol):
-                return False
-            self._mark_trade_closed(
-                trade,
-                reason="RECONCILED_EXTERNAL_CLOSE",
-                exit_price=safe_float(
-                    self.exchange.get_market_price(symbol, position_side)
-                ),
-            )
-            position_reconcile_guard.note_present(str(trade["trade_id"]))
-            return False
+        close_qty = quantity
 
         try:
             response: Optional[dict[str, Any]] = None
@@ -811,7 +978,17 @@ class TradeManager:
                             quantity=close_qty,
                         )
                     break
+                except PositionAlreadyClosedError as exc:
+                    trade_logger.warning(
+                        "[%s] ReduceOnly rejected (-2022) — exchange flat | reason=%s | %s",
+                        symbol,
+                        reason,
+                        exc,
+                    )
+                    return self._reconcile_exchange_flat(trade, reason)
                 except OrderExecutionError as exc:
+                    if PositionAlreadyClosedError.matches(exc):
+                        return self._reconcile_exchange_flat(trade, reason)
                     if attempt >= self.CLOSE_ORDER_MAX_RETRIES - 1:
                         error_logger.error(
                             "Close order failed for %s (%s) after %s attempts: %s",
@@ -832,7 +1009,17 @@ class TradeManager:
                         exc,
                     )
                     time.sleep(delay)
+        except PositionAlreadyClosedError as exc:
+            trade_logger.warning(
+                "[%s] ReduceOnly rejected (-2022) — exchange flat | reason=%s | %s",
+                symbol,
+                reason,
+                exc,
+            )
+            return self._reconcile_exchange_flat(trade, reason)
         except OrderExecutionError as exc:
+            if PositionAlreadyClosedError.matches(exc):
+                return self._reconcile_exchange_flat(trade, reason)
             error_logger.error("Close order failed for %s (%s): %s", symbol, reason, exc)
             return False
 
@@ -896,6 +1083,8 @@ class TradeManager:
         trade: dict[str, Any],
         reason: str,
         exit_price: float,
+        *,
+        notify: bool = True,
     ) -> None:
         trade_id = trade["trade_id"]
         symbol = trade["symbol"]
@@ -941,7 +1130,7 @@ class TradeManager:
             safe_float(trade.get("pnl")),
         )
 
-        if self.telegram:
+        if notify and self.telegram:
             self.telegram.send_close_alert(
                 symbol=symbol,
                 reason=reason,
@@ -1016,6 +1205,7 @@ class TradeManager:
                     trade,
                     quantity=self._remaining_close_quantity(trade),
                     reason=reason,
+                    blocking=True,
                 )
                 if ok:
                     closed.append(f"{symbol} {position_side}")
