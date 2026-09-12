@@ -350,13 +350,9 @@ def _execute_candidates(
 
 def _write_bot_heartbeat(cycle: int) -> None:
     """Touch heartbeat file for watchdog.py process health checks."""
-    try:
-        os.makedirs(Config.DATA_DIR, exist_ok=True)
-        payload = {"timestamp": time.time(), "cycle": cycle}
-        with open(Config.WATCHDOG_HEARTBEAT_FILE, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
-    except OSError as exc:
-        system_logger.debug("Heartbeat file write failed: %s", exc)
+    from core.ops_heartbeat import write_bot_heartbeat
+
+    write_bot_heartbeat(cycle=cycle, source="main_loop")
 
 
 def _start_position_monitor(

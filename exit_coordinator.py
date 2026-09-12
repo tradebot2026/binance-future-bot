@@ -25,31 +25,59 @@ def _claim_path(trade_id: str) -> str:
     return os.path.join(_claims_dir(), f"{safe_id}.json")
 
 
+def _read_claim(path: str) -> Optional[dict]:
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return None
+
+
 def claim_exit(trade_id: str, owner: str, *, ttl_seconds: Optional[int] = None) -> bool:
     """
-    Try to acquire exclusive exit rights for a trade.
+    Try to acquire exclusive exit rights for a trade (cross-process mutex).
     Returns True if claim acquired or refreshed by same owner.
     """
     ttl = ttl_seconds or Config.EXIT_CLAIM_TTL_SECONDS
     path = _claim_path(trade_id)
     now = time.time()
+    payload = {"owner": owner, "timestamp": now, "trade_id": trade_id}
+    encoded = json.dumps(payload)
 
     if os.path.isfile(path):
-        try:
-            with open(path, encoding="utf-8") as handle:
-                data = json.load(handle)
+        data = _read_claim(path)
+        if data:
             existing_owner = str(data.get("owner", ""))
             ts = float(data.get("timestamp", 0))
             if (now - ts) < ttl and existing_owner and existing_owner != owner:
                 return False
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            pass
 
-    payload = {"owner": owner, "timestamp": now, "trade_id": trade_id}
     try:
-        with open(path, "w", encoding="utf-8") as handle:
-            json.dump(payload, handle)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        fd = os.open(path, flags)
+        try:
+            os.write(fd, encoded.encode("utf-8"))
+        finally:
+            os.close(fd)
         return True
+    except FileExistsError:
+        data = _read_claim(path)
+        if not data:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            return claim_exit(trade_id, owner, ttl_seconds=ttl)
+        existing_owner = str(data.get("owner", ""))
+        ts = float(data.get("timestamp", 0))
+        if existing_owner == owner or (now - ts) >= ttl:
+            try:
+                with open(path, "w", encoding="utf-8") as handle:
+                    handle.write(encoded)
+                return True
+            except OSError:
+                return False
+        return False
     except OSError:
         return False
 

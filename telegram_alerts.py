@@ -54,12 +54,29 @@ def _build_exchange_position_map(
     return pos_map, source
 
 
+def format_daily_stats_footer(db: DatabaseManager, date_str: str) -> str:
+    """Compact realized-PnL / win-rate line sourced from closed trades in DB."""
+    db.sync_daily_stats_from_trades(date_str)
+    analytics = db.get_daily_trade_analytics(date_str)
+    pf = analytics.get("profit_factor", 0.0)
+    pf_display = "∞" if pf == float("inf") else f"{pf:.2f}"
+    return (
+        f"\n📊 <b>Today</b> | Realized: ${safe_float(analytics.get('total_pnl')):.2f} | "
+        f"Closes: {int(analytics.get('closes', 0))} | "
+        f"Win: {analytics.get('win_rate', 0.0):.1f}% "
+        f"({analytics.get('wins', 0)}W/{analytics.get('losses', 0)}L) | "
+        f"PF: {pf_display}"
+    )
+
+
 def format_active_positions_message(
     db: DatabaseManager,
     exchange: Any,
     telegram: Any = None,
 ) -> str:
     """Format /active — reconcile DB vs Binance then list verified open trades."""
+    from utils import utc_today_str
+
     sync_summary = sync_active_trades_on_demand(
         exchange,
         db,
@@ -67,14 +84,20 @@ def format_active_positions_message(
         force_rest=True,
     )
     trades = db.get_open_trades()
+    stats_footer = format_daily_stats_footer(db, utc_today_str())
     if not trades:
         closed_n = len(sync_summary.get("closed", []))
         if closed_n:
             return (
                 "📭 <b>Active Positions</b>\n"
                 f"<i>Synced with exchange — {closed_n} stale DB trade(s) purged.</i>"
+                f"{stats_footer}"
             )
-        return "📭 <b>Active Positions</b>\n<i>No open trades in database.</i>"
+        return (
+            "📭 <b>Active Positions</b>\n"
+            "<i>No open trades in database.</i>"
+            f"{stats_footer}"
+        )
 
     pos_map, source = _build_exchange_position_map(exchange, force_rest=True)
     lines = [
@@ -149,6 +172,8 @@ def format_active_positions_message(
         for (sym, side), pos in pos_map.items()
         if (sym, side) not in tracked_keys
     ]
+    lines.append(format_daily_stats_footer(db, utc_today_str()))
+
     if orphans:
         lines.append(f"🚨 <b>Untracked on exchange ({len(orphans)})</b>")
         for sym, side, pos in orphans[:5]:

@@ -120,13 +120,18 @@ class PositionWatchdog:
 
     def run(self) -> None:
         watchdog_logger.info(
-            "Watchdog started | interval=%ss | breach_grace=%ss | main_stale=%ss",
+            "Watchdog started | interval=%ss | breach_grace=%ss | main_stale=%ss | "
+            "auto_restart=%s | emergency_only_when_main_down=%s",
             Config.WATCHDOG_INTERVAL_SECONDS,
             Config.WATCHDOG_BREACH_GRACE_SECONDS,
             Config.WATCHDOG_MAIN_STALE_SECONDS,
+            Config.WATCHDOG_AUTO_RESTART_MAIN,
+            Config.WATCHDOG_EMERGENCY_ONLY_WHEN_MAIN_DOWN,
         )
         self.telegram.send_message(
-            "🛡 <b>Watchdog online</b> — monitoring open positions independently."
+            "🛡 <b>Watchdog online</b> — safety net active.\n"
+            f"<i>Auto-restart main: {'ON' if Config.WATCHDOG_AUTO_RESTART_MAIN else 'OFF'} | "
+            f"Emergency close when main stalled &gt; {Config.WATCHDOG_MAIN_STALE_SECONDS}s</i>"
         )
 
         while self._running:
@@ -341,10 +346,14 @@ class PositionWatchdog:
                 main_bot_healthy,
             )
 
-            grace = Config.WATCHDOG_BREACH_GRACE_SECONDS
-            if not main_bot_healthy:
-                grace = max(grace // 2, 30)
+            if Config.WATCHDOG_EMERGENCY_ONLY_WHEN_MAIN_DOWN and main_bot_healthy:
+                watchdog_logger.debug(
+                    "[%s] Breach observed but main bot healthy — deferring to soft monitor.",
+                    symbol,
+                )
+                continue
 
+            grace = Config.WATCHDOG_BREACH_GRACE_SECONDS
             if age < grace:
                 continue
 
@@ -464,12 +473,18 @@ class PositionWatchdog:
         finally:
             release_exit(trade_id, "watchdog")
 
+        stale = self.main_bot_stale_seconds()
+        stale_note = (
+            f"Main heartbeat stale {stale:.0f}s."
+            if stale is not None
+            else "Main process/heartbeat unavailable."
+        )
         self.telegram.send_message(
             "🛡 <b>Watchdog Emergency Close</b>\n"
             f"Pair: <b>{escape_html(symbol)}</b> {escape_html(side)}\n"
             f"Level: <b>{escape_html(signal.level)}</b> ({escape_html(signal.reason)})\n"
             f"Mark: {mark_price:.6f} | Qty: {close_qty}\n"
-            f"<i>Main bot inactive — watchdog executed market close.</i>"
+            f"<i>{escape_html(stale_note)} Watchdog executed reduce-only market close.</i>"
         )
 
     def _apply_post_close_db(

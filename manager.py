@@ -25,7 +25,7 @@ from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from exceptions import OrderExecutionError, PositionAlreadyClosedError
 from logger import error_logger, trade_logger
-from exit_coordinator import claim_exit, release_exit
+from exit_coordinator import claim_exit, exit_claim_active, release_exit
 from reconciliation import (
     confirm_external_close_allowed,
     is_within_position_grace_period,
@@ -149,9 +149,12 @@ class TradeManager:
 
     def _fast_monitor_loop(self) -> None:
         """Dedicated 1s TP/SL loop — never waits on REST."""
+        from core.ops_heartbeat import write_bot_heartbeat
+
         while not self._monitor_stop.wait(1.0):
             try:
                 self.monitor_open_trades(ws_only=True)
+                write_bot_heartbeat(source="position_monitor")
             except Exception as exc:
                 error_logger.error("Fast TP/SL monitor error: %s", exc, exc_info=True)
 
@@ -1091,7 +1094,7 @@ class TradeManager:
         with self._close_lock:
             if inflight_key in self._close_inflight:
                 return True
-            if not claim_exit(trade_id, "main"):
+            if exit_claim_active(trade_id) or not claim_exit(trade_id, "main"):
                 trade_logger.debug(
                     "[%s] Close deferred — exit claim held by another process.",
                     symbol,

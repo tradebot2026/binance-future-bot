@@ -43,7 +43,18 @@ def log_execution_rejected(symbol: str, reason: str, *, strategy: str = "") -> N
     """Explicit WARNING when an approved signal fails at execution gates."""
     symbol_key = symbol.upper()
     reason_lower = reason.lower()
-    if "position already open" in reason_lower:
+    blocked_patterns = (
+        "position already open",
+        "active db trade",
+        "entry gate closed",
+        "symbol on cooldown",
+        "open position on",
+        "exchange rest confirms",
+        "entries paused",
+        "max open positions",
+        "max daily entries",
+    )
+    if any(pattern in reason_lower for pattern in blocked_patterns):
         suppress_key = symbol_key
     else:
         suppress_key = f"{symbol_key}:{reason}"
