@@ -340,22 +340,34 @@ class TelegramManager:
                 return
 
             analytics = self.db.get_daily_trade_analytics(today)
+            if self.scheduler:
+                analytics = {
+                    "wins": stats.get("wins", analytics.get("wins", 0)),
+                    "losses": stats.get("losses", analytics.get("losses", 0)),
+                    "win_rate": stats.get("win_rate", analytics.get("win_rate", 0.0)),
+                    "profit_factor": stats.get(
+                        "profit_factor", analytics.get("profit_factor", 0.0)
+                    ),
+                    "total_pnl": stats.get("total_pnl", analytics.get("total_pnl", 0.0)),
+                    "closes": stats.get("trades_count", analytics.get("closes", 0)),
+                }
             pf = analytics.get("profit_factor", 0.0)
             pf_display = "∞" if pf == float("inf") else f"{pf:.2f}"
+            realized_pnl = safe_float(analytics.get("total_pnl", stats.get("total_pnl")))
 
             msg = (
                 f"📊 <b>Daily Status ({escape_html(today)})</b>\n\n"
                 f"💰 <b>Reference:</b> ${safe_float(stats.get('start_balance')):.2f}\n"
                 f"💵 <b>Balance:</b> ${safe_float(stats.get('current_balance')):.2f}\n"
-                f"📈 <b>Realized PnL:</b> ${safe_float(stats.get('total_pnl')):.2f}\n"
-                f"📊 <b>Total PnL:</b> ${safe_float(stats.get('computed_total_pnl', stats.get('total_pnl'))):.2f} "
+                f"📈 <b>Realized PnL:</b> ${realized_pnl:.2f}\n"
+                f"📊 <b>Total PnL:</b> ${safe_float(stats.get('computed_total_pnl', realized_pnl)):.2f} "
                 f"({safe_float(stats.get('computed_pnl_percent', 0)):.2f}%)\n"
                 f"📉 <b>Unrealized:</b> ${safe_float(stats.get('unrealized_pnl', 0)):.2f}\n"
                 f"🏆 <b>Win Rate:</b> {analytics.get('win_rate', 0.0):.1f}% "
                 f"({analytics.get('wins', 0)}W / {analytics.get('losses', 0)}L)\n"
                 f"📐 <b>Profit Factor:</b> {pf_display}\n"
                 f"🆕 <b>Entries:</b> {int(stats.get('entries_count', 0))}/{Config.MAX_DAILY_TRADES}\n"
-                f"🔄 <b>Closes:</b> {int(stats.get('trades_count', 0))}\n"
+                f"🔄 <b>Closes:</b> {int(analytics.get('closes', stats.get('trades_count', 0)))}\n"
                 f"⚙️ <b>Status:</b> {escape_html(str(stats.get('status', 'UNKNOWN')))}"
             )
             self.bot.reply_to(message, msg)

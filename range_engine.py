@@ -13,10 +13,11 @@ import pandas as pd
 from config import Config
 from constants import STRATEGY_RANGE_REVERSION
 from smc_engine import (
-    resolve_confirm_trend,
-    resolve_macro_trend,
     check_bearish_expansion_veto,
     check_momentum_crash_veto,
+    compute_rr_ladder,
+    resolve_confirm_trend,
+    resolve_macro_trend,
 )
 from utils import safe_float
 
@@ -205,7 +206,7 @@ def compute_range_sl_tp(
     atr: float,
     meta: RangeMetadata,
 ) -> tuple[float, float, float, float]:
-    """Tight range SL beyond boundary; TPs toward equilibrium and opposite edge."""
+    """Range boundary SL + R-multiple TP ladder anchored to execution entry."""
     buffer = atr * Config.SL_BUFFER_ATR
     max_dist = atr * Config.MAX_SL_ATR_MULTIPLIER
 
@@ -213,23 +214,27 @@ def compute_range_sl_tp(
         boundary_sl = meta.range_low - buffer
         sl = min(boundary_sl, entry_price - buffer)
         sl = max(sl, entry_price - max_dist)
-        tp1 = meta.equilibrium
-        tp2 = meta.equilibrium + (meta.range_high - meta.equilibrium) * 0.5
-        tp3 = meta.range_high - buffer
     else:
         boundary_sl = meta.range_high + buffer
         sl = max(boundary_sl, entry_price + buffer)
         sl = min(sl, entry_price + max_dist)
-        tp1 = meta.equilibrium
-        tp2 = meta.equilibrium - (meta.equilibrium - meta.range_low) * 0.5
-        tp3 = meta.range_low + buffer
 
-    r = abs(entry_price - sl)
-    if r > 0:
-        if action == "LONG":
-            tp1 = max(tp1, entry_price + r * Config.TP1_R_MULTIPLE)
-        else:
-            tp1 = min(tp1, entry_price - r * Config.TP1_R_MULTIPLE)
+    sl, tp1, tp2, tp3 = compute_rr_ladder(action, entry_price, sl)
+
+    if action == "LONG" and meta.range_high > entry_price:
+        cap = meta.range_high - buffer
+        if cap > entry_price:
+            if tp3 > 0:
+                tp3 = min(tp3, cap)
+            else:
+                tp3 = cap
+    elif action == "SHORT" and meta.range_low > 0 and meta.range_low < entry_price:
+        cap = meta.range_low + buffer
+        if cap < entry_price:
+            if tp3 > 0:
+                tp3 = max(tp3, cap)
+            else:
+                tp3 = cap
 
     return sl, tp1, tp2, tp3
 

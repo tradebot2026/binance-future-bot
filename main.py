@@ -7,6 +7,8 @@ Includes auto-restart on recoverable failures.
 
 from __future__ import annotations
 
+import json
+import os
 import threading
 import time
 import traceback
@@ -346,6 +348,17 @@ def _execute_candidates(
             continue
 
 
+def _write_bot_heartbeat(cycle: int) -> None:
+    """Touch heartbeat file for watchdog.py process health checks."""
+    try:
+        os.makedirs(Config.DATA_DIR, exist_ok=True)
+        payload = {"timestamp": time.time(), "cycle": cycle}
+        with open(Config.WATCHDOG_HEARTBEAT_FILE, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+    except OSError as exc:
+        system_logger.debug("Heartbeat file write failed: %s", exc)
+
+
 def _start_position_monitor(
     manager: TradeManager,
     stop_event: threading.Event,
@@ -674,6 +687,7 @@ def main(controller: Optional[BotController] = None) -> str:
                         snap.unrealized_pnl,
                         snap.drawdown_percent,
                     )
+                    _write_bot_heartbeat(cycle)
                     last_heartbeat = now
 
                 consecutive_errors = 0

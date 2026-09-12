@@ -36,8 +36,24 @@ from utils import (
 )
 
 
+_REJECT_LOG_AT: dict[str, float] = {}
+
+
 def log_execution_rejected(symbol: str, reason: str, *, strategy: str = "") -> None:
     """Explicit WARNING when an approved signal fails at execution gates."""
+    symbol_key = symbol.upper()
+    reason_lower = reason.lower()
+    if "position already open" in reason_lower:
+        suppress_key = symbol_key
+    else:
+        suppress_key = f"{symbol_key}:{reason}"
+    now = time.monotonic()
+    interval = max(Config.CONFLICT_REJECT_LOG_INTERVAL_SECONDS, 60)
+    last = _REJECT_LOG_AT.get(suppress_key, 0.0)
+    if (now - last) < interval:
+        return
+    _REJECT_LOG_AT[suppress_key] = now
+
     suffix = f" | strategy={strategy}" if strategy else ""
     trade_logger.warning(
         "[EXECUTION_REJECTED] %s - Reason: %s%s",
@@ -71,6 +87,115 @@ class TradeExecutor:
                 f"short_sl_must_be_above_entry entry={entry_price:.6f} sl={sl_price:.6f}",
             )
         return True, "ok"
+
+    def _validate_tp_ladder(
+        self,
+        action: str,
+        entry_price: float,
+        tp1: float,
+        tp2: float,
+        tp3: float,
+    ) -> tuple[bool, str]:
+        """Ensure take-profit rungs are on the profitable side of entry."""
+        if action == "LONG":
+            for label, tp in (("TP1", tp1), ("TP2", tp2), ("TP3", tp3)):
+                if tp > 0 and tp <= entry_price:
+                    return (
+                        False,
+                        f"long_{label.lower()}_must_be_above_entry "
+                        f"entry={entry_price:.6f} {label.lower()}={tp:.6f}",
+                    )
+            if tp1 > 0 and tp2 > 0 and tp2 <= tp1:
+                return False, "long_tp2_must_be_above_tp1"
+            if tp2 > 0 and tp3 > 0 and tp3 <= tp2:
+                return False, "long_tp3_must_be_above_tp2"
+        else:
+            for label, tp in (("TP1", tp1), ("TP2", tp2), ("TP3", tp3)):
+                if tp > 0 and tp >= entry_price:
+                    return (
+                        False,
+                        f"short_{label.lower()}_must_be_below_entry "
+                        f"entry={entry_price:.6f} {label.lower()}={tp:.6f}",
+                    )
+            if tp1 > 0 and tp2 > 0 and tp2 >= tp1:
+                return False, "short_tp2_must_be_below_tp1"
+            if tp2 > 0 and tp3 > 0 and tp3 >= tp2:
+                return False, "short_tp3_must_be_below_tp2"
+        return True, "ok"
+
+    def _resolve_execution_levels(
+        self,
+        action: str,
+        execution_price: float,
+        atr: float,
+        rules: SymbolRules,
+        structure: dict[str, Any],
+        strategy: str,
+    ) -> Optional[tuple[float, float, float, float]]:
+        """Compute SL/TP strictly from the confirmed execution entry price."""
+        if execution_price <= 0 or atr <= 0:
+            return None
+
+        range_mode = is_range_strategy(strategy)
+        if range_mode:
+            rmeta = RangeMetadata()
+            for key, value in structure.items():
+                if hasattr(rmeta, key):
+                    setattr(rmeta, key, value)
+            sl, tp1, tp2, tp3 = compute_range_sl_tp(
+                action, execution_price, atr, rmeta
+            )
+            sl = round_step_size(sl, rules.tick_size, rules.price_precision)
+            tp1 = round_step_size(tp1, rules.tick_size, rules.price_precision)
+            tp2 = round_step_size(tp2, rules.tick_size, rules.price_precision)
+            tp3 = round_step_size(tp3, rules.tick_size, rules.price_precision)
+        else:
+            sl, tp1, tp2, tp3 = self.calculate_sl_tp(
+                action, execution_price, atr, rules, structure=structure
+            )
+
+        sl_ok, sl_reason = self._validate_stop_loss(action, execution_price, sl)
+        if not sl_ok:
+            return None
+        tp_ok, tp_reason = self._validate_tp_ladder(
+            action, execution_price, tp1, tp2, tp3
+        )
+        if not tp_ok:
+            error_logger.error(
+                "Invalid TP ladder for %s %s at entry %.6f — %s",
+                strategy,
+                action,
+                execution_price,
+                tp_reason,
+            )
+            return None
+        return sl, tp1, tp2, tp3
+
+    def _apply_execution_levels(
+        self,
+        *,
+        trade_id: str,
+        fill_price: float,
+        sl: float,
+        tp1: float,
+        tp2: float,
+        tp3: float,
+        metadata: dict[str, Any],
+    ) -> None:
+        """Persist entry-linked SL/TP after fill or entry-price refinement."""
+        metadata["best_price"] = fill_price
+        metadata["r_distance"] = abs(fill_price - sl)
+        self.db.update_trade(
+            trade_id,
+            {
+                "entry_price": fill_price,
+                "stop_loss": sl,
+                "take_profit_1": tp1,
+                "take_profit_2": tp2,
+                "take_profit_3": tp3,
+                "metadata": metadata,
+            },
+        )
 
     def calculate_sl_tp(
         self,
@@ -311,6 +436,60 @@ class TradeExecutor:
         except OSError as exc:
             error_logger.error("Failed to write orphan fill recovery file: %s", exc)
 
+    def _place_native_exit_orders(
+        self,
+        *,
+        trade_id: str,
+        symbol: str,
+        position_side: str,
+        sl: float,
+        tp1: float,
+        tp2: float,
+        tp3: float,
+        metadata: dict[str, Any],
+        quantity: float,
+    ) -> None:
+        """Place exchange-native STOP_MARKET + TAKE_PROFIT_MARKET bracket after entry."""
+        tp_specs: list[tuple[str, float, float]] = []
+        if Config.ENABLE_PARTIAL_TP:
+            tp_specs = [
+                ("TP1", tp1, safe_float(metadata.get("tp1_quantity"))),
+                ("TP2", tp2, safe_float(metadata.get("tp2_quantity"))),
+                ("TP3", tp3, safe_float(metadata.get("tp3_quantity"))),
+            ]
+        else:
+            tp_specs = [("TP3", tp3, quantity)]
+
+        try:
+            order_map = self.exchange.place_native_exit_bracket(
+                symbol=symbol,
+                position_side=position_side,
+                sl_price=sl,
+                tp_specs=tp_specs,
+            )
+            metadata["native_orders_placed"] = bool(order_map)
+            metadata["native_sl_order_id"] = order_map.get("SL")
+            metadata["native_tp_order_ids"] = {
+                k: v for k, v in order_map.items() if k != "SL"
+            }
+            self.db.update_trade(trade_id, {"metadata": metadata})
+            trade_logger.info(
+                "Native TP/SL bracket placed | %s %s | SL=%.6f | orders=%s",
+                symbol,
+                position_side,
+                sl,
+                list(order_map.keys()),
+            )
+        except Exception as exc:
+            metadata["native_orders_placed"] = False
+            self.db.update_trade(trade_id, {"metadata": metadata})
+            error_logger.warning(
+                "Native TP/SL placement failed for %s %s — soft monitor fallback active: %s",
+                symbol,
+                position_side,
+                exc,
+            )
+
     def execute_trade(
         self,
         symbol: str,
@@ -383,34 +562,25 @@ class TradeExecutor:
         structure = structure_metadata or {}
         range_mode = is_range_strategy(strategy)
 
-        if range_mode:
-            rmeta = RangeMetadata()
-            for key, value in structure.items():
-                if hasattr(rmeta, key):
-                    setattr(rmeta, key, value)
-            sl, tp1, tp2, tp3 = compute_range_sl_tp(action, current_price, atr, rmeta)
-            sl = round_step_size(sl, rules.tick_size, rules.price_precision)
-            tp1 = round_step_size(tp1, rules.tick_size, rules.price_precision)
-            tp2 = round_step_size(tp2, rules.tick_size, rules.price_precision)
-            tp3 = round_step_size(tp3, rules.tick_size, rules.price_precision)
-            sl_ok, sl_reason = self._validate_stop_loss(action, current_price, sl)
-            if not sl_ok:
-                log_execution_rejected(symbol, f"invalid stop loss — {sl_reason}", strategy=strategy)
-                self.db.log_signal_rejection(
-                    symbol, action, score, [sl_reason], strategy=strategy
-                )
-                return None
-        else:
-            sl, tp1, tp2, tp3 = self.calculate_sl_tp(
-                action, current_price, atr, rules, structure=structure
+        pre_levels = self._resolve_execution_levels(
+            action, current_price, atr, rules, structure, strategy
+        )
+        if not pre_levels:
+            log_execution_rejected(
+                symbol,
+                "invalid SL/TP ladder at signal price — cannot size entry",
+                strategy=strategy,
             )
-            sl_ok, sl_reason = self._validate_stop_loss(action, current_price, sl)
-            if not sl_ok:
-                log_execution_rejected(symbol, f"invalid stop loss — {sl_reason}", strategy=strategy)
-                self.db.log_signal_rejection(
-                    symbol, action, score, [sl_reason], strategy=strategy
-                )
-                return None
+            self.db.log_signal_rejection(
+                symbol,
+                action,
+                score,
+                ["invalid_sl_tp_at_signal_price"],
+                strategy=strategy,
+            )
+            return None
+        sl, tp1, tp2, tp3 = pre_levels
+        if not range_mode:
             opposing = safe_float(structure.get("opposing_liquidity"))
             rr_ok, rr_reason = check_opposing_liquidity_rr(
                 action, current_price, sl, opposing
@@ -509,22 +679,15 @@ class TradeExecutor:
         if fill_price <= 0:
             fill_price = current_price
 
-        if range_mode:
-            rmeta = RangeMetadata()
-            for key, value in structure.items():
-                if hasattr(rmeta, key):
-                    setattr(rmeta, key, value)
-            sl, tp1, tp2, tp3 = compute_range_sl_tp(action, fill_price, atr, rmeta)
-            sl = round_step_size(sl, rules.tick_size, rules.price_precision)
-            tp1 = round_step_size(tp1, rules.tick_size, rules.price_precision)
-            tp2 = round_step_size(tp2, rules.tick_size, rules.price_precision)
-            tp3 = round_step_size(tp3, rules.tick_size, rules.price_precision)
+        post_levels = self._resolve_execution_levels(
+            action, fill_price, atr, rules, structure, strategy
+        )
+        if not post_levels:
+            sl_ok, sl_reason = False, "invalid_sl_tp_at_fill_price"
         else:
-            sl, tp1, tp2, tp3 = self.calculate_sl_tp(
-                action, fill_price, atr, rules, structure=structure
-            )
+            sl, tp1, tp2, tp3 = post_levels
+            sl_ok, sl_reason = self._validate_stop_loss(action, fill_price, sl)
 
-        sl_ok, sl_reason = self._validate_stop_loss(action, fill_price, sl)
         if not sl_ok:
             error_logger.critical(
                 "Post-fill invalid SL for %s %s — %s | closing orphan position.",
@@ -600,14 +763,64 @@ class TradeExecutor:
                 symbol, position_side, quantity, fill_price
             )
 
-            if safe_float(response.get("avgPrice")) <= 0 and not self.exchange.is_rest_blocked()[0]:
-                refined = self.exchange.get_fill_price_from_order(
-                    symbol, response, fallback=fill_price
+            if Config.ENABLE_NATIVE_TP_SL:
+                self._place_native_exit_orders(
+                    trade_id=trade_id,
+                    symbol=symbol,
+                    position_side=position_side,
+                    sl=sl,
+                    tp1=tp1,
+                    tp2=tp2,
+                    tp3=tp3,
+                    metadata=metadata,
+                    quantity=quantity,
                 )
+
+            if not self.exchange.is_rest_blocked()[0]:
+                refined = fill_price
+                if safe_float(response.get("avgPrice")) <= 0:
+                    refined = self.exchange.get_fill_price_from_order(
+                        symbol, response, fallback=fill_price
+                    )
                 if refined > 0 and abs(refined - fill_price) > 1e-12:
                     fill_price = refined
                     trade_data["entry_price"] = fill_price
-                    self.db.update_trade(trade_id, {"entry_price": fill_price})
+                    refined_levels = self._resolve_execution_levels(
+                        action, fill_price, atr, rules, structure, strategy
+                    )
+                    if refined_levels:
+                        sl, tp1, tp2, tp3 = refined_levels
+                        trade_data.update(
+                            {
+                                "stop_loss": sl,
+                                "take_profit_1": tp1,
+                                "take_profit_2": tp2,
+                                "take_profit_3": tp3,
+                            }
+                        )
+                        self._apply_execution_levels(
+                            trade_id=trade_id,
+                            fill_price=fill_price,
+                            sl=sl,
+                            tp1=tp1,
+                            tp2=tp2,
+                            tp3=tp3,
+                            metadata=metadata,
+                        )
+                        if Config.ENABLE_NATIVE_TP_SL:
+                            self._place_native_exit_orders(
+                                trade_id=trade_id,
+                                symbol=symbol,
+                                position_side=position_side,
+                                sl=sl,
+                                tp1=tp1,
+                                tp2=tp2,
+                                tp3=tp3,
+                                metadata=metadata,
+                                quantity=quantity,
+                            )
+                    else:
+                        self.db.update_trade(trade_id, {"entry_price": fill_price})
                     self.exchange.seed_position_after_fill(
                         symbol, position_side, quantity, fill_price
                     )

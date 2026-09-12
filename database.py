@@ -152,6 +152,8 @@ class DatabaseManager:
                 self._ensure_column(cursor, "signals", "outcome", "TEXT")
                 self._ensure_column(cursor, "signals", "structure_metadata", "TEXT")
                 self._ensure_column(cursor, "signals", "rejection_reason", "TEXT")
+                self._ensure_column(cursor, "trades", "exit_price", "REAL")
+                self._ensure_column(cursor, "trades", "realized_pnl", "REAL")
 
                 cursor.execute(
                     """
@@ -918,24 +920,58 @@ class DatabaseManager:
             except sqlite3.Error as exc:
                 error_logger.error("Failed to record signal outcome: %s", exc)
 
+    @staticmethod
+    def estimate_trade_pnl(
+        trade: dict[str, Any],
+        exit_price: float,
+    ) -> float:
+        """Estimate closed-trade PnL when no partial fills were recorded."""
+        existing = safe_float(trade.get("realized_pnl"))
+        if existing != 0:
+            return existing
+        existing = safe_float(trade.get("pnl"))
+        if existing != 0:
+            return existing
+
+        side = str(trade.get("side", "LONG")).upper()
+        entry = safe_float(trade.get("entry_price"))
+        quantity = safe_float(trade.get("quantity"))
+        if entry <= 0 or quantity <= 0 or exit_price <= 0:
+            return 0.0
+        if side == "LONG":
+            return (exit_price - entry) * quantity
+        return (entry - exit_price) * quantity
+
     def get_daily_trade_analytics(self, date_str: str) -> dict[str, Any]:
         """Win rate, W/L breakdown, profit factor for closed trades on a UTC day."""
         try:
             with self.connection() as conn:
                 rows = conn.execute(
                     """
-                    SELECT pnl FROM trades
+                    SELECT
+                        COALESCE(realized_pnl, pnl, 0.0) AS closed_pnl
+                    FROM trades
                     WHERE status = 'CLOSED'
                       AND closed_at IS NOT NULL
                       AND closed_at LIKE ?
                     """,
                     (f"{date_str}%",),
                 ).fetchall()
+                closes_count = conn.execute(
+                    """
+                    SELECT COUNT(*) FROM trades
+                    WHERE status = 'CLOSED'
+                      AND closed_at IS NOT NULL
+                      AND closed_at LIKE ?
+                    """,
+                    (f"{date_str}%",),
+                ).fetchone()
         except sqlite3.Error as exc:
             error_logger.error("Failed to fetch daily analytics: %s", exc)
             return {
                 "wins": 0,
                 "losses": 0,
+                "closes": 0,
                 "win_rate": 0.0,
                 "profit_factor": 0.0,
                 "total_pnl": 0.0,
@@ -960,10 +996,98 @@ class DatabaseManager:
         return {
             "wins": win_count,
             "losses": loss_count,
+            "closes": int(closes_count[0]) if closes_count else total,
             "win_rate": win_rate,
             "profit_factor": profit_factor,
             "total_pnl": sum(pnls),
         }
+
+    def sync_daily_stats_from_trades(self, date_str: str) -> None:
+        """Align daily_stats.total_pnl and trades_count with closed trades in DB."""
+        analytics = self.get_daily_trade_analytics(date_str)
+        with self._write_lock:
+            try:
+                with self.connection() as conn:
+                    conn.execute(
+                        """
+                        UPDATE daily_stats
+                        SET total_pnl = ?,
+                            trades_count = ?
+                        WHERE date = ?
+                        """,
+                        (
+                            analytics.get("total_pnl", 0.0),
+                            int(analytics.get("closes", 0)),
+                            date_str,
+                        ),
+                    )
+                    conn.commit()
+            except sqlite3.Error as exc:
+                error_logger.error(
+                    "Failed to sync daily stats from trades for %s: %s", date_str, exc
+                )
+
+    def close_trade_and_sync_stats(
+        self,
+        trade: dict[str, Any],
+        *,
+        exit_price: float,
+        exit_reason: str,
+        pnl: Optional[float] = None,
+        closed_at: Optional[str] = None,
+        duration: Optional[int] = None,
+        book_daily_pnl: bool = True,
+        daily_pnl_delta: Optional[float] = None,
+        increment_close_count: bool = True,
+        current_balance: Optional[float] = None,
+    ) -> float:
+        """
+        Mark a trade CLOSED with exit metadata and refresh daily aggregates.
+        Returns the final realized PnL stored on the trade row.
+        """
+        trade_id = str(trade.get("trade_id", ""))
+        if not trade_id:
+            return 0.0
+
+        closed_at = closed_at or utc_now().isoformat()
+        prior_pnl = safe_float(trade.get("realized_pnl"))
+        if prior_pnl == 0:
+            prior_pnl = safe_float(trade.get("pnl"))
+
+        if pnl is None:
+            if prior_pnl != 0:
+                pnl = prior_pnl
+            else:
+                pnl = self.estimate_trade_pnl(trade, exit_price)
+
+        if daily_pnl_delta is None:
+            daily_pnl_delta = (pnl - prior_pnl) if book_daily_pnl else 0.0
+        elif not book_daily_pnl:
+            daily_pnl_delta = 0.0
+
+        updates: dict[str, Any] = {
+            "status": "CLOSED",
+            "closed_at": closed_at,
+            "exit_reason": exit_reason,
+            "exit_price": exit_price,
+            "pnl": pnl,
+            "realized_pnl": pnl,
+        }
+        if duration is not None:
+            updates["duration"] = duration
+
+        self.update_trade(trade_id, updates)
+
+        date_str = closed_at[:10]
+        if book_daily_pnl and daily_pnl_delta:
+            self.add_daily_realized_pnl(date_str, daily_pnl_delta)
+        if increment_close_count:
+            self.sync_daily_stats_from_trades(date_str)
+        if current_balance is not None and current_balance > 0:
+            stats = self.get_daily_stats(date_str) or {}
+            status = stats.get("status", DAILY_STATUS_ACTIVE)
+            self.update_daily_balance(date_str, current_balance, status)
+        return pnl
 
     # ---------------- Trades ----------------
 

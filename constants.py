@@ -81,6 +81,8 @@ ALLOWED_TRADE_COLUMNS: Final[Set[str]] = {
     "take_profit_3",
     "stop_loss",
     "pnl",
+    "realized_pnl",
+    "exit_price",
     "opened_at",
     "closed_at",
     "strategy",

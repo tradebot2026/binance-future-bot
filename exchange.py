@@ -1472,16 +1472,41 @@ class BinanceExchangeManager:
                 return mark
         return None
 
+    def fetch_mark_price_rest(self, symbol: str) -> Optional[float]:
+        """REST mark price — used by watchdog when WS hub is unavailable."""
+        if self.is_rest_blocked()[0]:
+            return None
+        try:
+            with self.execution_context():
+                data = self._throttled_call(
+                    self.client.futures_mark_price,
+                    symbol=symbol.upper(),
+                    **self.recv_window_param,
+                    execution_priority=True,
+                )
+            mark = safe_float(data.get("markPrice"))
+            return mark if mark > 0 else None
+        except Exception as exc:
+            error_logger.warning("REST mark price failed for %s: %s", symbol, exc)
+            return None
+
     def get_tp_monitor_price(
         self, symbol: str, position_side: str = "LONG"
     ) -> Optional[float]:
-        """Live last price for internal TP/SL — avoids stale seeded mark prices."""
+        """Best available live price for virtual TP/SL (ticker first, never stale entry mark)."""
         if self._market_data:
             fresh = self._market_data.get_fresh_ticker_price(
-                symbol, max_age_seconds=30.0
+                symbol,
+                max_age_seconds=Config.VIRTUAL_TP_TICKER_MAX_AGE_SECONDS,
             )
             if fresh is not None and fresh > 0:
                 return fresh
+            cached = self._market_data.get_price(symbol)
+            if cached is not None and cached > 0:
+                return cached
+        mark = self.get_mark_price(symbol, position_side)
+        if mark is not None and mark > 0:
+            return mark
         return self.get_market_price(symbol, position_side)
 
     def get_market_price(self, symbol: str, position_side: str = "LONG") -> Optional[float]:
@@ -2086,6 +2111,241 @@ class BinanceExchangeManager:
                     exc=exc,
                 )
             raise OrderExecutionError(str(exc)) from exc
+
+    # ---------------- Native TP/SL (exchange conditional orders) ----------------
+
+    def _format_stop_price(self, symbol: str, stop_price: float) -> str:
+        rules = self.get_symbol_rules(symbol)
+        clean = round_step_size(stop_price, rules.tick_size, rules.price_precision)
+        return f"{clean:.{rules.price_precision}f}"
+
+    def place_conditional_order(
+        self,
+        symbol: str,
+        side: str,
+        position_side: str,
+        order_type: str,
+        stop_price: float,
+        *,
+        quantity: Optional[float] = None,
+        close_position: bool = False,
+    ) -> dict[str, Any]:
+        """Place STOP_MARKET or TAKE_PROFIT_MARKET (hedge-mode positionSide)."""
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        side = side.upper()
+        order_type = order_type.upper()
+        rules = self.get_symbol_rules(symbol)
+
+        params: dict[str, Any] = {
+            "symbol": symbol,
+            "side": side,
+            "positionSide": position_side,
+            "type": order_type,
+            "stopPrice": self._format_stop_price(symbol, stop_price),
+            "workingType": Config.NATIVE_TP_WORKING_TYPE,
+        }
+        if close_position:
+            params["closePosition"] = "true"
+        else:
+            if quantity is None or quantity <= 0:
+                raise OrderExecutionError(
+                    f"Quantity required for {order_type} on {symbol}"
+                )
+            clean_qty = amount_to_precision(
+                quantity, rules.step_size, rules.quantity_precision
+            )
+            if clean_qty < rules.min_qty:
+                raise OrderExecutionError(
+                    f"Conditional qty {clean_qty} below min_qty for {symbol}"
+                )
+            params["quantity"] = f"{clean_qty:.{rules.quantity_precision}f}"
+
+        with self.execution_context():
+            response = self._throttled_call(
+                self.client.futures_create_order,
+                **params,
+                **self.recv_window_param,
+                execution_priority=True,
+            )
+        trade_logger.info(
+            "Native %s placed | %s %s | stop=%s | qty=%s | closePosition=%s | id=%s",
+            order_type,
+            symbol,
+            position_side,
+            params["stopPrice"],
+            params.get("quantity", "ALL"),
+            close_position,
+            response.get("orderId"),
+        )
+        return response
+
+    def place_native_exit_bracket(
+        self,
+        symbol: str,
+        position_side: str,
+        sl_price: float,
+        tp_specs: list[tuple[str, float, float]],
+    ) -> dict[str, str]:
+        """
+        Place exchange-native SL (close entire position) + partial TP market orders.
+        Returns map of level -> orderId (includes key 'SL').
+        """
+        position_side = position_side.upper()
+        close_side = "SELL" if position_side == "LONG" else "BUY"
+        placed: dict[str, str] = {}
+        tp_order_ids: list[str] = []
+
+        if sl_price > 0:
+            sl_resp = self.place_conditional_order(
+                symbol,
+                close_side,
+                position_side,
+                "STOP_MARKET",
+                sl_price,
+                close_position=True,
+            )
+            sl_id = str(sl_resp.get("orderId", ""))
+            if sl_id:
+                placed["SL"] = sl_id
+
+        for level, tp_price, tp_qty in tp_specs:
+            if tp_price <= 0 or tp_qty <= 0:
+                continue
+            try:
+                tp_resp = self.place_conditional_order(
+                    symbol,
+                    close_side,
+                    position_side,
+                    "TAKE_PROFIT_MARKET",
+                    tp_price,
+                    quantity=tp_qty,
+                )
+                tp_id = str(tp_resp.get("orderId", ""))
+                if tp_id:
+                    placed[level.upper()] = tp_id
+                    tp_order_ids.append(tp_id)
+            except OrderExecutionError as exc:
+                error_logger.warning(
+                    "Native %s order failed for %s %s: %s",
+                    level,
+                    symbol,
+                    position_side,
+                    exc,
+                )
+
+        if sl_price > 0 and "SL" not in placed and not tp_order_ids:
+            raise OrderExecutionError(f"Failed to place any native exit orders on {symbol}")
+
+        return placed
+
+    def cancel_order_by_id(self, symbol: str, order_id: str) -> bool:
+        symbol = symbol.upper()
+        if not order_id:
+            return False
+        try:
+            with self.execution_context():
+                self._throttled_call(
+                    self.client.futures_cancel_order,
+                    symbol=symbol,
+                    orderId=int(order_id),
+                    **self.recv_window_param,
+                    execution_priority=True,
+                )
+            trade_logger.info("Canceled order %s on %s.", order_id, symbol)
+            return True
+        except BinanceAPIException as exc:
+            if exc.code in (-2011, -2013):
+                return False
+            error_logger.warning(
+                "Cancel order %s on %s failed: %s", order_id, symbol, exc.message
+            )
+            return False
+        except Exception as exc:
+            error_logger.warning(
+                "Cancel order %s on %s failed: %s", order_id, symbol, exc
+            )
+            return False
+
+    def get_open_orders(self, symbol: str) -> list[dict[str, Any]]:
+        symbol = symbol.upper()
+        try:
+            with self.execution_context():
+                orders = self._throttled_call(
+                    self.client.futures_get_open_orders,
+                    symbol=symbol,
+                    **self.recv_window_param,
+                    execution_priority=True,
+                )
+            return list(orders or [])
+        except Exception as exc:
+            error_logger.warning("Failed to fetch open orders for %s: %s", symbol, exc)
+            return []
+
+    def is_order_still_open(self, symbol: str, order_id: str) -> bool:
+        if not order_id:
+            return False
+        for order in self.get_open_orders(symbol):
+            if str(order.get("orderId")) == str(order_id):
+                return True
+        return False
+
+    def cancel_native_exit_orders(
+        self,
+        symbol: str,
+        position_side: str,
+        order_ids: Optional[dict[str, str]] = None,
+    ) -> int:
+        """Cancel native SL/TP orders for a position side. Returns cancel count."""
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        canceled = 0
+        target_ids: set[str] = set()
+        if order_ids:
+            target_ids = {str(v) for v in order_ids.values() if v}
+
+        open_orders = self.get_open_orders(symbol)
+        for order in open_orders:
+            if str(order.get("positionSide", "")).upper() != position_side:
+                continue
+            order_type = str(order.get("type", "")).upper()
+            if order_type not in (
+                "STOP_MARKET",
+                "TAKE_PROFIT_MARKET",
+                "STOP",
+                "TAKE_PROFIT",
+                "LIMIT",
+            ):
+                continue
+            oid = str(order.get("orderId", ""))
+            if target_ids and oid not in target_ids:
+                continue
+            if self.cancel_order_by_id(symbol, oid):
+                canceled += 1
+        return canceled
+
+    def refresh_native_stop_loss(
+        self,
+        symbol: str,
+        position_side: str,
+        new_sl_price: float,
+        old_sl_order_id: Optional[str] = None,
+    ) -> Optional[str]:
+        """Replace native SL after break-even / trailing update."""
+        if old_sl_order_id:
+            self.cancel_order_by_id(symbol, old_sl_order_id)
+        if new_sl_price <= 0:
+            return None
+        close_side = "SELL" if position_side.upper() == "LONG" else "BUY"
+        resp = self.place_conditional_order(
+            symbol,
+            close_side,
+            position_side,
+            "STOP_MARKET",
+            new_sl_price,
+            close_position=True,
+        )
+        return str(resp.get("orderId", "")) or None
 
     def close_position_quantity(
         self,

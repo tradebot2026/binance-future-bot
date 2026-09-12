@@ -25,6 +25,7 @@ from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from exceptions import OrderExecutionError, PositionAlreadyClosedError
 from logger import error_logger, trade_logger
+from exit_coordinator import claim_exit, release_exit
 from reconciliation import (
     confirm_external_close_allowed,
     is_within_position_grace_period,
@@ -96,6 +97,15 @@ class TradeManager:
         self._tick_worker.start()
         self._fast_monitor.start()
         self._close_worker.start()
+        self._register_open_trade_symbols()
+
+    def _register_open_trade_symbols(self) -> None:
+        """Ensure every open DB trade receives miniTicker-driven TP/SL evaluation."""
+        for trade in self.db.get_open_trades():
+            symbol = str(trade.get("symbol", "")).upper()
+            if symbol:
+                with self._monitored_lock:
+                    self._monitored_symbols.add(symbol)
 
     def note_open_symbol(self, symbol: str) -> None:
         """Register a symbol for immediate WS tick monitoring after entry."""
@@ -187,6 +197,9 @@ class TradeManager:
                     str(trade.get("symbol", "")).upper() for trade in active_trades
                 }
             if not active_trades:
+                return
+
+            if not Config.ENABLE_SOFT_TP_SL:
                 return
 
             if not ws_only and not self.exchange.rest_account_reads_blocked():
@@ -282,28 +295,33 @@ class TradeManager:
 
         if live_qty <= 0:
             if ws_only:
-                trade_logger.debug(
-                    "[%s] TP/SL eval skipped — qty unavailable (WS-only path).",
-                    symbol,
+                db_qty = self._trade_quantity_from_db(trade)
+                if db_qty <= 0:
+                    trade_logger.debug(
+                        "[%s] TP/SL eval skipped — no DB/exchange qty (WS-only path).",
+                        symbol,
+                    )
+                    return
+                live_qty = db_qty
+                qty_map[key] = db_qty
+            elif self._defer_external_close(trade, symbol):
+                return
+            else:
+                self._mark_trade_closed(
+                    trade,
+                    reason="RECONCILED_EXTERNAL_CLOSE",
+                    exit_price=safe_float(
+                        price
+                        or self.exchange.get_market_price(symbol, position_side)
+                    ),
                 )
+                position_reconcile_guard.note_present(str(trade["trade_id"]))
                 return
-            if self._defer_external_close(trade, symbol):
-                return
-            self._mark_trade_closed(
-                trade,
-                reason="RECONCILED_EXTERNAL_CLOSE",
-                exit_price=safe_float(
-                    price
-                    or self.exchange.get_market_price(symbol, position_side)
-                ),
-            )
-            position_reconcile_guard.note_present(str(trade["trade_id"]))
-            return
 
         position_reconcile_guard.note_present(str(trade["trade_id"]))
 
         if price is None or price <= 0:
-            price = self.exchange.get_tp_monitor_price(symbol, position_side)
+            price = self._resolve_monitor_price(symbol, position_side)
         if price is None or price <= 0:
             trade_logger.warning(
                 "[%s] TP/SL eval skipped — no live ticker/mark price available.",
@@ -504,6 +522,58 @@ class TradeManager:
 
         return False
 
+    def _advance_profit_stop_ladder(
+        self,
+        trade: dict[str, Any],
+        current_price: float,
+        *,
+        is_long: bool,
+    ) -> None:
+        """Trail SL into profit as price reaches TP rungs (entry after TP1, TP1 after TP2)."""
+        if not Config.ENABLE_BREAK_EVEN:
+            return
+
+        entry = safe_float(trade.get("entry_price"))
+        tp1 = safe_float(trade.get("take_profit_1"))
+        tp2 = safe_float(trade.get("take_profit_2"))
+        tp3 = safe_float(trade.get("take_profit_3"))
+        sl = safe_float(trade.get("stop_loss"))
+        symbol = str(trade.get("symbol", ""))
+        rules = self.exchange.get_symbol_rules(symbol)
+        target_sl: Optional[float] = None
+
+        if is_long:
+            if tp1 > 0 and current_price >= tp1 and entry > 0 and sl < entry:
+                target_sl = entry
+            if tp2 > 0 and current_price >= tp2 and tp1 > 0 and sl < tp1:
+                target_sl = tp1
+            if tp3 > 0 and current_price >= tp3 and tp2 > 0 and sl < tp2:
+                target_sl = tp2
+        else:
+            if tp1 > 0 and current_price <= tp1 and entry > 0 and (sl <= 0 or sl > entry):
+                target_sl = entry
+            if tp2 > 0 and current_price <= tp2 and tp1 > 0 and (sl <= 0 or sl > tp1):
+                target_sl = tp1
+            if tp3 > 0 and current_price <= tp3 and tp2 > 0 and (sl <= 0 or sl > tp2):
+                target_sl = tp2
+
+        if target_sl is None:
+            return
+        target_sl = round_step_size(target_sl, rules.tick_size, rules.price_precision)
+        if is_long and target_sl <= sl:
+            return
+        if not is_long and sl > 0 and target_sl >= sl:
+            return
+
+        self.db.update_trade(trade["trade_id"], {"stop_loss": target_sl})
+        trade["stop_loss"] = target_sl
+        trade_logger.info(
+            "[%s] Profit SL trailed to %.6f | price=%.6f",
+            symbol,
+            target_sl,
+            current_price,
+        )
+
     def _manage_long_trade(self, trade: dict[str, Any], current_price: float) -> None:
         for _ in range(4):
             trade = self.db.get_trade(trade["trade_id"]) or trade
@@ -511,24 +581,23 @@ class TradeManager:
                 return
 
             metadata = self.db.parse_trade_metadata(trade)
+            entry = safe_float(trade.get("entry_price"))
+
+            self._advance_profit_stop_ladder(trade, current_price, is_long=True)
+
+            if Config.ENABLE_TRAILING_STOP and entry > 0 and current_price > entry:
+                self._apply_trailing_stop(trade, current_price, is_long=True)
 
             stop_loss = safe_float(trade.get("stop_loss"))
             if stop_loss > 0 and current_price <= stop_loss:
-                trade_logger.warning(
-                    "[%s] STOP LOSS breach LONG | price=%.6f <= sl=%.6f",
-                    trade.get("symbol"),
-                    current_price,
-                    stop_loss,
-                )
+                self._trigger_virtual_sl(trade, current_price, stop_loss)
+                self._cancel_all_native_orders(trade)
                 self._close_position(
                     trade,
                     quantity=self._remaining_close_quantity(trade),
                     reason="STOP_LOSS",
                 )
                 return
-
-            if Config.ENABLE_TRAILING_STOP and metadata.get("trailing_active"):
-                self._apply_trailing_stop(trade, current_price, is_long=True)
 
             metadata = self.db.parse_trade_metadata(trade)
             tp1 = safe_float(trade.get("take_profit_1"))
@@ -537,30 +606,15 @@ class TradeManager:
 
             acted = False
             if tp3 > 0 and current_price >= tp3 and not metadata.get("tp3_executed"):
-                trade_logger.info(
-                    "[%s] TP3 breach LONG | price=%.6f >= tp3=%.6f",
-                    trade.get("symbol"),
-                    current_price,
-                    tp3,
-                )
+                self._trigger_virtual_tp(trade, "TP3", current_price, tp3)
                 self._handle_take_profit(trade, level="TP3", reason="TP3_FULL_CLOSE")
                 acted = True
             elif tp2 > 0 and current_price >= tp2 and not metadata.get("tp2_executed"):
-                trade_logger.info(
-                    "[%s] TP2 breach LONG | price=%.6f >= tp2=%.6f",
-                    trade.get("symbol"),
-                    current_price,
-                    tp2,
-                )
+                self._trigger_virtual_tp(trade, "TP2", current_price, tp2)
                 self._handle_take_profit(trade, level="TP2", reason="TP2")
                 acted = True
             elif tp1 > 0 and current_price >= tp1 and not metadata.get("tp1_executed"):
-                trade_logger.info(
-                    "[%s] TP1 breach LONG | price=%.6f >= tp1=%.6f",
-                    trade.get("symbol"),
-                    current_price,
-                    tp1,
-                )
+                self._trigger_virtual_tp(trade, "TP1", current_price, tp1)
                 self._handle_take_profit(trade, level="TP1", reason="TP1")
                 acted = True
 
@@ -574,24 +628,23 @@ class TradeManager:
                 return
 
             metadata = self.db.parse_trade_metadata(trade)
+            entry = safe_float(trade.get("entry_price"))
+
+            self._advance_profit_stop_ladder(trade, current_price, is_long=False)
+
+            if Config.ENABLE_TRAILING_STOP and entry > 0 and current_price < entry:
+                self._apply_trailing_stop(trade, current_price, is_long=False)
 
             stop_loss = safe_float(trade.get("stop_loss"))
             if stop_loss > 0 and current_price >= stop_loss:
-                trade_logger.warning(
-                    "[%s] STOP LOSS breach SHORT | price=%.6f >= sl=%.6f",
-                    trade.get("symbol"),
-                    current_price,
-                    stop_loss,
-                )
+                self._trigger_virtual_sl(trade, current_price, stop_loss)
+                self._cancel_all_native_orders(trade)
                 self._close_position(
                     trade,
                     quantity=self._remaining_close_quantity(trade),
                     reason="STOP_LOSS",
                 )
                 return
-
-            if Config.ENABLE_TRAILING_STOP and metadata.get("trailing_active"):
-                self._apply_trailing_stop(trade, current_price, is_long=False)
 
             metadata = self.db.parse_trade_metadata(trade)
             tp1 = safe_float(trade.get("take_profit_1"))
@@ -600,35 +653,107 @@ class TradeManager:
 
             acted = False
             if tp3 > 0 and current_price <= tp3 and not metadata.get("tp3_executed"):
-                trade_logger.info(
-                    "[%s] TP3 breach SHORT | price=%.6f <= tp3=%.6f",
-                    trade.get("symbol"),
-                    current_price,
-                    tp3,
-                )
+                self._trigger_virtual_tp(trade, "TP3", current_price, tp3)
                 self._handle_take_profit(trade, level="TP3", reason="TP3_FULL_CLOSE")
                 acted = True
             elif tp2 > 0 and current_price <= tp2 and not metadata.get("tp2_executed"):
-                trade_logger.info(
-                    "[%s] TP2 breach SHORT | price=%.6f <= tp2=%.6f",
-                    trade.get("symbol"),
-                    current_price,
-                    tp2,
-                )
+                self._trigger_virtual_tp(trade, "TP2", current_price, tp2)
                 self._handle_take_profit(trade, level="TP2", reason="TP2")
                 acted = True
             elif tp1 > 0 and current_price <= tp1 and not metadata.get("tp1_executed"):
-                trade_logger.info(
-                    "[%s] TP1 breach SHORT | price=%.6f <= tp1=%.6f",
-                    trade.get("symbol"),
-                    current_price,
-                    tp1,
-                )
+                self._trigger_virtual_tp(trade, "TP1", current_price, tp1)
                 self._handle_take_profit(trade, level="TP1", reason="TP1")
                 acted = True
 
             if not acted:
                 break
+
+    def _resolve_monitor_price(
+        self, symbol: str, position_side: str
+    ) -> Optional[float]:
+        """Resolve a live price for virtual TP/SL — WS ticker first, REST last resort."""
+        price = self.exchange.get_tp_monitor_price(symbol, position_side)
+        if price is not None and price > 0:
+            return price
+        if not self.exchange.rest_account_reads_blocked():
+            return self.exchange.get_market_price(symbol, position_side)
+        return None
+
+    def _trigger_virtual_tp(
+        self,
+        trade: dict[str, Any],
+        level: str,
+        current_price: float,
+        target_price: float,
+    ) -> None:
+        symbol = trade.get("symbol", "?")
+        side = trade.get("side", "LONG")
+        trade_logger.info(
+            "[VIRTUAL_TP_TRIGGERED] Pair: %s %s | Level: %s | price=%.6f target=%.6f "
+            "| Executing Market Close",
+            symbol,
+            side,
+            level,
+            current_price,
+            target_price,
+        )
+
+    def _trigger_virtual_sl(
+        self,
+        trade: dict[str, Any],
+        current_price: float,
+        stop_loss: float,
+    ) -> None:
+        symbol = trade.get("symbol", "?")
+        side = trade.get("side", "LONG")
+        trade_logger.warning(
+            "[VIRTUAL_SL_TRIGGERED] Pair: %s %s | price=%.6f sl=%.6f "
+            "| Executing Market Close",
+            symbol,
+            side,
+            current_price,
+            stop_loss,
+        )
+
+    def _native_order_map(self, trade: dict[str, Any]) -> dict[str, str]:
+        metadata = self.db.parse_trade_metadata(trade)
+        order_map: dict[str, str] = {}
+        sl_id = metadata.get("native_sl_order_id")
+        if sl_id:
+            order_map["SL"] = str(sl_id)
+        tp_ids = metadata.get("native_tp_order_ids") or {}
+        if isinstance(tp_ids, dict):
+            for level, oid in tp_ids.items():
+                if oid:
+                    order_map[str(level).upper()] = str(oid)
+        return order_map
+
+    def _cancel_all_native_orders(self, trade: dict[str, Any]) -> None:
+        if not Config.ENABLE_NATIVE_TP_SL:
+            return
+        symbol = str(trade.get("symbol", ""))
+        position_side = str(trade.get("side", "LONG")).upper()
+        order_map = self._native_order_map(trade)
+        if not order_map:
+            return
+        canceled = self.exchange.cancel_native_exit_orders(
+            symbol, position_side, order_map
+        )
+        if canceled:
+            trade_logger.info(
+                "[%s] Canceled %s native exit order(s) for %s.",
+                symbol,
+                canceled,
+                position_side,
+            )
+
+    def _cancel_native_tp_order(self, trade: dict[str, Any], level: str) -> None:
+        level_key = level.upper().replace("_FULL_CLOSE", "")
+        metadata = self.db.parse_trade_metadata(trade)
+        tp_ids = metadata.get("native_tp_order_ids") or {}
+        order_id = tp_ids.get(level_key) if isinstance(tp_ids, dict) else None
+        if order_id:
+            self.exchange.cancel_order_by_id(str(trade.get("symbol", "")), str(order_id))
 
     def _handle_take_profit(
         self,
@@ -710,6 +835,19 @@ class TradeManager:
 
         self.db.update_trade(trade["trade_id"], updates)
 
+        if new_sl is not None and Config.ENABLE_NATIVE_TP_SL:
+            metadata = self.db.parse_trade_metadata(trade)
+            if metadata.get("native_orders_placed"):
+                new_sl_id = self.exchange.refresh_native_stop_loss(
+                    trade["symbol"],
+                    str(trade.get("side", "LONG")),
+                    new_sl,
+                    old_sl_order_id=str(metadata.get("native_sl_order_id") or ""),
+                )
+                if new_sl_id:
+                    metadata["native_sl_order_id"] = new_sl_id
+                    self.db.update_trade(trade["trade_id"], {"metadata": metadata})
+
         if self.telegram:
             self.telegram.send_tp_level_alert(
                 symbol=trade["symbol"],
@@ -767,6 +905,7 @@ class TradeManager:
                 if task.result_box is not None:
                     task.result_box[0] = False
             finally:
+                release_exit(trade_id, "main")
                 with self._close_lock:
                     self._close_inflight.discard(inflight_key)
                 if task.result_event is not None:
@@ -898,6 +1037,7 @@ class TradeManager:
             reason,
             exit_reason,
         )
+        self._cancel_all_native_orders(trade)
         self.exchange.clear_position_cache(symbol, position_side)
         position_reconcile_guard.note_present(str(trade["trade_id"]))
         if self.telegram:
@@ -951,6 +1091,12 @@ class TradeManager:
         with self._close_lock:
             if inflight_key in self._close_inflight:
                 return True
+            if not claim_exit(trade_id, "main"):
+                trade_logger.debug(
+                    "[%s] Close deferred — exit claim held by another process.",
+                    symbol,
+                )
+                return False
             self._close_inflight.add(inflight_key)
 
         task = _CloseTask(
@@ -1089,10 +1235,15 @@ class TradeManager:
         )
 
         cumulative_pnl = safe_float(trade.get("pnl")) + realized
-        self.db.update_trade(trade_id, {"pnl": cumulative_pnl})
+        self.db.update_trade(
+            trade_id,
+            {"pnl": cumulative_pnl, "realized_pnl": cumulative_pnl},
+        )
         trade["pnl"] = cumulative_pnl
+        trade["realized_pnl"] = cumulative_pnl
 
         self.db.add_daily_realized_pnl(utc_today_str(), realized)
+        self.db.sync_daily_stats_from_trades(utc_today_str())
 
         trade_logger.info(
             "[%s] Closed qty=%s | reason=%s | pnl=%.4f",
@@ -1124,7 +1275,12 @@ class TradeManager:
         )
 
         if is_full_close:
-            self._mark_trade_closed(trade, reason=reason, exit_price=exit_price)
+            self._mark_trade_closed(
+                trade,
+                reason=reason,
+                exit_price=exit_price,
+                book_daily_pnl=False,
+            )
         else:
             if live_remaining <= 0:
                 self.exchange.clear_position_cache(symbol, position_side)
@@ -1132,6 +1288,23 @@ class TradeManager:
                 self.telegram.send_close_alert(symbol=symbol, reason=reason, pnl=realized)
 
         return True
+
+    def _log_position_closed(
+        self,
+        symbol: str,
+        position_side: str,
+        reason: str,
+        exit_price: float,
+        pnl: float,
+    ) -> None:
+        trade_logger.info(
+            "[POSITION_CLOSED] Pair: %s %s | Reason: %s | exit=%.6f | pnl=%.4f",
+            symbol,
+            position_side,
+            reason,
+            exit_price,
+            pnl,
+        )
 
     def _calculate_realized_pnl(
         self,
@@ -1151,6 +1324,7 @@ class TradeManager:
         exit_price: float,
         *,
         notify: bool = True,
+        book_daily_pnl: bool = True,
     ) -> None:
         trade_id = trade["trade_id"]
         symbol = trade["symbol"]
@@ -1168,32 +1342,32 @@ class TradeManager:
             except ValueError:
                 duration = None
 
-        self.db.update_trade(
-            trade_id,
-            {
-                "status": TRADE_STATUS_CLOSED,
-                "closed_at": closed_at,
-                "exit_reason": reason,
-                "duration": duration,
-            },
-        )
         position_reconcile_guard.note_present(str(trade_id))
+        self._cancel_all_native_orders(trade)
         self.exchange.clear_position_cache(symbol, position_side)
         with self._monitored_lock:
             self._monitored_symbols.discard(str(symbol).upper())
         self.exchange.invalidate_balance_cache()
         balance = self.exchange.get_futures_balance(force_refresh=False)
-        self.db.record_closed_trade(
-            date_str=utc_today_str(),
+
+        total_pnl = self.db.close_trade_and_sync_stats(
+            trade,
+            exit_price=exit_price,
+            exit_reason=reason,
+            closed_at=closed_at,
+            duration=duration,
+            book_daily_pnl=book_daily_pnl,
             current_balance=balance,
         )
-
+        trade["pnl"] = total_pnl
+        trade["realized_pnl"] = total_pnl
+        self._log_position_closed(symbol, position_side, reason, exit_price, total_pnl)
         trade_logger.info(
             "[%s] Trade %s fully closed | reason=%s | total_pnl=%.4f",
             symbol,
             trade_id[:8],
             reason,
-            safe_float(trade.get("pnl")),
+            total_pnl,
         )
 
         if notify and self.telegram:

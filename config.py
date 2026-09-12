@@ -212,6 +212,15 @@ class Config:
     ENABLE_BREAK_EVEN: bool = _env_bool("ENABLE_BREAK_EVEN", True)
     ENABLE_TRAILING_STOP: bool = _env_bool("ENABLE_TRAILING_STOP", True)
     ENABLE_PARTIAL_TP: bool = _env_bool("ENABLE_PARTIAL_TP", True)
+    ENABLE_NATIVE_TP_SL: bool = _env_bool("ENABLE_NATIVE_TP_SL", False)
+    ENABLE_SOFT_TP_SL: bool = _env_bool("ENABLE_SOFT_TP_SL", True)
+    VIRTUAL_TP_TICKER_MAX_AGE_SECONDS: float = _env_float(
+        "VIRTUAL_TP_TICKER_MAX_AGE_SECONDS", 120.0
+    )
+    NATIVE_TP_WORKING_TYPE: str = os.getenv("NATIVE_TP_WORKING_TYPE", "MARK_PRICE")
+    CONFLICT_REJECT_LOG_INTERVAL_SECONDS: int = _env_int(
+        "CONFLICT_REJECT_LOG_INTERVAL_SECONDS", 300
+    )
 
     # ---------------- Strategy / SMC ----------------
     STRATEGY_MIN_SCORE: float = _env_float("STRATEGY_MIN_SCORE", 70.0)
@@ -385,6 +394,13 @@ class Config:
 
     # ---------------- Ops / VPS ----------------
     HEARTBEAT_SECONDS: int = _env_int("HEARTBEAT_SECONDS", 60)
+
+    # ---------------- Watchdog (watchdog.py) ----------------
+    WATCHDOG_INTERVAL_SECONDS: int = _env_int("WATCHDOG_INTERVAL_SECONDS", 45)
+    WATCHDOG_BREACH_GRACE_SECONDS: int = _env_int("WATCHDOG_BREACH_GRACE_SECONDS", 60)
+    WATCHDOG_MAIN_STALE_SECONDS: int = _env_int("WATCHDOG_MAIN_STALE_SECONDS", 180)
+    WATCHDOG_AUTO_RESTART_MAIN: bool = _env_bool("WATCHDOG_AUTO_RESTART_MAIN", False)
+    WATCHDOG_MAIN_SCRIPT: str = os.getenv("WATCHDOG_MAIN_SCRIPT", "main.py")
     ENABLE_DAILY_REPORT: bool = _env_bool("ENABLE_DAILY_REPORT", True)
     ENABLE_WEEKLY_REPORT: bool = _env_bool("ENABLE_WEEKLY_REPORT", True)
     ENABLE_MONTHLY_REPORT: bool = _env_bool("ENABLE_MONTHLY_REPORT", True)
@@ -410,6 +426,14 @@ class Config:
         DATA_DIR,
         os.getenv("DATABASE_NAME", "trading_bot.sqlite"),
     )
+    WATCHDOG_HEARTBEAT_FILE: str = os.path.join(
+        DATA_DIR, os.getenv("WATCHDOG_HEARTBEAT_FILE", "bot_heartbeat.json")
+    )
+    WATCHDOG_STATE_FILE: str = os.path.join(
+        DATA_DIR, os.getenv("WATCHDOG_STATE_FILE", "watchdog_state.json")
+    )
+    WATCHDOG_FORCE_REST: bool = _env_bool("WATCHDOG_FORCE_REST", False)
+    EXIT_CLAIM_TTL_SECONDS: int = _env_int("EXIT_CLAIM_TTL_SECONDS", 120)
 
     @classmethod
     def get_scan_kline_intervals(cls) -> list[str]:

@@ -58,7 +58,10 @@ def compute_daily_pnl_metrics(
     """
     stats = db.get_daily_stats(date_str) or {}
     start_balance = safe_float(stats.get("start_balance"))
-    realized_pnl = safe_float(stats.get("total_pnl"))
+    trade_analytics = db.get_daily_trade_analytics(date_str)
+    realized_pnl = safe_float(trade_analytics.get("total_pnl"))
+    if realized_pnl == 0:
+        realized_pnl = safe_float(stats.get("total_pnl"))
     unrealized_pnl = exchange.get_unrealized_pnl_total()
     if unrealized_pnl == 0 and exchange.get_open_positions_count() > 0:
         unrealized_pnl = exchange.get_unrealized_pnl_total(force_refresh=True)
@@ -267,7 +270,10 @@ class RiskManager:
         daily_stats = self.db.get_daily_stats(today) or {}
 
         daily_entries = int(daily_stats.get("entries_count", 0) or 0)
-        daily_trades = int(daily_stats.get("trades_count", 0))
+        trade_analytics = self.db.get_daily_trade_analytics(today)
+        daily_trades = int(
+            trade_analytics.get("closes", daily_stats.get("trades_count", 0))
+        )
         consecutive_losses = self._count_consecutive_losses(Config.MAX_CONSECUTIVE_LOSSES)
 
         pnl_metrics = compute_daily_pnl_metrics(self.exchange, self.db, today)

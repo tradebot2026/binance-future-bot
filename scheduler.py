@@ -170,12 +170,21 @@ class DailyScheduler:
         if not stats:
             return stats
 
+        self.db.sync_daily_stats_from_trades(self.today_str)
+        stats = self.db.get_daily_stats(self.today_str) or stats
+        analytics = self.db.get_daily_trade_analytics(self.today_str)
         metrics = compute_daily_pnl_metrics(self.exchange, self.db, self.today_str)
         enriched = dict(stats)
+        enriched["total_pnl"] = safe_float(analytics.get("total_pnl"))
+        enriched["trades_count"] = int(analytics.get("closes", stats.get("trades_count", 0)))
         enriched["computed_total_pnl"] = metrics.total_pnl
         enriched["computed_pnl_percent"] = metrics.total_pnl_percent
         enriched["computed_realized_pnl_percent"] = metrics.realized_pnl_percent
         enriched["unrealized_pnl"] = metrics.unrealized_pnl
+        enriched["win_rate"] = analytics.get("win_rate", 0.0)
+        enriched["wins"] = analytics.get("wins", 0)
+        enriched["losses"] = analytics.get("losses", 0)
+        enriched["profit_factor"] = analytics.get("profit_factor", 0.0)
         live_balance = self.exchange.get_futures_balance(force_refresh=False)
         if live_balance <= 0:
             live_balance = self.exchange.get_futures_balance(force_refresh=True)

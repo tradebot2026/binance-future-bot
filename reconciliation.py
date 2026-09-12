@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from typing import Any, Optional, TYPE_CHECKING
 
 from config import Config
-from constants import TRADE_STATUS_CLOSED
 from logger import error_logger, system_logger
 from utils import safe_float, utc_now
 
@@ -19,6 +18,27 @@ if TYPE_CHECKING:
     from database import DatabaseManager
     from exchange import BinanceExchangeManager
     from telegram_bot import TelegramManager
+
+
+def finalize_reconciled_trade_close(
+    exchange: "BinanceExchangeManager",
+    db: "DatabaseManager",
+    trade: dict[str, Any],
+    exit_reason: str,
+) -> None:
+    """Close a DB trade with estimated PnL when the exchange position is flat."""
+    symbol = str(trade.get("symbol", "")).upper()
+    side = str(trade.get("side", "LONG")).upper()
+    exit_price = safe_float(exchange.get_market_price(symbol, side))
+    balance = exchange.get_futures_balance(force_refresh=False)
+    db.close_trade_and_sync_stats(
+        trade,
+        exit_price=exit_price,
+        exit_reason=exit_reason,
+        book_daily_pnl=True,
+        current_balance=balance if balance > 0 else None,
+    )
+    exchange.clear_position_cache(symbol, side)
 
 
 def trade_open_age_seconds(trade: dict[str, Any]) -> float:
@@ -229,16 +249,10 @@ def sync_active_trades_on_demand(
             exchange_keys.add(key)
             continue
 
-        db.update_trade(
-            trade_id,
-            {
-                "status": TRADE_STATUS_CLOSED,
-                "closed_at": utc_now().isoformat(),
-                "exit_reason": "RECONCILED_MANUAL_CLOSE",
-            },
+        finalize_reconciled_trade_close(
+            exchange, db, trade, "RECONCILED_MANUAL_CLOSE"
         )
         position_reconcile_guard.note_present(trade_id)
-        exchange.clear_position_cache(symbol, side)
         summary["closed"].append(f"{symbol} {side}")
         system_logger.warning(
             "Purged manually closed trade from DB: %s %s | id=%s",
@@ -377,19 +391,10 @@ def reconcile_positions(
                     )
                     continue
 
-                db.update_trade(
-                    trade_id,
-                    {
-                        "status": TRADE_STATUS_CLOSED,
-                        "closed_at": utc_now().isoformat(),
-                        "exit_reason": "RECONCILED_PHANTOM_PURGE",
-                    },
+                finalize_reconciled_trade_close(
+                    exchange, db, trade, "RECONCILED_PHANTOM_PURGE"
                 )
                 position_reconcile_guard.note_present(trade_id)
-                exchange.clear_position_cache(
-                    str(trade["symbol"]).upper(),
-                    str(trade.get("side", "LONG")).upper(),
-                )
                 closed_externally += 1
                 system_logger.warning(
                     "Purged phantom DB trade (exchange flat): %s %s | id=%s",

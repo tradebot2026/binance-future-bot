@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from typing import TYPE_CHECKING, Optional
 
 from config import Config
@@ -28,6 +29,7 @@ class SymbolConflictGuard:
         self.exchange = exchange
         self.db = db
         self._cycle_claims: dict[str, SignalCandidate] = {}
+        self._reject_log_at: dict[str, float] = {}
 
     def reset_cycle(self) -> None:
         """Clear in-memory claims at the start of each scan cycle."""
@@ -93,6 +95,15 @@ class SymbolConflictGuard:
         reason: str,
         context: str = "conflict_guard",
     ) -> None:
+        symbol = candidate.symbol.upper()
+        suppress_key = f"{symbol}:{reason}"
+        now = time.monotonic()
+        last = self._reject_log_at.get(suppress_key, 0.0)
+        interval = max(Config.CONFLICT_REJECT_LOG_INTERVAL_SECONDS, 60)
+        if (now - last) < interval:
+            return
+        self._reject_log_at[suppress_key] = now
+
         log_execution_rejected(candidate.symbol, reason, strategy=candidate.strategy)
         signal_logger.info(
             "CONFLICT_REJECTED %s %s | strategy=%s | reason=%s | context=%s",
