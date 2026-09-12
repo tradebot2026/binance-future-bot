@@ -303,10 +303,10 @@ class TradeManager:
         position_reconcile_guard.note_present(str(trade["trade_id"]))
 
         if price is None or price <= 0:
-            price = self.exchange.get_market_price(symbol, position_side)
+            price = self.exchange.get_tp_monitor_price(symbol, position_side)
         if price is None or price <= 0:
             trade_logger.warning(
-                "[%s] TP/SL eval skipped — no mark/ticker price available.",
+                "[%s] TP/SL eval skipped — no live ticker/mark price available.",
                 symbol,
             )
             return
@@ -660,13 +660,14 @@ class TradeManager:
         self.db.update_trade(trade["trade_id"], {"metadata": metadata})
         trade["metadata"] = metadata
 
-        self._close_position(
+        if not self._close_position(
             trade,
             quantity=close_qty,
             reason=reason,
             partial=True,
             tp_level=level,
-        )
+        ):
+            self._rollback_tp_lock(trade, level)
 
     def _finalize_take_profit(
         self,
@@ -738,12 +739,14 @@ class TradeManager:
             if task is None:
                 break
             trade_id = str(task.trade.get("trade_id", ""))
+            inflight_key = f"{trade_id}:{task.reason}"
             try:
                 ok = self._execute_close_order(
                     task.trade,
                     task.quantity,
                     task.reason,
                     partial=task.partial,
+                    tp_level=task.tp_level,
                 )
                 if task.tp_level:
                     if ok:
@@ -765,7 +768,7 @@ class TradeManager:
                     task.result_box[0] = False
             finally:
                 with self._close_lock:
-                    self._close_inflight.discard(trade_id)
+                    self._close_inflight.discard(inflight_key)
                 if task.result_event is not None:
                     task.result_event.set()
                 self._close_queue.task_done()
@@ -830,15 +833,11 @@ class TradeManager:
         if updated and metadata.get("trailing_active"):
             self.db.update_trade(trade["trade_id"], {"metadata": metadata})
 
-    def _remaining_close_quantity(self, trade: dict[str, Any]) -> float:
-        """Prefer exchange-reported size; fall back to metadata remainder."""
-        position_side = trade.get("side", "LONG")
-        live_qty = self.exchange.get_position_quantity(trade["symbol"], position_side)
-        if live_qty > 0:
-            return live_qty
-
+    def _metadata_remaining_quantity(self, trade: dict[str, Any]) -> float:
         metadata = self.db.parse_trade_metadata(trade)
-        original = safe_float(metadata.get("original_quantity"), safe_float(trade.get("quantity")))
+        original = safe_float(
+            metadata.get("original_quantity"), safe_float(trade.get("quantity"))
+        )
         remaining = original
         for key in ("tp1_quantity", "tp2_quantity", "tp3_quantity"):
             executed_key = key.replace("_quantity", "_executed")
@@ -846,11 +845,20 @@ class TradeManager:
                 remaining -= safe_float(metadata.get(key))
         return max(remaining, 0.0)
 
+    def _remaining_close_quantity(self, trade: dict[str, Any]) -> float:
+        """Prefer exchange-reported size; fall back to metadata remainder."""
+        position_side = trade.get("side", "LONG")
+        live_qty = self.exchange.get_position_quantity(trade["symbol"], position_side)
+        if live_qty > 0:
+            return live_qty
+        return self._metadata_remaining_quantity(trade)
+
     def _resolve_close_quantity(
         self,
         trade: dict[str, Any],
         requested_qty: float,
         *,
+        partial: bool = False,
         exchange_only: bool = True,
     ) -> float:
         """Clamp requested quantity to live exchange position size."""
@@ -862,7 +870,9 @@ class TradeManager:
         if live_qty <= 0:
             live_qty = self.exchange.get_position_quantity(symbol, position_side)
         if live_qty <= 0 and not exchange_only:
-            live_qty = self._trade_quantity_from_db(trade)
+            live_qty = self._metadata_remaining_quantity(trade)
+        if live_qty <= 0 and partial and requested_qty > 0:
+            live_qty = requested_qty
         if live_qty <= 0:
             return 0.0
 
@@ -916,15 +926,32 @@ class TradeManager:
         """Enqueue close for monitor paths; blocking=True waits for close-all/manual."""
         symbol = trade["symbol"]
         trade_id = str(trade["trade_id"])
+        inflight_key = f"{trade_id}:{reason}"
 
-        close_qty = self._resolve_close_quantity(trade, quantity, exchange_only=True)
+        close_qty = self._resolve_close_quantity(
+            trade,
+            quantity,
+            partial=partial,
+            exchange_only=not partial,
+        )
         if close_qty <= 0:
-            return self._reconcile_exchange_flat(trade, reason)
+            if partial:
+                if quantity > 0:
+                    close_qty = quantity
+                    trade_logger.info(
+                        "[%s] Partial close qty from metadata=%s (exchange cache stale).",
+                        symbol,
+                        close_qty,
+                    )
+                else:
+                    return False
+            else:
+                return self._reconcile_exchange_flat(trade, reason)
 
         with self._close_lock:
-            if trade_id in self._close_inflight:
+            if inflight_key in self._close_inflight:
                 return True
-            self._close_inflight.add(trade_id)
+            self._close_inflight.add(inflight_key)
 
         task = _CloseTask(
             trade=trade,
@@ -961,11 +988,33 @@ class TradeManager:
         quantity: float,
         reason: str,
         partial: bool = False,
+        *,
+        tp_level: Optional[str] = None,
     ) -> bool:
+        trade_id = trade["trade_id"]
+        fresh = self.db.get_trade(trade_id)
+        if fresh:
+            trade = fresh
+        if trade.get("status") == TRADE_STATUS_CLOSED:
+            return True
+
         symbol = trade["symbol"]
         position_side = trade.get("side", "LONG")
-        trade_id = trade["trade_id"]
-        close_qty = quantity
+        close_qty = self._resolve_close_quantity(
+            trade,
+            quantity,
+            partial=partial,
+            exchange_only=False,
+        )
+        if close_qty <= 0:
+            if partial:
+                trade_logger.error(
+                    "[%s] Partial close aborted — could not resolve qty for %s.",
+                    symbol,
+                    reason,
+                )
+                return False
+            return self._reconcile_exchange_flat(trade, reason)
 
         try:
             response: Optional[dict[str, Any]] = None
@@ -1053,14 +1102,31 @@ class TradeManager:
             realized,
         )
 
+        if partial and tp_level not in (None, "TP3") and reason != "TP3_FULL_CLOSE":
+            metadata_remaining = self._metadata_remaining_quantity(trade)
+            trade_logger.info(
+                "[%s] Partial %s filled qty=%s | metadata_remaining=%.4f",
+                symbol,
+                reason,
+                close_qty,
+                max(metadata_remaining - close_qty, 0.0),
+            )
+            return True
+
         live_remaining = self.exchange.get_position_quantity(symbol, position_side)
-        is_full_close = live_remaining <= 0 or not partial
+        metadata_remaining = self._metadata_remaining_quantity(trade)
+        is_full_close = (
+            not partial
+            or tp_level == "TP3"
+            or reason == "TP3_FULL_CLOSE"
+            or live_remaining <= 0
+            or metadata_remaining <= 0
+        )
 
         if is_full_close:
             self._mark_trade_closed(trade, reason=reason, exit_price=exit_price)
         else:
-            remaining_qty = self.exchange.get_position_quantity(symbol, position_side)
-            if remaining_qty <= 0:
+            if live_remaining <= 0:
                 self.exchange.clear_position_cache(symbol, position_side)
             elif self.telegram and "STOP" in reason.upper():
                 self.telegram.send_close_alert(symbol=symbol, reason=reason, pnl=realized)

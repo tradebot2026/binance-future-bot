@@ -983,6 +983,7 @@ class MarketDataHub:
             if updated:
                 self._reconnect_policy.reset()
                 for sym, tick_price in tick_prices.items():
+                    self.update_position_mark_from_ticker(sym, tick_price)
                     self._emit_price_tick(sym, tick_price)
         except Exception as exc:
             error_logger.warning("Ticker WS parse error: %s", exc)
@@ -1478,6 +1479,39 @@ class MarketDataHub:
                 price = safe_float(row.get("lastPrice"))
                 return price if price > 0 else None
         return None
+
+    def get_fresh_ticker_price(
+        self,
+        symbol: str,
+        *,
+        max_age_seconds: float = 30.0,
+    ) -> Optional[float]:
+        """Last miniTicker price if updated within max_age_seconds."""
+        symbol = symbol.upper()
+        now = time.monotonic()
+        with self._lock:
+            row = self._tickers.get(symbol)
+            if not row:
+                return None
+            updated_at = safe_float(row.get("updated_at"))
+            if updated_at <= 0 or (now - updated_at) > max_age_seconds:
+                return None
+            price = safe_float(row.get("lastPrice"))
+            return price if price > 0 else None
+
+    def update_position_mark_from_ticker(self, symbol: str, price: float) -> None:
+        """Refresh cached mark prices between sparse ACCOUNT_UPDATE events."""
+        if price <= 0:
+            return
+        symbol = symbol.upper()
+        with self._lock:
+            updated = False
+            for pos in self._positions:
+                if pos.get("symbol") == symbol:
+                    pos["mark_price"] = price
+                    updated = True
+            if updated:
+                self._last_user_event_at = time.monotonic()
 
     def get_ticker_map(self) -> dict[str, dict[str, Any]]:
         with self._lock:

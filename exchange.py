@@ -1472,6 +1472,18 @@ class BinanceExchangeManager:
                 return mark
         return None
 
+    def get_tp_monitor_price(
+        self, symbol: str, position_side: str = "LONG"
+    ) -> Optional[float]:
+        """Live last price for internal TP/SL — avoids stale seeded mark prices."""
+        if self._market_data:
+            fresh = self._market_data.get_fresh_ticker_price(
+                symbol, max_age_seconds=30.0
+            )
+            if fresh is not None and fresh > 0:
+                return fresh
+        return self.get_market_price(symbol, position_side)
+
     def get_market_price(self, symbol: str, position_side: str = "LONG") -> Optional[float]:
         if self._market_data:
             cached = self._market_data.get_price(symbol)
