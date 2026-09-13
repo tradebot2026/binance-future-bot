@@ -13,8 +13,10 @@ import pandas as pd
 from config import Config
 from constants import STRATEGY_RANGE_REVERSION
 from smc_engine import (
+    StructureMetadata,
     check_bearish_expansion_veto,
     check_momentum_crash_veto,
+    compute_dynamic_tp_ladder,
     compute_rr_ladder,
     resolve_confirm_trend,
     resolve_macro_trend,
@@ -219,22 +221,29 @@ def compute_range_sl_tp(
         sl = max(boundary_sl, entry_price + buffer)
         sl = min(sl, entry_price + max_dist)
 
-    sl, tp1, tp2, tp3 = compute_rr_ladder(action, entry_price, sl)
+    extra = {
+        "range_high": meta.range_high,
+        "range_low": meta.range_low,
+        "equilibrium": meta.equilibrium,
+    }
+    if Config.USE_DYNAMIC_TP_LADDER:
+        struct = StructureMetadata(equilibrium=meta.equilibrium)
+        tp1, tp2, tp3 = compute_dynamic_tp_ladder(
+            action, entry_price, atr, struct, extra_structure=extra
+        )
+    else:
+        _, tp1, tp2, tp3 = compute_rr_ladder(action, entry_price, sl)
 
     if action == "LONG" and meta.range_high > entry_price:
         cap = meta.range_high - buffer
         if cap > entry_price:
-            if tp3 > 0:
-                tp3 = min(tp3, cap)
-            else:
-                tp3 = cap
+            tp1 = min(tp1, cap) if tp1 > entry_price else tp1
+            tp2 = min(tp2, cap) if tp2 > entry_price else tp2
     elif action == "SHORT" and meta.range_low > 0 and meta.range_low < entry_price:
         cap = meta.range_low + buffer
         if cap < entry_price:
-            if tp3 > 0:
-                tp3 = max(tp3, cap)
-            else:
-                tp3 = cap
+            tp1 = max(tp1, cap) if tp1 < entry_price else tp1
+            tp2 = max(tp2, cap) if tp2 < entry_price else tp2
 
     return sl, tp1, tp2, tp3
 

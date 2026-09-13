@@ -206,16 +206,27 @@ class Config:
 
     # ---------------- ATR exits ----------------
     SL_ATR_MULTIPLIER: float = _env_float("SL_ATR_MULTIPLIER", 2.0)
-    TP1_ATR_MULTIPLIER: float = _env_float("TP1_ATR_MULTIPLIER", 1.5)
-    TP2_ATR_MULTIPLIER: float = _env_float("TP2_ATR_MULTIPLIER", 2.5)
-    TP3_ATR_MULTIPLIER: float = _env_float("TP3_ATR_MULTIPLIER", 4.0)
+    TP1_ATR_MULTIPLIER: float = _env_float("TP1_ATR_MULTIPLIER", 2.0)
+    TP2_ATR_MULTIPLIER: float = _env_float("TP2_ATR_MULTIPLIER", 4.0)
+    TP3_ATR_MULTIPLIER: float = _env_float("TP3_ATR_MULTIPLIER", 6.0)
+    TP_MIN_SPACING_ATR: float = _env_float("TP_MIN_SPACING_ATR", 0.75)
+    USE_DYNAMIC_TP_LADDER: bool = _env_bool("USE_DYNAMIC_TP_LADDER", True)
+    ENABLE_TP3_RUNNER: bool = _env_bool("ENABLE_TP3_RUNNER", True)
+    RUNNER_TRAIL_ATR_MULTIPLIER: float = _env_float("RUNNER_TRAIL_ATR_MULTIPLIER", 1.5)
     ENABLE_BREAK_EVEN: bool = _env_bool("ENABLE_BREAK_EVEN", True)
     ENABLE_TRAILING_STOP: bool = _env_bool("ENABLE_TRAILING_STOP", True)
     ENABLE_PARTIAL_TP: bool = _env_bool("ENABLE_PARTIAL_TP", True)
     ENABLE_NATIVE_TP_SL: bool = _env_bool("ENABLE_NATIVE_TP_SL", False)
     ENABLE_SOFT_TP_SL: bool = _env_bool("ENABLE_SOFT_TP_SL", True)
     VIRTUAL_TP_TICKER_MAX_AGE_SECONDS: float = _env_float(
-        "VIRTUAL_TP_TICKER_MAX_AGE_SECONDS", 120.0
+        "VIRTUAL_TP_TICKER_MAX_AGE_SECONDS", 15.0
+    )
+    MONITOR_LOOP_STALL_SECONDS: float = _env_float("MONITOR_LOOP_STALL_SECONDS", 5.0)
+    MONITOR_WATCHDOG_INTERVAL_SECONDS: float = _env_float(
+        "MONITOR_WATCHDOG_INTERVAL_SECONDS", 5.0
+    )
+    MONITOR_REST_MARK_INTERVAL_SECONDS: float = _env_float(
+        "MONITOR_REST_MARK_INTERVAL_SECONDS", 8.0
     )
     NATIVE_TP_WORKING_TYPE: str = os.getenv("NATIVE_TP_WORKING_TYPE", "MARK_PRICE")
     CONFLICT_REJECT_LOG_INTERVAL_SECONDS: int = _env_int(
@@ -394,7 +405,7 @@ class Config:
 
     # ---------------- Ops / VPS ----------------
     HEARTBEAT_SECONDS: int = _env_int("HEARTBEAT_SECONDS", 30)
-    MONITOR_HEARTBEAT_SECONDS: int = _env_int("MONITOR_HEARTBEAT_SECONDS", 15)
+    MONITOR_HEARTBEAT_SECONDS: int = _env_int("MONITOR_HEARTBEAT_SECONDS", 5)
 
     # ---------------- Watchdog (watchdog.py) ----------------
     WATCHDOG_INTERVAL_SECONDS: int = _env_int("WATCHDOG_INTERVAL_SECONDS", 30)

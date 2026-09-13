@@ -9,6 +9,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Optional, TYPE_CHECKING
@@ -16,6 +17,7 @@ from typing import Any, Optional, TYPE_CHECKING
 from config import Config
 from constants import (
     STRATEGY_RANGE_REVERSION,
+    TP3_PORTION,
     TRADE_STATUS_CLOSED,
     TRADE_STATUS_TP1_HIT,
     TRADE_STATUS_TP2_HIT,
@@ -98,6 +100,9 @@ class TradeManager:
         self._fast_monitor.start()
         self._close_worker.start()
         self._register_open_trade_symbols()
+        from core.ops_heartbeat import touch_monitor_loop
+
+        touch_monitor_loop(source="manager_init")
 
     def _register_open_trade_symbols(self) -> None:
         """Ensure every open DB trade receives miniTicker-driven TP/SL evaluation."""
@@ -136,6 +141,10 @@ class TradeManager:
             with self._tick_lock:
                 batch = dict(self._latest_ticks)
                 self._latest_ticks.clear()
+            if batch:
+                from core.ops_heartbeat import touch_monitor_loop
+
+                touch_monitor_loop(source="price_tick_worker")
             for symbol, price in batch.items():
                 try:
                     self._process_price_tick(symbol, price)
@@ -148,15 +157,17 @@ class TradeManager:
                     )
 
     def _fast_monitor_loop(self) -> None:
-        """Dedicated 1s TP/SL loop — never waits on REST."""
-        from core.ops_heartbeat import write_bot_heartbeat
+        """Dedicated 1s TP/SL loop with live price REST fallback when WS ticks stall."""
+        from core.ops_heartbeat import touch_monitor_loop
 
         while not self._monitor_stop.wait(1.0):
             try:
+                self._prefetch_live_prices_for_open_trades()
                 self.monitor_open_trades(ws_only=True)
-                write_bot_heartbeat(source="position_monitor")
+                touch_monitor_loop(source="position_monitor")
             except Exception as exc:
                 error_logger.error("Fast TP/SL monitor error: %s", exc, exc_info=True)
+                error_logger.error(traceback.format_exc())
 
     def _trade_quantity_from_db(self, trade: dict[str, Any]) -> float:
         metadata = self.db.parse_trade_metadata(trade)
@@ -588,8 +599,9 @@ class TradeManager:
 
             self._advance_profit_stop_ladder(trade, current_price, is_long=True)
 
-            if Config.ENABLE_TRAILING_STOP and entry > 0 and current_price > entry:
-                self._apply_trailing_stop(trade, current_price, is_long=True)
+            if Config.ENABLE_TRAILING_STOP and entry > 0:
+                if current_price > entry or metadata.get("runner_active"):
+                    self._apply_trailing_stop(trade, current_price, is_long=True)
 
             stop_loss = safe_float(trade.get("stop_loss"))
             if stop_loss > 0 and current_price <= stop_loss:
@@ -606,9 +618,15 @@ class TradeManager:
             tp1 = safe_float(trade.get("take_profit_1"))
             tp2 = safe_float(trade.get("take_profit_2"))
             tp3 = safe_float(trade.get("take_profit_3"))
+            runner_mode = bool(metadata.get("runner_mode", Config.ENABLE_TP3_RUNNER))
 
             acted = False
-            if tp3 > 0 and current_price >= tp3 and not metadata.get("tp3_executed"):
+            if (
+                tp3 > 0
+                and not runner_mode
+                and current_price >= tp3
+                and not metadata.get("tp3_executed")
+            ):
                 self._trigger_virtual_tp(trade, "TP3", current_price, tp3)
                 self._handle_take_profit(trade, level="TP3", reason="TP3_FULL_CLOSE")
                 acted = True
@@ -635,8 +653,9 @@ class TradeManager:
 
             self._advance_profit_stop_ladder(trade, current_price, is_long=False)
 
-            if Config.ENABLE_TRAILING_STOP and entry > 0 and current_price < entry:
-                self._apply_trailing_stop(trade, current_price, is_long=False)
+            if Config.ENABLE_TRAILING_STOP and entry > 0:
+                if current_price < entry or metadata.get("runner_active"):
+                    self._apply_trailing_stop(trade, current_price, is_long=False)
 
             stop_loss = safe_float(trade.get("stop_loss"))
             if stop_loss > 0 and current_price >= stop_loss:
@@ -653,9 +672,15 @@ class TradeManager:
             tp1 = safe_float(trade.get("take_profit_1"))
             tp2 = safe_float(trade.get("take_profit_2"))
             tp3 = safe_float(trade.get("take_profit_3"))
+            runner_mode = bool(metadata.get("runner_mode", Config.ENABLE_TP3_RUNNER))
 
             acted = False
-            if tp3 > 0 and current_price <= tp3 and not metadata.get("tp3_executed"):
+            if (
+                tp3 > 0
+                and not runner_mode
+                and current_price <= tp3
+                and not metadata.get("tp3_executed")
+            ):
                 self._trigger_virtual_tp(trade, "TP3", current_price, tp3)
                 self._handle_take_profit(trade, level="TP3", reason="TP3_FULL_CLOSE")
                 acted = True
@@ -671,16 +696,30 @@ class TradeManager:
             if not acted:
                 break
 
+    def _prefetch_live_prices_for_open_trades(self) -> None:
+        """REST mark refresh for open symbols whose WS miniTicker is stale."""
+        if self.exchange.is_rest_blocked()[0]:
+            return
+        hub = getattr(self.exchange, "_market_data", None)
+        max_age = Config.VIRTUAL_TP_TICKER_MAX_AGE_SECONDS
+        for trade in self.db.get_open_trades():
+            symbol = str(trade.get("symbol", "")).upper()
+            side = str(trade.get("side", "LONG")).upper()
+            if not symbol:
+                continue
+            if hub is not None:
+                fresh = hub.get_fresh_ticker_price(symbol, max_age_seconds=max_age)
+                if fresh is not None and fresh > 0:
+                    continue
+            self.exchange.get_live_mark_price(symbol, side, allow_rest=True)
+
     def _resolve_monitor_price(
         self, symbol: str, position_side: str
     ) -> Optional[float]:
-        """Resolve a live price for virtual TP/SL — WS ticker first, REST last resort."""
-        price = self.exchange.get_tp_monitor_price(symbol, position_side)
-        if price is not None and price > 0:
-            return price
-        if not self.exchange.rest_account_reads_blocked():
-            return self.exchange.get_market_price(symbol, position_side)
-        return None
+        """Resolve a live price for virtual TP/SL — never unbounded stale cache."""
+        return self.exchange.get_live_mark_price(
+            symbol, position_side, allow_rest=True
+        )
 
     def _trigger_virtual_tp(
         self,
@@ -833,6 +872,15 @@ class TradeManager:
                     trade["symbol"],
                     new_sl,
                 )
+            if Config.ENABLE_TP3_RUNNER or metadata.get("runner_mode"):
+                metadata["runner_active"] = True
+                metadata["trailing_active"] = True
+                updates["metadata"] = metadata
+                trade_logger.info(
+                    "[%s] TP2 hit — runner active (%.0f%% trailing via dynamic SL).",
+                    trade["symbol"],
+                    TP3_PORTION * 100,
+                )
         elif level == "TP3":
             updates["status"] = TRADE_STATUS_CLOSED
 
@@ -929,7 +977,11 @@ class TradeManager:
         entry = safe_float(trade.get("entry_price"))
         current_sl = safe_float(trade.get("stop_loss"))
         best_price = safe_float(metadata.get("best_price"), entry)
-        trail_distance = atr * self.TRAILING_ATR_MULTIPLIER
+        if metadata.get("runner_active"):
+            trail_mult = Config.RUNNER_TRAIL_ATR_MULTIPLIER
+        else:
+            trail_mult = self.TRAILING_ATR_MULTIPLIER
+        trail_distance = atr * trail_mult
         rules = self.exchange.get_symbol_rules(trade["symbol"])
 
         updated = False
@@ -938,7 +990,7 @@ class TradeManager:
                 best_price = current_price
                 metadata["best_price"] = best_price
                 updated = True
-            if current_price > entry:
+            if metadata.get("runner_active") or current_price > entry:
                 metadata["trailing_active"] = True
                 candidate_sl = round_step_size(
                     best_price - trail_distance,
@@ -957,7 +1009,7 @@ class TradeManager:
                 best_price = current_price
                 metadata["best_price"] = best_price
                 updated = True
-            if current_price < entry:
+            if metadata.get("runner_active") or current_price < entry:
                 metadata["trailing_active"] = True
                 candidate_sl = round_step_size(
                     best_price + trail_distance,

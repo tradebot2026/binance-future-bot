@@ -19,9 +19,9 @@ DAILY_STATUS_ACTIVE: Final[str] = "ACTIVE"
 DAILY_STATUS_PAUSED: Final[str] = "PAUSED"
 
 # ---------------- Partial take-profit ratios (original position) ----------------
-TP1_PORTION: Final[float] = 0.33
-TP2_PORTION: Final[float] = 0.33
-TP3_PORTION: Final[float] = 0.34
+TP1_PORTION: Final[float] = 0.30
+TP2_PORTION: Final[float] = 0.30
+TP3_PORTION: Final[float] = 0.40
 
 # ---------------- Strategy identifiers (persisted on every trade) ----------------
 STRATEGY_SMC_TREND: Final[str] = "SMC_TREND"

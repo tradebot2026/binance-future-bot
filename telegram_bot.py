@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Callable, Optional
 import telebot
 
 from config import Config
-from constants import strategy_display_label
+from constants import TP1_PORTION, TP2_PORTION, TP3_PORTION, strategy_display_label
 from database import DatabaseManager
 from logger import error_logger, system_logger
 from telegram_alerts import format_active_positions_message, format_watchlist_message
@@ -33,6 +33,26 @@ TELEGRAM_PLACEHOLDERS = {
     "your_telegram_bot_token",
     "your_chat_id",
 }
+
+
+def _leg_pnl_usd(side: str, entry: float, target: float, quantity: float) -> float:
+    """Estimated USD PnL for a partial leg at target price."""
+    if entry <= 0 or target <= 0 or quantity <= 0:
+        return 0.0
+    if side.upper() == "LONG":
+        return (target - entry) * quantity
+    return (entry - target) * quantity
+
+
+def _format_sl_pnl(amount: float) -> str:
+    if amount >= 0:
+        return f"+${amount:.2f}"
+    return f"-${abs(amount):.2f} Loss"
+
+
+def _format_tp_pnl(amount: float, portion_pct: float) -> str:
+    sign = "+" if amount >= 0 else "-"
+    return f"{sign}${abs(amount):.2f} Profit on {portion_pct:.0f}%"
 
 
 class TelegramManager:
@@ -133,8 +153,26 @@ class TelegramManager:
         tp3: Optional[float] = None,
         score: float = 0.0,
         strategy: str = "DEFAULT",
+        quantity: float = 0.0,
     ) -> None:
         emoji = "🟢" if action == "LONG" else "🔴"
+        tp1_qty = quantity * TP1_PORTION if quantity > 0 else 0.0
+        tp2_qty = quantity * TP2_PORTION if quantity > 0 else 0.0
+        tp3_qty = quantity * TP3_PORTION if quantity > 0 else 0.0
+
+        sl_pnl = _leg_pnl_usd(action, price, sl, quantity) if quantity > 0 else 0.0
+        tp1_pnl = _leg_pnl_usd(action, price, tp1, tp1_qty) if tp1_qty > 0 else 0.0
+        tp2_pnl = (
+            _leg_pnl_usd(action, price, tp2, tp2_qty)
+            if tp2 is not None and tp2 > 0 and tp2_qty > 0
+            else 0.0
+        )
+        tp3_est = (
+            _leg_pnl_usd(action, price, tp3, tp3_qty)
+            if tp3 is not None and tp3 > 0 and tp3_qty > 0
+            else 0.0
+        )
+
         msg = (
             f"{emoji} <b>NEW TRADE EXECUTED</b>\n\n"
             f"🪙 <b>Pair:</b> {escape_html(symbol)}\n"
@@ -143,13 +181,34 @@ class TelegramManager:
             f"🏷 <b>Tag:</b> {escape_html(strategy)}\n"
             f"📊 <b>Score:</b> {score:.1f}\n"
             f"💵 <b>Entry:</b> {price:.6f}\n"
-            f"✅ <b>TP1:</b> {tp1:.6f}\n"
         )
-        if tp2 is not None:
-            msg += f"✅ <b>TP2:</b> {tp2:.6f}\n"
-        if tp3 is not None:
-            msg += f"✅ <b>TP3:</b> {tp3:.6f}\n"
-        msg += f"🛑 <b>SL:</b> {sl:.6f}"
+        if quantity > 0:
+            msg += f"📦 <b>Size:</b> {quantity:.4f}\n"
+
+        msg += f"🛑 <b>SL:</b> {sl:.6f} ({_format_sl_pnl(sl_pnl)})\n"
+        msg += (
+            f"🎯 <b>TP1:</b> {tp1:.6f} "
+            f"({_format_tp_pnl(tp1_pnl, TP1_PORTION * 100)})\n"
+        )
+        if tp2 is not None and tp2 > 0:
+            msg += (
+                f"🎯 <b>TP2:</b> {tp2:.6f} "
+                f"({_format_tp_pnl(tp2_pnl, TP2_PORTION * 100)})\n"
+            )
+        if Config.ENABLE_TP3_RUNNER:
+            est = max(tp3_est, 0.0)
+            msg += (
+                f"🚀 <b>TP3:</b> Dynamic Trailing "
+                f"(Runner {TP3_PORTION * 100:.0f}% | Est. +${est:.2f}+)\n"
+            )
+            if tp3 is not None and tp3 > 0:
+                msg += f"   <i>Expansion target ~{tp3:.6f}</i>\n"
+        elif tp3 is not None and tp3 > 0:
+            msg += (
+                f"🎯 <b>TP3:</b> {tp3:.6f} "
+                f"({_format_tp_pnl(tp3_est, TP3_PORTION * 100)})\n"
+            )
+
         self.send_message(msg)
 
     def send_close_alert(

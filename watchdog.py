@@ -376,11 +376,18 @@ class PositionWatchdog:
         tp2 = safe_float(trade.get("take_profit_2"))
         tp3 = safe_float(trade.get("take_profit_3"))
 
+        runner_mode = bool(metadata.get("runner_mode", Config.ENABLE_TP3_RUNNER))
+
         if side == "LONG":
             if sl > 0 and mark_price <= sl:
                 qty = self._close_quantity(trade, metadata, full=True)
                 return ExitSignal("SL", "STOP_LOSS", False, qty)
-            if tp3 > 0 and mark_price >= tp3 and not metadata.get("tp3_executed"):
+            if (
+                tp3 > 0
+                and not runner_mode
+                and mark_price >= tp3
+                and not metadata.get("tp3_executed")
+            ):
                 qty = self._close_quantity(trade, metadata, full=True)
                 return ExitSignal("TP3", "TP3_FULL_CLOSE", True, qty)
             if tp2 > 0 and mark_price >= tp2 and not metadata.get("tp2_executed"):
@@ -393,7 +400,12 @@ class PositionWatchdog:
             if sl > 0 and mark_price >= sl:
                 qty = self._close_quantity(trade, metadata, full=True)
                 return ExitSignal("SL", "STOP_LOSS", False, qty)
-            if tp3 > 0 and mark_price <= tp3 and not metadata.get("tp3_executed"):
+            if (
+                tp3 > 0
+                and not runner_mode
+                and mark_price <= tp3
+                and not metadata.get("tp3_executed")
+            ):
                 qty = self._close_quantity(trade, metadata, full=True)
                 return ExitSignal("TP3", "TP3_FULL_CLOSE", True, qty)
             if tp2 > 0 and mark_price <= tp2 and not metadata.get("tp2_executed"):

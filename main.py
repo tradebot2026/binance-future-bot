@@ -314,6 +314,7 @@ def _execute_candidates(
                     tp3=float(result.get("take_profit_3", 0.0)),
                     score=normalized["score"],
                     strategy=normalized["strategy"],
+                    quantity=float(result.get("quantity", 0.0)),
                 )
 
             scheduler.notify_trade_event()
@@ -350,9 +351,9 @@ def _execute_candidates(
 
 def _write_bot_heartbeat(cycle: int) -> None:
     """Touch heartbeat file for watchdog.py process health checks."""
-    from core.ops_heartbeat import write_bot_heartbeat
+    from core.ops_heartbeat import touch_main_loop
 
-    write_bot_heartbeat(cycle=cycle, source="main_loop")
+    touch_main_loop(cycle=cycle)
 
 
 def _start_position_monitor(
@@ -362,9 +363,13 @@ def _start_position_monitor(
     """Run position monitoring in a background thread every MONITOR_INTERVAL_SECONDS."""
 
     def _monitor_loop() -> None:
+        from core.ops_heartbeat import touch_monitor_loop
+
         while not stop_event.is_set():
             try:
+                manager._prefetch_live_prices_for_open_trades()
                 manager.monitor_open_trades()
+                touch_monitor_loop(source="slow_position_monitor")
             except Exception as exc:
                 error_logger.error("Background monitor error: %s", exc)
                 error_logger.error(traceback.format_exc())
@@ -553,6 +558,10 @@ def main(controller: Optional[BotController] = None) -> str:
             _bootstrap_scan_universe_at_startup(scanner, exchange, market_data)
 
         _start_position_monitor(manager, monitor_stop)
+
+        from core.monitor_watchdog import start_monitor_watchdog
+
+        start_monitor_watchdog(market_data, telegram=tg, stop_event=monitor_stop)
 
         system_logger.info("Initialization complete. Entering main trading loop.")
 

@@ -545,6 +545,10 @@ class MarketDataHub:
 
         return _wrapped
 
+    def reconnect_stale_streams(self, reason: str) -> None:
+        """Public entry: schedule WS reconnect when monitor/watchdog detects stale data."""
+        self._request_reconnect(reason)
+
     def _request_reconnect(self, reason: str) -> None:
         if not Config.WS_RECONNECT_ENABLED or not Config.ENABLE_WEBSOCKET_STREAMS:
             return

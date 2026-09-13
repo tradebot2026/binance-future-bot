@@ -117,7 +117,9 @@ def format_active_positions_message(
         tracked_keys.add((symbol, side))
 
         entry = safe_float(trade.get("entry_price"))
-        mark = safe_float(exchange.get_market_price(symbol, side))
+        mark = safe_float(exchange.get_live_mark_price(symbol, side, allow_rest=True))
+        if mark <= 0:
+            mark = safe_float(exchange.fetch_mark_price_rest(symbol))
         tp1 = safe_float(trade.get("take_profit_1"))
         tp2 = safe_float(trade.get("take_profit_2"))
         tp3 = safe_float(trade.get("take_profit_3"))

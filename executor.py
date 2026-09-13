@@ -21,6 +21,7 @@ from range_engine import RangeMetadata, compute_range_sl_tp
 from smc_engine import (
     StructureMetadata,
     check_opposing_liquidity_rr,
+    compute_dynamic_tp_ladder,
     compute_rr_ladder,
     compute_structural_sl,
     size_multiplier_for_score,
@@ -216,15 +217,20 @@ class TradeExecutor:
         rules: SymbolRules,
         structure: Optional[dict[str, Any]] = None,
     ) -> tuple[float, float, float, float]:
-        """Structural stop with R-multiple take-profit ladder."""
+        """Structural SL + dynamic ATR/structure take-profit ladder."""
         meta = StructureMetadata()
-        if structure:
-            for key, value in structure.items():
-                if hasattr(meta, key):
-                    setattr(meta, key, value)
+        structure = structure or {}
+        for key, value in structure.items():
+            if hasattr(meta, key):
+                setattr(meta, key, value)
 
         sl = compute_structural_sl(action, entry_price, atr, meta)
-        sl, tp1, tp2, tp3 = compute_rr_ladder(action, entry_price, sl)
+        if Config.USE_DYNAMIC_TP_LADDER:
+            tp1, tp2, tp3 = compute_dynamic_tp_ladder(
+                action, entry_price, atr, meta, extra_structure=structure
+            )
+        else:
+            _, tp1, tp2, tp3 = compute_rr_ladder(action, entry_price, sl)
 
         return (
             round_step_size(sl, rules.tick_size, rules.price_precision),
@@ -640,6 +646,9 @@ class TradeExecutor:
 
         metadata["atr_at_entry"] = atr
         metadata["trailing_active"] = False
+        metadata["runner_mode"] = Config.ENABLE_TP3_RUNNER
+        metadata["runner_active"] = False
+        metadata["tp3_is_estimate"] = Config.ENABLE_TP3_RUNNER
         metadata["best_price"] = current_price
         metadata["structure"] = structure
         metadata["strategy_tag"] = strategy

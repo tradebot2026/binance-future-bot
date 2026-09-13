@@ -177,6 +177,9 @@ class BinanceExchangeManager:
         self._execution_lock = threading.Lock()
         self._bootstrap_depth = 0
         self._bootstrap_lock = threading.Lock()
+        self._rest_mark_fetched_at: dict[str, float] = {}
+        self._rest_mark_cache: dict[str, float] = {}
+        self._rest_mark_lock = threading.Lock()
         self._kline_bootstrap_halted = False
         self._kline_rest_lock = threading.Lock()
         self._last_kline_rest_at: float = 0.0
@@ -1490,24 +1493,80 @@ class BinanceExchangeManager:
             error_logger.warning("REST mark price failed for %s: %s", symbol, exc)
             return None
 
-    def get_tp_monitor_price(
-        self, symbol: str, position_side: str = "LONG"
+    def _fetch_mark_price_rest_throttled(self, symbol: str) -> Optional[float]:
+        """Per-symbol REST mark fetch with throttle + short-lived cache."""
+        symbol = symbol.upper()
+        min_interval = max(Config.MONITOR_REST_MARK_INTERVAL_SECONDS, 3.0)
+        now = time.monotonic()
+        with self._rest_mark_lock:
+            last_fetch = self._rest_mark_fetched_at.get(symbol, 0.0)
+            cached = self._rest_mark_cache.get(symbol)
+            if cached and cached > 0 and (now - last_fetch) < min_interval:
+                return cached
+
+        mark = self.fetch_mark_price_rest(symbol)
+        with self._rest_mark_lock:
+            self._rest_mark_fetched_at[symbol] = now
+            if mark and mark > 0:
+                self._rest_mark_cache[symbol] = mark
+                return mark
+            return self._rest_mark_cache.get(symbol)
+
+    def get_live_mark_price(
+        self,
+        symbol: str,
+        position_side: str = "LONG",
+        *,
+        allow_rest: bool = True,
     ) -> Optional[float]:
-        """Best available live price for virtual TP/SL (ticker first, never stale entry mark)."""
+        """
+        Authoritative live mark for TP/SL and /active display.
+        Never returns an unbounded stale WS cache entry.
+        """
+        symbol = symbol.upper()
+        max_age = Config.VIRTUAL_TP_TICKER_MAX_AGE_SECONDS
+
         if self._market_data:
             fresh = self._market_data.get_fresh_ticker_price(
-                symbol,
-                max_age_seconds=Config.VIRTUAL_TP_TICKER_MAX_AGE_SECONDS,
+                symbol, max_age_seconds=max_age
             )
             if fresh is not None and fresh > 0:
                 return fresh
-            cached = self._market_data.get_price(symbol)
-            if cached is not None and cached > 0:
-                return cached
-        mark = self.get_mark_price(symbol, position_side)
-        if mark is not None and mark > 0:
-            return mark
-        return self.get_market_price(symbol, position_side)
+
+        if allow_rest and not self.is_rest_blocked()[0]:
+            rest_mark = self._fetch_mark_price_rest_throttled(symbol)
+            if rest_mark is not None and rest_mark > 0:
+                if self._market_data:
+                    self._market_data.update_position_mark_from_ticker(
+                        symbol, rest_mark
+                    )
+                if self._rest_block_log.should_log(f"live_mark_rest:{symbol}"):
+                    trade_logger.debug(
+                        "[%s] Live mark via REST fallback: %.6f (WS ticker stale)",
+                        symbol,
+                        rest_mark,
+                    )
+                return rest_mark
+
+        if self._market_data and self._market_data.ws_is_stale():
+            if allow_rest and not self.is_rest_blocked()[0]:
+                forced = self.fetch_mark_price_rest(symbol)
+                if forced and forced > 0:
+                    with self._rest_mark_lock:
+                        self._rest_mark_cache[symbol] = forced
+                        self._rest_mark_fetched_at[symbol] = time.monotonic()
+                    return forced
+
+        return None
+
+    def get_tp_monitor_price(
+        self, symbol: str, position_side: str = "LONG"
+    ) -> Optional[float]:
+        """Best available live price for virtual TP/SL — rejects stale internal cache."""
+        live = self.get_live_mark_price(symbol, position_side, allow_rest=True)
+        if live is not None and live > 0:
+            return live
+        return None
 
     def get_market_price(self, symbol: str, position_side: str = "LONG") -> Optional[float]:
         if self._market_data:

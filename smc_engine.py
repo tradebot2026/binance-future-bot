@@ -605,6 +605,112 @@ def compute_structural_sl(
         return sl
 
 
+def _collect_structural_targets(
+    action: str,
+    entry_price: float,
+    structure: StructureMetadata,
+    extra: Optional[dict[str, Any]] = None,
+) -> list[float]:
+    """Profit-side structural levels (swings, liquidity, zones)."""
+    raw_levels: list[float] = []
+    for attr in (
+        "opposing_liquidity",
+        "ob_zone_high",
+        "ob_zone_low",
+        "fvg_zone_high",
+        "fvg_zone_low",
+        "equilibrium",
+    ):
+        value = safe_float(getattr(structure, attr, 0.0))
+        if value > 0:
+            raw_levels.append(value)
+    if extra:
+        for key in ("range_high", "range_low", "equilibrium", "vwap"):
+            value = safe_float(extra.get(key))
+            if value > 0:
+                raw_levels.append(value)
+
+    if action == "LONG":
+        return sorted({level for level in raw_levels if level > entry_price})
+    return sorted(
+        {level for level in raw_levels if level < entry_price},
+        reverse=True,
+    )
+
+
+def _atr_profit_target(action: str, entry_price: float, atr: float, mult: float) -> float:
+    if action == "LONG":
+        return entry_price + atr * mult
+    return entry_price - atr * mult
+
+
+def _blend_atr_and_structure(
+    action: str,
+    entry_price: float,
+    atr: float,
+    atr_mult: float,
+    struct_levels: list[float],
+) -> float:
+    """Use the more ambitious target: wider ATR expansion or nearest structural level."""
+    base = _atr_profit_target(action, entry_price, atr, atr_mult)
+    if not struct_levels:
+        return base
+
+    if action == "LONG":
+        beyond = [level for level in struct_levels if level >= base * 0.98]
+        if beyond:
+            return max(base, min(beyond))
+        valid = [level for level in struct_levels if level > entry_price + atr * 0.25]
+        if valid:
+            return max(base, valid[0])
+    else:
+        beyond = [level for level in struct_levels if level <= base * 1.02]
+        if beyond:
+            return min(base, max(beyond))
+        valid = [level for level in struct_levels if level < entry_price - atr * 0.25]
+        if valid:
+            return min(base, valid[0])
+    return base
+
+
+def compute_dynamic_tp_ladder(
+    action: str,
+    entry_price: float,
+    atr: float,
+    structure: StructureMetadata,
+    extra_structure: Optional[dict[str, Any]] = None,
+) -> tuple[float, float, float]:
+    """
+    ATR-expansion TPs blended with structural S/R levels.
+    TP3 is an estimate target when runner mode is enabled (no hard close required).
+    """
+    if atr <= 0:
+        atr = entry_price * 0.005
+
+    struct_levels = _collect_structural_targets(
+        action, entry_price, structure, extra_structure
+    )
+    tp1 = _blend_atr_and_structure(
+        action, entry_price, atr, Config.TP1_ATR_MULTIPLIER, struct_levels
+    )
+    tp2 = _blend_atr_and_structure(
+        action, entry_price, atr, Config.TP2_ATR_MULTIPLIER, struct_levels
+    )
+    tp3 = _blend_atr_and_structure(
+        action, entry_price, atr, Config.TP3_ATR_MULTIPLIER, struct_levels
+    )
+
+    gap = atr * Config.TP_MIN_SPACING_ATR
+    if action == "LONG":
+        tp2 = max(tp2, tp1 + gap)
+        tp3 = max(tp3, tp2 + gap)
+    else:
+        tp2 = min(tp2, tp1 - gap)
+        tp3 = min(tp3, tp2 - gap)
+
+    return tp1, tp2, tp3
+
+
 def compute_rr_ladder(
     action: str,
     entry_price: float,
