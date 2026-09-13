@@ -14,6 +14,11 @@ from constants import DAILY_STATUS_ACTIVE, DAILY_STATUS_PAUSED
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from logger import performance_logger, system_logger, trade_logger
+from core.daily_balance_manager import (
+    ensure_daily_baseline,
+    fetch_account_equity,
+    on_utc_day_rollover,
+)
 from risk_manager import compute_daily_pnl_metrics
 from utils import safe_float, utc_today_str
 
@@ -53,15 +58,15 @@ class DailyScheduler:
         delay = max(Config.STARTUP_BALANCE_RETRY_SECONDS, 0.5)
 
         for attempt in range(1, max_attempts + 1):
-            balance = self.exchange.fetch_startup_balance()
-            if balance > 0:
-                self.db.initialize_daily_stats(self.today_str, balance)
-                self.db.update_daily_balance(self.today_str, balance, DAILY_STATUS_ACTIVE)
+            baseline = ensure_daily_baseline(
+                self.exchange, self.db, utc_day=self.today_str
+            )
+            if baseline > 0:
                 self._startup_initialized = True
                 system_logger.info(
-                    "Trading day %s initialized with reference balance $%.2f.",
+                    "Trading day %s initialized with daily starting balance $%.2f.",
                     self.today_str,
-                    balance,
+                    baseline,
                 )
                 return
 
@@ -210,23 +215,32 @@ class DailyScheduler:
             )
 
     def _initialize_trading_day(self, force_balance_refresh: bool) -> None:
-        balance = self._get_balance(force_refresh=force_balance_refresh)
-        if balance <= 0:
+        baseline = on_utc_day_rollover(
+            self.exchange, self.db, self.today_str
+        )
+        if baseline <= 0:
+            baseline = ensure_daily_baseline(
+                self.exchange,
+                self.db,
+                utc_day=self.today_str,
+            )
+        if baseline <= 0:
             system_logger.warning(
-                "Could not initialize daily stats for %s: balance unavailable.",
+                "Could not initialize daily stats for %s: equity unavailable.",
                 self.today_str,
             )
             return
 
-        self.db.initialize_daily_stats(self.today_str, balance)
-        self.db.update_daily_balance(self.today_str, balance, DAILY_STATUS_ACTIVE)
         system_logger.info(
-            "Trading day %s initialized with reference balance $%.2f.",
+            "Trading day %s — daily starting balance $%.2f.",
             self.today_str,
-            balance,
+            baseline,
         )
 
     def _get_balance(self, force_refresh: bool) -> float:
+        equity = fetch_account_equity(self.exchange, force=force_refresh)
+        if equity > 0:
+            return equity
         return self.exchange.get_futures_balance(force_refresh=force_refresh)
 
     def _pause_entries(

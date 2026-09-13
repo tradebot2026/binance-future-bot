@@ -1489,6 +1489,89 @@ class BinanceExchangeManager:
 
         return result
 
+    def resolve_order_fill_pnl(
+        self,
+        symbol: str,
+        order_id: str,
+        *,
+        position_side: str = "",
+        wait_seconds: float = 3.0,
+    ) -> ClosedPositionPnl:
+        """
+        Authoritative realized PnL for a single close order fill.
+        WS ORDER_TRADE_UPDATE (rp) → REST userTrades by orderId.
+        """
+        symbol = symbol.upper()
+        order_id = str(order_id or "").strip()
+        result = ClosedPositionPnl(source="unknown")
+
+        if not order_id:
+            return result
+
+        hub = self._market_data
+        if hub is not None and hasattr(hub, "fill_tracker"):
+            ws_fill = hub.fill_tracker.wait_for(order_id, timeout=wait_seconds)
+            if ws_fill is not None:
+                result.realized_pnl = ws_fill.realized_pnl
+                result.commission = ws_fill.commission
+                result.exit_price = ws_fill.fill_price
+                result.fill_count = 1
+                result.source = "ws"
+                trade_logger.info(
+                    "[%s] Fill PnL from WS order %s | rp=%.4f | px=%.6f",
+                    symbol,
+                    order_id,
+                    result.realized_pnl,
+                    result.exit_price,
+                )
+                return result
+
+        if self.is_rest_blocked()[0]:
+            return result
+
+        try:
+            kwargs: dict[str, Any] = {"symbol": symbol, "orderId": int(order_id)}
+            rows = self._throttled_call(
+                self.client.futures_account_trades,
+                **kwargs,
+            )
+            close_qty = 0.0
+            close_notional = 0.0
+            for row in rows or []:
+                row_ps = str(row.get("positionSide", "BOTH")).upper()
+                if position_side and row_ps not in (position_side.upper(), "BOTH"):
+                    continue
+                result.realized_pnl += safe_float(row.get("realizedPnl"))
+                result.commission += safe_float(row.get("commission"))
+                result.fill_count += 1
+                qty = safe_float(row.get("qty"))
+                price = safe_float(row.get("price"))
+                if qty > 0 and price > 0:
+                    close_qty += qty
+                    close_notional += price * qty
+
+            if result.fill_count > 0:
+                result.source = "userTrades"
+                if close_qty > 0:
+                    result.exit_price = close_notional / close_qty
+                trade_logger.info(
+                    "[%s] Fill PnL from REST order %s | rp=%.4f | fills=%s",
+                    symbol,
+                    order_id,
+                    result.realized_pnl,
+                    result.fill_count,
+                )
+        except Exception as exc:
+            if self._rest_block_log.should_log(f"order_pnl:{symbol}:{order_id}"):
+                error_logger.warning(
+                    "Order fill PnL REST fetch failed for %s order %s: %s",
+                    symbol,
+                    order_id,
+                    exc,
+                )
+
+        return result
+
     # ---------------- Market data ----------------
 
     def fetch_historical_candles(

@@ -1293,36 +1293,90 @@ class TradeManager:
         if not response:
             return False
 
-        exit_price = safe_float(response.get("avgPrice"))
+        order_id = str(response.get("orderId", ""))
+        fill_pnl = self.exchange.resolve_order_fill_pnl(
+            symbol,
+            order_id,
+            position_side=str(position_side),
+        )
+        exit_price = fill_pnl.exit_price
+        if exit_price <= 0:
+            exit_price = safe_float(response.get("avgPrice"))
         if exit_price <= 0:
             exit_price = safe_float(
                 self.exchange.get_market_price(symbol, position_side)
             )
 
-        realized = self._calculate_realized_pnl(
-            side=position_side,
-            entry=safe_float(trade.get("entry_price")),
-            exit_price=exit_price,
-            quantity=close_qty,
+        leg_pnl = fill_pnl.realized_pnl
+        pnl_source = fill_pnl.source
+        if fill_pnl.fill_count <= 0 or pnl_source == "unknown":
+            trade_logger.warning(
+                "[%s] Binance fill PnL unavailable for order %s — skipping local estimate.",
+                symbol,
+                order_id or "?",
+            )
+            leg_pnl = 0.0
+            pnl_source = "unavailable"
+
+        prior_pnl = safe_float(trade.get("realized_pnl"))
+        if prior_pnl == 0:
+            prior_pnl = safe_float(trade.get("pnl"))
+
+        live_remaining = self.exchange.get_position_quantity(symbol, position_side)
+        metadata_remaining = self._metadata_remaining_quantity(trade)
+        is_full_close = (
+            not partial
+            or tp_level == "TP3"
+            or reason == "TP3_FULL_CLOSE"
+            or live_remaining <= 0
+            or metadata_remaining <= 0
         )
 
-        cumulative_pnl = safe_float(trade.get("pnl")) + realized
+        if is_full_close:
+            from reconciliation import trade_opened_at_ms
+
+            lifecycle = self.exchange.fetch_closed_position_realized_pnl(
+                symbol,
+                str(position_side),
+                trade_opened_at_ms(trade),
+            )
+            if lifecycle.source in ("userTrades", "income", "ws") and (
+                lifecycle.fill_count > 0 or abs(lifecycle.realized_pnl) > 0
+            ):
+                cumulative_pnl = lifecycle.realized_pnl
+                pnl_source = lifecycle.source
+            else:
+                cumulative_pnl = prior_pnl + leg_pnl
+        else:
+            cumulative_pnl = prior_pnl + leg_pnl
+
+        metadata = self.db.parse_trade_metadata(trade)
+        metadata["last_fill_order_id"] = order_id
+        metadata["last_fill_pnl_source"] = pnl_source
         self.db.update_trade(
             trade_id,
-            {"pnl": cumulative_pnl, "realized_pnl": cumulative_pnl},
+            {
+                "pnl": cumulative_pnl,
+                "realized_pnl": cumulative_pnl,
+                "metadata": metadata,
+            },
         )
         trade["pnl"] = cumulative_pnl
         trade["realized_pnl"] = cumulative_pnl
 
-        self.db.add_daily_realized_pnl(utc_today_str(), realized)
+        daily_leg = cumulative_pnl - prior_pnl
+        if daily_leg != 0:
+            self.db.add_daily_realized_pnl(utc_today_str(), daily_leg)
         self.db.sync_daily_stats_from_trades(utc_today_str())
 
         trade_logger.info(
-            "[%s] Closed qty=%s | reason=%s | pnl=%.4f",
+            "[%s] Closed qty=%s | reason=%s | leg_pnl=%.4f | total=%.4f | source=%s",
             symbol,
             close_qty,
             reason,
-            realized,
+            leg_pnl,
+            cumulative_pnl,
+            pnl_source,
         )
 
         if partial and tp_level not in (None, "TP3") and reason != "TP3_FULL_CLOSE":
@@ -1336,28 +1390,22 @@ class TradeManager:
             )
             return True
 
-        live_remaining = self.exchange.get_position_quantity(symbol, position_side)
-        metadata_remaining = self._metadata_remaining_quantity(trade)
-        is_full_close = (
-            not partial
-            or tp_level == "TP3"
-            or reason == "TP3_FULL_CLOSE"
-            or live_remaining <= 0
-            or metadata_remaining <= 0
-        )
-
         if is_full_close:
             self._mark_trade_closed(
                 trade,
                 reason=reason,
                 exit_price=exit_price,
                 book_daily_pnl=False,
+                pnl=cumulative_pnl,
+                pnl_source=pnl_source,
             )
         else:
             if live_remaining <= 0:
                 self.exchange.clear_position_cache(symbol, position_side)
             elif self.telegram and "STOP" in reason.upper():
-                self.telegram.send_close_alert(symbol=symbol, reason=reason, pnl=realized)
+                self.telegram.send_close_alert(
+                    symbol=symbol, reason=reason, pnl=leg_pnl
+                )
 
         return True
 

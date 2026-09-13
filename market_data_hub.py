@@ -24,6 +24,7 @@ from config import Config
 from kline_bootstrap import run_batched_kline_bootstrap
 from logger import error_logger, system_logger
 from utils import safe_float
+from core.fill_pnl_tracker import FillPnlRecord, FillPnlTracker
 from ws_reconnect import (
     WsLogSuppressor,
     WsReconnectPolicy,
@@ -175,6 +176,7 @@ class MarketDataHub:
             max_seconds=Config.WS_RECONNECT_MAX_SECONDS,
         )
         self._ws_log = WsLogSuppressor(Config.WS_RECONNECT_LOG_INTERVAL_SECONDS)
+        self.fill_tracker = FillPnlTracker()
         configure_binance_ws_logging()
 
     def ws_is_running(self) -> bool:
@@ -1088,10 +1090,41 @@ class MarketDataHub:
                             safe_float(p.get("unrealized_pnl")) for p in self._positions
                         )
                     self._last_user_event_at = time.monotonic()
-            elif event in ("ORDER_TRADE_UPDATE", "ACCOUNT_CONFIG_UPDATE"):
+            elif event == "ORDER_TRADE_UPDATE":
+                self._last_user_event_at = time.monotonic()
+                self._record_order_trade_update(message)
+            elif event == "ACCOUNT_CONFIG_UPDATE":
                 self._last_user_event_at = time.monotonic()
         except Exception as exc:
             error_logger.warning("User WS parse error: %s", exc)
+
+    def _record_order_trade_update(self, message: dict[str, Any]) -> None:
+        """Parse ORDER_TRADE_UPDATE fill and store Binance realized PnL (rp field)."""
+        order = message.get("o") or {}
+        exec_type = str(order.get("x", "")).upper()
+        if exec_type not in ("TRADE", "CALCULATED"):
+            return
+        order_id = str(order.get("i", ""))
+        if not order_id:
+            return
+        realized = safe_float(order.get("rp"))
+        fill_price = safe_float(order.get("L")) or safe_float(order.get("ap"))
+        fill_qty = safe_float(order.get("l"))
+        commission = safe_float(order.get("n"))
+        self.fill_tracker.record(
+            FillPnlRecord(
+                order_id=order_id,
+                symbol=str(order.get("s", "")).upper(),
+                position_side=str(order.get("ps", "BOTH")).upper(),
+                realized_pnl=realized,
+                commission=commission,
+                fill_price=fill_price,
+                fill_qty=fill_qty,
+                trade_id=str(order.get("t", "")),
+                timestamp_ms=int(safe_float(order.get("T"))),
+                source="ws",
+            )
+        )
 
     def _on_kline_multiplex(self, message: dict[str, Any]) -> None:
         payload = message.get("data", message)

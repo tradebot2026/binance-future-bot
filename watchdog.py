@@ -464,8 +464,11 @@ class PositionWatchdog:
         )
 
         try:
+            order_response: Optional[dict[str, Any]] = None
             try:
-                self.exchange.close_position_quantity(symbol, side, close_qty)
+                order_response = self.exchange.close_position_quantity(
+                    symbol, side, close_qty
+                )
             except PositionAlreadyClosedError:
                 self._mark_trade_closed_db(trade, signal.reason, mark_price)
                 self.state.clear_breach(f"{trade_id}:")
@@ -480,7 +483,9 @@ class PositionWatchdog:
                     )
                 return
 
-            self._apply_post_close_db(trade, signal, mark_price, close_qty)
+            self._apply_post_close_db(
+                trade, signal, mark_price, close_qty, order_response=order_response
+            )
             self.state.clear_breach(f"{trade_id}:")
         finally:
             release_exit(trade_id, "watchdog")
@@ -505,18 +510,43 @@ class PositionWatchdog:
         signal: ExitSignal,
         mark_price: float,
         close_qty: float,
+        *,
+        order_response: Optional[dict[str, Any]] = None,
     ) -> None:
         trade_id = str(trade.get("trade_id", ""))
         metadata = self.db.parse_trade_metadata(trade)
-        entry = safe_float(trade.get("entry_price"))
+        symbol = str(trade.get("symbol", "")).upper()
         side = str(trade.get("side", "LONG")).upper()
+        prior_pnl = safe_float(trade.get("realized_pnl")) or safe_float(trade.get("pnl"))
 
-        if side == "LONG":
-            realized = (mark_price - entry) * close_qty
+        leg_pnl = 0.0
+        if order_response:
+            fill = self.exchange.resolve_order_fill_pnl(
+                symbol,
+                str(order_response.get("orderId", "")),
+                position_side=side,
+            )
+            if fill.fill_count > 0 and fill.source != "unknown":
+                leg_pnl = fill.realized_pnl
+                if fill.exit_price > 0:
+                    mark_price = fill.exit_price
+
+        if signal.partial and signal.level in ("TP1", "TP2"):
+            cumulative = prior_pnl + leg_pnl
         else:
-            realized = (entry - mark_price) * close_qty
+            from reconciliation import trade_opened_at_ms
 
-        cumulative = safe_float(trade.get("pnl")) + realized
+            lifecycle = self.exchange.fetch_closed_position_realized_pnl(
+                symbol, side, trade_opened_at_ms(trade)
+            )
+            if lifecycle.source in ("userTrades", "income", "ws") and (
+                lifecycle.fill_count > 0 or abs(lifecycle.realized_pnl) > 0
+            ):
+                cumulative = lifecycle.realized_pnl
+            else:
+                cumulative = prior_pnl + leg_pnl
+
+        realized = cumulative - prior_pnl
         updates: dict[str, Any] = {
             "pnl": cumulative,
             "realized_pnl": cumulative,
@@ -525,9 +555,10 @@ class PositionWatchdog:
         if signal.partial and signal.level in ("TP1", "TP2"):
             metadata[f"{signal.level.lower()}_executed"] = True
             updates["metadata"] = metadata
+            entry = safe_float(trade.get("entry_price"))
             if signal.level == "TP1":
                 updates["status"] = TRADE_STATUS_TP1_HIT
-                if Config.ENABLE_BREAK_EVEN:
+                if Config.ENABLE_BREAK_EVEN and entry > 0:
                     updates["stop_loss"] = entry
             elif signal.level == "TP2":
                 updates["status"] = TRADE_STATUS_TP2_HIT

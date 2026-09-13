@@ -62,7 +62,13 @@ def _fetch_live_account(exchange: Any):
     return None
 
 
-def format_live_account_header(exchange: Any, *, session_ref: float = 0.0) -> str:
+def format_live_account_header(
+    exchange: Any,
+    *,
+    session_ref: float = 0.0,
+    db: Optional[DatabaseManager] = None,
+    date_str: Optional[str] = None,
+) -> str:
     """Wallet/margin/unrealized/realized block sourced from Binance fapi/v2/account."""
     snap = _fetch_live_account(exchange)
     if snap is None or snap.wallet_balance <= 0:
@@ -74,7 +80,18 @@ def format_live_account_header(exchange: Any, *, session_ref: float = 0.0) -> st
             f"<i>Source: fallback cache</i>\n"
         )
 
-    total_pnl = snap.today_realized_pnl + snap.unrealized_pnl
+    realized_today = snap.today_realized_pnl
+    source_label = snap.source
+    if db is not None and date_str:
+        db.sync_daily_stats_from_trades(date_str)
+        analytics = db.get_daily_trade_analytics(date_str)
+        db_realized = safe_float(analytics.get("total_pnl"))
+        closes = int(analytics.get("closes", 0))
+        if abs(realized_today) < 0.005 and closes > 0 and abs(db_realized) >= 0.005:
+            realized_today = db_realized
+            source_label = f"{source_label} | Realized: DB fallback"
+
+    total_pnl = realized_today + snap.unrealized_pnl
     pct_line = ""
     if session_ref > 0:
         pct_line = f" ({total_pnl / session_ref * 100.0:.2f}%)"
@@ -82,10 +99,10 @@ def format_live_account_header(exchange: Any, *, session_ref: float = 0.0) -> st
     return (
         f"💵 <b>Wallet Balance:</b> ${snap.wallet_balance:.2f}\n"
         f"📊 <b>Margin Balance:</b> ${snap.margin_balance:.2f}\n"
-        f"📈 <b>Realized (Today):</b> ${snap.today_realized_pnl:.2f}\n"
+        f"📈 <b>Realized (Today):</b> ${realized_today:.2f}\n"
         f"📉 <b>Unrealized:</b> ${snap.unrealized_pnl:.2f}\n"
         f"📊 <b>Total PnL (Today):</b> ${total_pnl:.2f}{pct_line}\n"
-        f"<i>Source: {escape_html(snap.source)}</i>\n"
+        f"<i>Source: {escape_html(source_label)}</i>\n"
     )
 
 
@@ -103,17 +120,23 @@ def format_daily_status_message(
     pf = analytics.get("profit_factor", 0.0)
     pf_display = "∞" if pf == float("inf") else f"{pf:.2f}"
 
-    ref = safe_float(stats.get("start_balance"))
+    daily_start = safe_float(stats.get("start_balance"))
     bot_realized = safe_float(analytics.get("total_pnl", stats.get("total_pnl")))
+    daily_pct = 0.0
+    if daily_start > 0:
+        daily_pct = (bot_realized / daily_start) * 100.0
 
     lines = [
         f"📊 <b>Daily Status ({escape_html(date_str)})</b>\n",
         format_live_account_header(
-            exchange, session_ref=ref
+            exchange,
+            session_ref=daily_start,
+            db=db,
+            date_str=date_str,
         ).rstrip(),
         "",
-        f"💰 <b>Reference (session):</b> ${ref:.2f}",
-        f"🤖 <b>Bot Realized (DB):</b> ${bot_realized:.2f}",
+        f"💰 <b>Daily Start (UTC):</b> ${daily_start:.2f}",
+        f"📈 <b>Day PnL vs Start:</b> ${bot_realized:.2f} ({daily_pct:+.2f}%)",
         f"🏆 <b>Win Rate:</b> {analytics.get('win_rate', 0.0):.1f}% "
         f"({analytics.get('wins', 0)}W / {analytics.get('losses', 0)}L)",
         f"📐 <b>Profit Factor:</b> {pf_display}",
