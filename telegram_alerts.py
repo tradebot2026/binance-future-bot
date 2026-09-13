@@ -4,10 +4,11 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
+from config import Config
 from constants import strategy_display_label
 from database import DatabaseManager
 from reconciliation import sync_active_trades_on_demand
-from utils import escape_html, safe_float
+from utils import escape_html, safe_float, utc_today_str
 
 
 def _position_pnl_percent(
@@ -54,6 +55,75 @@ def _build_exchange_position_map(
     return pos_map, source
 
 
+def _fetch_live_account(exchange: Any):
+    """Always request a fresh REST account snapshot for Telegram display."""
+    if hasattr(exchange, "fetch_live_account_snapshot"):
+        return exchange.fetch_live_account_snapshot(include_today_income=True)
+    return None
+
+
+def format_live_account_header(exchange: Any, *, session_ref: float = 0.0) -> str:
+    """Wallet/margin/unrealized/realized block sourced from Binance fapi/v2/account."""
+    snap = _fetch_live_account(exchange)
+    if snap is None or snap.wallet_balance <= 0:
+        balance = safe_float(exchange.get_futures_balance(force_refresh=True))
+        unrealized = safe_float(exchange.get_unrealized_pnl_total(force_refresh=True))
+        return (
+            f"💵 <b>Wallet:</b> ${balance:.2f}\n"
+            f"📉 <b>Unrealized:</b> ${unrealized:.2f}\n"
+            f"<i>Source: fallback cache</i>\n"
+        )
+
+    total_pnl = snap.today_realized_pnl + snap.unrealized_pnl
+    pct_line = ""
+    if session_ref > 0:
+        pct_line = f" ({total_pnl / session_ref * 100.0:.2f}%)"
+
+    return (
+        f"💵 <b>Wallet Balance:</b> ${snap.wallet_balance:.2f}\n"
+        f"📊 <b>Margin Balance:</b> ${snap.margin_balance:.2f}\n"
+        f"📈 <b>Realized (Today):</b> ${snap.today_realized_pnl:.2f}\n"
+        f"📉 <b>Unrealized:</b> ${snap.unrealized_pnl:.2f}\n"
+        f"📊 <b>Total PnL (Today):</b> ${total_pnl:.2f}{pct_line}\n"
+        f"<i>Source: {escape_html(snap.source)}</i>\n"
+    )
+
+
+def format_daily_status_message(
+    exchange: Any,
+    db: DatabaseManager,
+    stats: dict,
+    *,
+    today: Optional[str] = None,
+) -> str:
+    """Build /status reply — live exchange balances + DB trade analytics."""
+    date_str = today or utc_today_str()
+    db.sync_daily_stats_from_trades(date_str)
+    analytics = db.get_daily_trade_analytics(date_str)
+    pf = analytics.get("profit_factor", 0.0)
+    pf_display = "∞" if pf == float("inf") else f"{pf:.2f}"
+
+    ref = safe_float(stats.get("start_balance"))
+    bot_realized = safe_float(analytics.get("total_pnl", stats.get("total_pnl")))
+
+    lines = [
+        f"📊 <b>Daily Status ({escape_html(date_str)})</b>\n",
+        format_live_account_header(
+            exchange, session_ref=ref
+        ).rstrip(),
+        "",
+        f"💰 <b>Reference (session):</b> ${ref:.2f}",
+        f"🤖 <b>Bot Realized (DB):</b> ${bot_realized:.2f}",
+        f"🏆 <b>Win Rate:</b> {analytics.get('win_rate', 0.0):.1f}% "
+        f"({analytics.get('wins', 0)}W / {analytics.get('losses', 0)}L)",
+        f"📐 <b>Profit Factor:</b> {pf_display}",
+        f"🆕 <b>Entries:</b> {int(stats.get('entries_count', 0))}/{Config.MAX_DAILY_TRADES}",
+        f"🔄 <b>Closes:</b> {int(analytics.get('closes', stats.get('trades_count', 0)))}",
+        f"⚙️ <b>Status:</b> {escape_html(str(stats.get('status', 'UNKNOWN')))}",
+    ]
+    return "\n".join(lines)
+
+
 def format_daily_stats_footer(db: DatabaseManager, date_str: str) -> str:
     """Compact realized-PnL / win-rate line sourced from closed trades in DB."""
     db.sync_daily_stats_from_trades(date_str)
@@ -85,15 +155,18 @@ def format_active_positions_message(
     )
     trades = db.get_open_trades()
     stats_footer = format_daily_stats_footer(db, utc_today_str())
+    account_header = format_live_account_header(exchange).rstrip()
     if not trades:
         closed_n = len(sync_summary.get("closed", []))
         if closed_n:
             return (
+                f"{account_header}\n\n"
                 "📭 <b>Active Positions</b>\n"
                 f"<i>Synced with exchange — {closed_n} stale DB trade(s) purged.</i>"
                 f"{stats_footer}"
             )
         return (
+            f"{account_header}\n\n"
             "📭 <b>Active Positions</b>\n"
             "<i>No open trades in database.</i>"
             f"{stats_footer}"
@@ -101,8 +174,10 @@ def format_active_positions_message(
 
     pos_map, source = _build_exchange_position_map(exchange, force_rest=True)
     lines = [
+        account_header,
+        "",
         f"📂 <b>Active Positions ({len(trades)})</b>",
-        f"<i>Exchange source: {escape_html(source)}</i>",
+        f"<i>Positions source: {escape_html(source)}</i>",
     ]
     if sync_summary.get("closed"):
         lines.append(

@@ -30,8 +30,10 @@ from logger import error_logger, trade_logger
 from exit_coordinator import claim_exit, exit_claim_active, release_exit
 from reconciliation import (
     confirm_external_close_allowed,
+    is_exchange_sync_close_reason,
     is_within_position_grace_period,
     position_reconcile_guard,
+    resolve_exchange_close_pnl,
 )
 from utils import escape_html, round_step_size, safe_float, utc_now, utc_today_str
 
@@ -321,13 +323,21 @@ class TradeManager:
             elif self._defer_external_close(trade, symbol):
                 return
             else:
+                resolved = resolve_exchange_close_pnl(
+                    self.exchange, self.db, trade
+                )
+                exit_px = resolved.exit_price
+                if exit_px <= 0:
+                    exit_px = safe_float(
+                        price
+                        or self.exchange.get_market_price(symbol, position_side)
+                    )
                 self._mark_trade_closed(
                     trade,
                     reason="RECONCILED_EXTERNAL_CLOSE",
-                    exit_price=safe_float(
-                        price
-                        or self.exchange.get_market_price(symbol, position_side)
-                    ),
+                    exit_price=exit_px,
+                    pnl=resolved.realized_pnl,
+                    pnl_source=resolved.source,
                 )
                 position_reconcile_guard.note_present(str(trade["trade_id"]))
                 return
@@ -1095,16 +1105,23 @@ class TradeManager:
         self._cancel_all_native_orders(trade)
         self.exchange.clear_position_cache(symbol, position_side)
         position_reconcile_guard.note_present(str(trade["trade_id"]))
+        resolved = resolve_exchange_close_pnl(self.exchange, self.db, trade)
+        if resolved.exit_price > 0:
+            exit_price = resolved.exit_price
         if self.telegram:
             self.telegram.send_message(
                 f"🔄 <b>{escape_html(symbol)}</b> synced: Already closed on exchange "
-                f"(ReduceOnly rejected)."
+                f"(ReduceOnly rejected).\n"
+                f"💰 <b>Exchange PnL:</b> ${resolved.realized_pnl:.4f} "
+                f"<i>({escape_html(resolved.source)})</i>"
             )
         self._mark_trade_closed(
             trade,
             reason=exit_reason,
             exit_price=exit_price,
-            notify=False,
+            pnl=resolved.realized_pnl,
+            pnl_source=resolved.source,
+            notify=True,
         )
         return True
 
@@ -1380,6 +1397,8 @@ class TradeManager:
         *,
         notify: bool = True,
         book_daily_pnl: bool = True,
+        pnl: Optional[float] = None,
+        pnl_source: str = "",
     ) -> None:
         trade_id = trade["trade_id"]
         symbol = trade["symbol"]
@@ -1405,6 +1424,13 @@ class TradeManager:
         self.exchange.invalidate_balance_cache()
         balance = self.exchange.get_futures_balance(force_refresh=False)
 
+        if pnl is None and is_exchange_sync_close_reason(reason):
+            resolved = resolve_exchange_close_pnl(self.exchange, self.db, trade)
+            pnl = resolved.realized_pnl
+            pnl_source = resolved.source
+            if resolved.exit_price > 0:
+                exit_price = resolved.exit_price
+
         total_pnl = self.db.close_trade_and_sync_stats(
             trade,
             exit_price=exit_price,
@@ -1413,16 +1439,19 @@ class TradeManager:
             duration=duration,
             book_daily_pnl=book_daily_pnl,
             current_balance=balance,
+            pnl=pnl,
         )
         trade["pnl"] = total_pnl
         trade["realized_pnl"] = total_pnl
         self._log_position_closed(symbol, position_side, reason, exit_price, total_pnl)
+        source_note = f" | pnl_source={pnl_source}" if pnl_source else ""
         trade_logger.info(
-            "[%s] Trade %s fully closed | reason=%s | total_pnl=%.4f",
+            "[%s] Trade %s fully closed | reason=%s | total_pnl=%.4f%s",
             symbol,
             trade_id[:8],
             reason,
             total_pnl,
+            source_note,
         )
 
         if notify and self.telegram:

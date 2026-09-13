@@ -17,6 +17,15 @@ class BotController:
         self._restart = threading.Event()
         self._manual_pause = False
         self._manual_pause_reason = ""
+        self.started_at_mono: float = 0.0
+
+    def mark_started(self) -> None:
+        """Record monotonic start time for health/uptime reporting."""
+        with self._lock:
+            if self.started_at_mono <= 0:
+                import time
+
+                self.started_at_mono = time.monotonic()
 
     # ---------------- Lifecycle ----------------
 

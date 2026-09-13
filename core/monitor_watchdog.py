@@ -11,6 +11,7 @@ import traceback
 from typing import Any, Optional
 
 from config import Config
+from core.bot_health import note_monitor_stall_recovery, set_monitor_watchdog_active
 from core.ops_heartbeat import get_monitor_stall_seconds, is_monitor_loop_stale
 from logger import error_logger, system_logger
 
@@ -24,6 +25,7 @@ def start_monitor_watchdog(
     """Start background watchdog; returns the daemon thread handle."""
 
     def _loop() -> None:
+        set_monitor_watchdog_active(True)
         system_logger.info(
             "Monitor watchdog started | stall_threshold=%ss | check_interval=%ss",
             Config.MONITOR_LOOP_STALL_SECONDS,
@@ -33,6 +35,7 @@ def start_monitor_watchdog(
         while stop_event is None or not stop_event.is_set():
             try:
                 if is_monitor_loop_stale(Config.MONITOR_LOOP_STALL_SECONDS):
+                    note_monitor_stall_recovery()
                     stall = get_monitor_stall_seconds()
                     error_logger.critical(
                         "Position monitor loop stalled for %.1fs (threshold=%ss) — "
@@ -71,6 +74,7 @@ def start_monitor_watchdog(
                 stop_event.wait(interval)
             else:
                 time.sleep(interval)
+        set_monitor_watchdog_active(False)
 
     thread = threading.Thread(target=_loop, name="monitor-watchdog", daemon=True)
     thread.start()

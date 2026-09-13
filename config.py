@@ -264,6 +264,10 @@ class Config:
     TP2_R_MULTIPLE: float = _env_float("TP2_R_MULTIPLE", 2.0)
     TP3_R_MULTIPLE: float = _env_float("TP3_R_MULTIPLE", 3.5)
     MIN_OPPOSING_RR: float = _env_float("MIN_OPPOSING_RR", 1.5)
+    ENABLE_TP1_RR_OPTIMIZER: bool = _env_bool("ENABLE_TP1_RR_OPTIMIZER", True)
+    MIN_TP1_RR_ACCEPT: float = _env_float("MIN_TP1_RR_ACCEPT", 0.75)
+    MIN_TP1_RISK_REWARD: float = _env_float("MIN_TP1_RISK_REWARD", 1.0)
+    MIN_SL_ATR_NOISE: float = _env_float("MIN_SL_ATR_NOISE", 0.35)
     SYMBOL_COOLDOWN_MINUTES: int = _env_int("SYMBOL_COOLDOWN_MINUTES", 20)
 
     # ---------------- Range regime ----------------

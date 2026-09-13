@@ -180,6 +180,46 @@ class MarketDataHub:
     def ws_is_running(self) -> bool:
         return self._ws_running
 
+    def get_ws_health_snapshot(self) -> dict[str, Any]:
+        """Connection summary for /health diagnostics."""
+        with self._lock:
+            active_feeds = 0
+            if self._ticker_conn_key:
+                active_feeds += 1
+            if self._book_ticker_conn_key:
+                active_feeds += 1
+            if self._user_conn_key:
+                active_feeds += 1
+            active_feeds += sum(1 for sock in self._kline_sockets if sock.streams)
+
+            ticker_age = self.ticker_cache_age_seconds()
+            user_age = (
+                max(time.monotonic() - self._last_user_event_at, 0.0)
+                if self._last_user_event_at > 0
+                else float("inf")
+            )
+
+            if self._reconnect_in_progress:
+                state = "RECONNECTING"
+            elif not self._ws_running:
+                state = "STOPPED"
+            elif self.ws_is_stale():
+                state = "STALE"
+            else:
+                state = "CONNECTED"
+
+            return {
+                "state": state,
+                "active_feeds": active_feeds,
+                "ticker_symbols": len(self._tickers),
+                "kline_streams": len(self._subscribed_kline_streams),
+                "ticker_age_seconds": ticker_age,
+                "user_stream_age_seconds": user_age,
+                "user_stream_ok": self.user_stream_has_account_data()
+                and not self.user_stream_is_stale(),
+                "reconnect_in_progress": self._reconnect_in_progress,
+            }
+
     def set_ticker_rest_fetcher(
         self,
         fetcher: Callable[[], dict[str, dict[str, Any]]],

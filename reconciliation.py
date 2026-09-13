@@ -11,7 +11,8 @@ from datetime import datetime, timezone
 from typing import Any, Optional, TYPE_CHECKING
 
 from config import Config
-from logger import error_logger, system_logger
+from exchange import ClosedPositionPnl
+from logger import error_logger, system_logger, trade_logger
 from utils import safe_float, utc_now
 
 if TYPE_CHECKING:
@@ -20,25 +21,98 @@ if TYPE_CHECKING:
     from telegram_bot import TelegramManager
 
 
+def trade_opened_at_ms(trade: dict[str, Any]) -> int:
+    """Parse trade opened_at to epoch milliseconds (0 when missing)."""
+    opened_at_raw = trade.get("opened_at")
+    if not opened_at_raw:
+        return 0
+    try:
+        opened_at = datetime.fromisoformat(str(opened_at_raw))
+        if opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        return int(opened_at.timestamp() * 1000)
+    except ValueError:
+        return 0
+
+
+def is_exchange_sync_close_reason(reason: str) -> bool:
+    """True when the position was closed on Binance outside the bot close worker."""
+    upper = str(reason).upper()
+    return upper.startswith("RECONCILED")
+
+
+def resolve_exchange_close_pnl(
+    exchange: "BinanceExchangeManager",
+    db: "DatabaseManager",
+    trade: dict[str, Any],
+) -> ClosedPositionPnl:
+    """
+    Fetch authoritative realized PnL from Binance userTrades/income.
+    Falls back to local price estimate only when REST history is unavailable.
+    """
+    symbol = str(trade.get("symbol", "")).upper()
+    side = str(trade.get("side", "LONG")).upper()
+    opened_ms = trade_opened_at_ms(trade)
+
+    if opened_ms > 0:
+        api_pnl = exchange.fetch_closed_position_realized_pnl(
+            symbol, side, opened_ms
+        )
+        if api_pnl.source in ("userTrades", "income"):
+            if api_pnl.exit_price <= 0:
+                mark = safe_float(exchange.get_market_price(symbol, side))
+                if mark > 0:
+                    api_pnl.exit_price = mark
+            trade_logger.info(
+                "[%s] Exchange PnL from %s | realized=%.4f | fills=%s | exit=%.6f",
+                symbol,
+                api_pnl.source,
+                api_pnl.realized_pnl,
+                api_pnl.fill_count,
+                api_pnl.exit_price,
+            )
+            return api_pnl
+
+    exit_price = safe_float(exchange.get_market_price(symbol, side))
+    estimated = db.estimate_trade_pnl(trade, exit_price)
+    trade_logger.warning(
+        "[%s] Exchange PnL unavailable — using local estimate %.4f (exit=%.6f)",
+        symbol,
+        estimated,
+        exit_price,
+    )
+    return ClosedPositionPnl(
+        realized_pnl=estimated,
+        exit_price=exit_price,
+        source="estimate",
+    )
+
+
 def finalize_reconciled_trade_close(
     exchange: "BinanceExchangeManager",
     db: "DatabaseManager",
     trade: dict[str, Any],
     exit_reason: str,
-) -> None:
-    """Close a DB trade with estimated PnL when the exchange position is flat."""
+) -> float:
+    """Close a DB trade using Binance-reported realized PnL when the exchange is flat."""
     symbol = str(trade.get("symbol", "")).upper()
     side = str(trade.get("side", "LONG")).upper()
-    exit_price = safe_float(exchange.get_market_price(symbol, side))
+    resolved = resolve_exchange_close_pnl(exchange, db, trade)
+    exit_price = resolved.exit_price
+    if exit_price <= 0:
+        exit_price = safe_float(exchange.get_market_price(symbol, side))
+
     balance = exchange.get_futures_balance(force_refresh=False)
-    db.close_trade_and_sync_stats(
+    total_pnl = db.close_trade_and_sync_stats(
         trade,
         exit_price=exit_price,
         exit_reason=exit_reason,
+        pnl=resolved.realized_pnl,
         book_daily_pnl=True,
         current_balance=balance if balance > 0 else None,
     )
     exchange.clear_position_cache(symbol, side)
+    return total_pnl
 
 
 def trade_open_age_seconds(trade: dict[str, Any]) -> float:
@@ -249,16 +323,19 @@ def sync_active_trades_on_demand(
             exchange_keys.add(key)
             continue
 
-        finalize_reconciled_trade_close(
+        closed_pnl = finalize_reconciled_trade_close(
             exchange, db, trade, "RECONCILED_MANUAL_CLOSE"
         )
         position_reconcile_guard.note_present(trade_id)
-        summary["closed"].append(f"{symbol} {side}")
+        summary["closed"].append(
+            {"symbol": symbol, "side": side, "pnl": closed_pnl}
+        )
         system_logger.warning(
-            "Purged manually closed trade from DB: %s %s | id=%s",
+            "Purged manually closed trade from DB: %s %s | id=%s | exchange_pnl=%.4f",
             symbol,
             side,
             trade_id[:8],
+            closed_pnl,
         )
 
     summary["exchange_open"] = len(exchange_keys)
@@ -269,7 +346,13 @@ def sync_active_trades_on_demand(
             f"Closed {len(summary['closed'])} DB trade(s) no longer on exchange:",
         ]
         for row in summary["closed"][:10]:
-            lines.append(f"• {row}")
+            if isinstance(row, dict):
+                sym = row.get("symbol", "?")
+                side = row.get("side", "?")
+                pnl = safe_float(row.get("pnl"))
+                lines.append(f"• {sym} {side} | PnL ${pnl:.4f}")
+            else:
+                lines.append(f"• {row}")
         telegram.send_message("\n".join(lines))
 
     return summary
@@ -391,16 +474,17 @@ def reconcile_positions(
                     )
                     continue
 
-                finalize_reconciled_trade_close(
+                closed_pnl = finalize_reconciled_trade_close(
                     exchange, db, trade, "RECONCILED_PHANTOM_PURGE"
                 )
                 position_reconcile_guard.note_present(trade_id)
                 closed_externally += 1
                 system_logger.warning(
-                    "Purged phantom DB trade (exchange flat): %s %s | id=%s",
+                    "Purged phantom DB trade (exchange flat): %s %s | id=%s | exchange_pnl=%.4f",
                     trade["symbol"],
                     trade["side"],
                     trade_id[:8],
+                    closed_pnl,
                 )
             except Exception as exc:
                 error_logger.error(

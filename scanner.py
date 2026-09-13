@@ -668,6 +668,7 @@ class MarketScanner:
         self._pipeline._scan_priority = self._scan_priority
         results = self._pipeline.scan_smc()
         self._scan_priority = self._pipeline._scan_priority
+        self._touch_scan_health()
         return results
 
     def _evaluate_range_direction(
@@ -775,6 +776,7 @@ class MarketScanner:
         self._pipeline._scan_priority = self._scan_priority
         results = self._pipeline.scan_unified()
         self._scan_priority = self._pipeline._scan_priority
+        self._touch_scan_health()
         return results
 
     def scan_range_market(self) -> List[Dict[str, Any]]:
@@ -784,4 +786,12 @@ class MarketScanner:
         self._pipeline._scan_priority = self._scan_priority
         results = self._pipeline.scan_range()
         self._scan_priority = self._pipeline._scan_priority
+        self._touch_scan_health()
         return results
+
+    def _touch_scan_health(self) -> None:
+        from core.bot_health import touch_scan_cycle
+
+        syms = list(self._last_universe_symbols or [])
+        total = len(syms)
+        touch_scan_cycle(scanned=total, universe_total=total)

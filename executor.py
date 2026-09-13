@@ -169,6 +169,13 @@ class TradeExecutor:
         sl_ok, sl_reason = self._validate_stop_loss(action, execution_price, sl)
         if not sl_ok:
             return None
+        optimized = self._optimize_tp1_rr_if_needed(
+            action, execution_price, atr, sl, tp1, rules
+        )
+        if optimized is None:
+            return None
+        sl = optimized
+
         tp_ok, tp_reason = self._validate_tp_ladder(
             action, execution_price, tp1, tp2, tp3
         )
@@ -182,6 +189,67 @@ class TradeExecutor:
             )
             return None
         return sl, tp1, tp2, tp3
+
+    def _optimize_tp1_rr_if_needed(
+        self,
+        action: str,
+        entry_price: float,
+        atr: float,
+        sl: float,
+        tp1: float,
+        rules: SymbolRules,
+    ) -> Optional[float]:
+        """
+        Keep strategy SL/TP when TP1 R:R is already favorable.
+        When R:R is poor, tighten SL toward entry to reach MIN_TP1_RISK_REWARD,
+        or return None to reject the setup if noise floor prevents safe tightening.
+        """
+        if not Config.ENABLE_TP1_RR_OPTIMIZER:
+            return sl
+
+        sl_dist = abs(entry_price - sl)
+        tp1_dist = abs(tp1 - entry_price)
+        if sl_dist <= 0 or tp1_dist <= 0 or tp1 <= 0:
+            return sl
+
+        accept_rr = max(float(Config.MIN_TP1_RR_ACCEPT), 0.1)
+        target_rr = max(float(Config.MIN_TP1_RISK_REWARD), accept_rr)
+        effective_rr = (tp1_dist * TP1_PORTION) / sl_dist
+        if effective_rr >= accept_rr:
+            return sl
+
+        target_sl_dist = tp1_dist * TP1_PORTION / target_rr
+        min_sl_dist = atr * Config.MIN_SL_ATR_NOISE
+        if target_sl_dist < min_sl_dist:
+            trade_logger.info(
+                "RR reject — TP1 reward too small vs noise floor "
+                "(tp1_dist=%.6f target_sl=%.6f min_sl=%.6f rr=%.2f)",
+                tp1_dist,
+                target_sl_dist,
+                min_sl_dist,
+                effective_rr,
+            )
+            return None
+
+        if action == "LONG":
+            new_sl = entry_price - target_sl_dist
+        else:
+            new_sl = entry_price + target_sl_dist
+
+        new_sl = round_step_size(new_sl, rules.tick_size, rules.price_precision)
+        sl_ok, _ = self._validate_stop_loss(action, entry_price, new_sl)
+        if not sl_ok:
+            return None
+
+        trade_logger.info(
+            "RR optimized — SL tightened for TP1 1:%.1f "
+            "(rr was %.2f sl_dist %.6f -> %.6f)",
+            target_rr,
+            effective_rr,
+            sl_dist,
+            abs(entry_price - new_sl),
+        )
+        return new_sl
 
     def _apply_execution_levels(
         self,
@@ -585,14 +653,14 @@ class TradeExecutor:
         if not pre_levels:
             log_execution_rejected(
                 symbol,
-                "invalid SL/TP ladder at signal price — cannot size entry",
+                "invalid SL/TP ladder or poor R:R at signal price — cannot size entry",
                 strategy=strategy,
             )
             self.db.log_signal_rejection(
                 symbol,
                 action,
                 score,
-                ["invalid_sl_tp_at_signal_price"],
+                ["invalid_sl_tp_or_poor_rr_at_signal_price"],
                 strategy=strategy,
             )
             return None

@@ -54,6 +54,29 @@ class SymbolRules:
 
 
 @dataclass
+class LiveAccountSnapshot:
+    """Authoritative USDT-M account fields from fapi/v2/account (+ optional income)."""
+
+    wallet_balance: float = 0.0
+    margin_balance: float = 0.0
+    unrealized_pnl: float = 0.0
+    available_balance: float = 0.0
+    today_realized_pnl: float = 0.0
+    source: str = "unknown"
+
+
+@dataclass
+class ClosedPositionPnl:
+    """Realized PnL for a closed position from Binance trade/income history."""
+
+    realized_pnl: float = 0.0
+    commission: float = 0.0
+    exit_price: float = 0.0
+    fill_count: int = 0
+    source: str = "unknown"
+
+
+@dataclass
 class BalanceCache:
     value: float = 0.0
     updated_at: float = 0.0
@@ -225,6 +248,10 @@ class BinanceExchangeManager:
             hub.set_ticker_rest_fetcher(self.fetch_futures_ticker_map_rest)
         if hub and hasattr(self, "_startup_ban") and self._startup_ban.is_banned:
             hub.apply_startup_ban(self._startup_ban)
+
+    def get_market_data_hub(self) -> Any:
+        """Return the attached MarketDataHub (if any)."""
+        return self._market_data
 
     def mark_ws_rest_ready(self) -> None:
         """Called after WebSocket cache warm-up — allows deferred REST init."""
@@ -1264,6 +1291,203 @@ class BinanceExchangeManager:
             if margin_est is not None and margin_est > 0:
                 return margin_est
             return self._balance_cache.value
+
+    def fetch_live_account_snapshot(
+        self,
+        *,
+        include_today_income: bool = True,
+    ) -> LiveAccountSnapshot:
+        """
+        Live wallet/margin/unrealized from Binance fapi/v2/account (futures_account).
+        Used by Telegram /status and /active — always prefers a fresh REST read.
+        """
+        snapshot = LiveAccountSnapshot()
+        account_info: Optional[dict[str, Any]] = None
+        source = "cache"
+
+        if not self.is_rest_blocked()[0]:
+            try:
+                account_info = self._throttled_call(
+                    self.client.futures_account,
+                    **self.recv_window_param,
+                )
+                if account_info:
+                    source = "REST (live)"
+                    now = time.monotonic()
+                    self._last_account_rest_at = now
+                    self._account_rest_cache.account_info = account_info
+                    self._account_rest_cache.updated_at = now
+                    wallet = safe_float(account_info.get("totalWalletBalance"))
+                    if wallet > 0:
+                        self._balance_cache.set(wallet)
+            except ExchangeRateLimitError:
+                pass
+            except Exception as exc:
+                if self._rest_block_log.should_log("live_account_snapshot"):
+                    error_logger.warning("Live account snapshot REST failed: %s", exc)
+
+        if not account_info:
+            account_info = self._cached_futures_account_response()
+            if account_info:
+                source = "WS/cache"
+
+        if account_info:
+            snapshot.wallet_balance = safe_float(
+                account_info.get("totalWalletBalance")
+            )
+            snapshot.margin_balance = safe_float(
+                account_info.get("totalMarginBalance")
+            )
+            if snapshot.margin_balance <= 0:
+                snapshot.margin_balance = safe_float(
+                    account_info.get("totalCrossWalletBalance")
+                )
+            snapshot.unrealized_pnl = safe_float(
+                account_info.get("totalUnrealizedProfit")
+            )
+            snapshot.available_balance = safe_float(
+                account_info.get("availableBalance")
+            )
+            if snapshot.available_balance <= 0:
+                snapshot.available_balance = self._extract_quote_balance(
+                    account_info, Config.QUOTE_ASSET
+                )
+
+        if include_today_income and not self.is_rest_blocked()[0]:
+            snapshot.today_realized_pnl = self._fetch_today_realized_income_rest()
+
+        snapshot.source = source
+        return snapshot
+
+    def _fetch_today_realized_income_rest(self) -> float:
+        """Sum REALIZED_PNL income rows for the current UTC day."""
+        from datetime import datetime, timezone
+
+        try:
+            now = datetime.now(timezone.utc)
+            start_ms = int(
+                datetime(now.year, now.month, now.day, tzinfo=timezone.utc).timestamp()
+                * 1000
+            )
+            rows = self._throttled_call(
+                self.client.futures_income_history,
+                startTime=start_ms,
+                limit=1000,
+            )
+            total = 0.0
+            for row in rows or []:
+                if str(row.get("incomeType", "")).upper() == "REALIZED_PNL":
+                    total += safe_float(row.get("income"))
+            return total
+        except Exception as exc:
+            if self._rest_block_log.should_log("today_realized_income"):
+                error_logger.debug("Today realized income fetch failed: %s", exc)
+            return 0.0
+
+    @staticmethod
+    def _closing_trade_side(position_side: str) -> str:
+        return "SELL" if position_side.upper() == "LONG" else "BUY"
+
+    def fetch_closed_position_realized_pnl(
+        self,
+        symbol: str,
+        position_side: str,
+        opened_at_ms: int,
+        *,
+        until_ms: Optional[int] = None,
+    ) -> ClosedPositionPnl:
+        """
+        Sum realized PnL from Binance userTrades (preferred) or income history.
+        Used when a DB trade is closed externally on the exchange.
+        """
+        symbol = symbol.upper()
+        position_side = position_side.upper()
+        close_side = self._closing_trade_side(position_side)
+        result = ClosedPositionPnl()
+
+        if self.is_rest_blocked()[0]:
+            return result
+
+        start_ms = max(opened_at_ms - 60_000, 0)
+        end_ms = until_ms or int(time.time() * 1000)
+
+        try:
+            rows = self._throttled_call(
+                self.client.futures_account_trades,
+                symbol=symbol,
+                startTime=start_ms,
+                limit=1000,
+            )
+            close_qty = 0.0
+            close_notional = 0.0
+            for row in rows or []:
+                trade_time = int(safe_float(row.get("time")))
+                if trade_time < start_ms or trade_time > end_ms:
+                    continue
+                row_ps = str(row.get("positionSide", "BOTH")).upper()
+                if row_ps not in (position_side, "BOTH"):
+                    continue
+                realized = safe_float(row.get("realizedPnl"))
+                commission = safe_float(row.get("commission"))
+                result.realized_pnl += realized
+                result.commission += commission
+                result.fill_count += 1
+                side = str(row.get("side", "")).upper()
+                if side == close_side:
+                    qty = safe_float(row.get("qty"))
+                    price = safe_float(row.get("price"))
+                    if qty > 0 and price > 0:
+                        close_qty += qty
+                        close_notional += price * qty
+
+            if result.fill_count > 0:
+                result.source = "userTrades"
+                if close_qty > 0:
+                    result.exit_price = close_notional / close_qty
+                return result
+        except Exception as exc:
+            if self._rest_block_log.should_log(f"user_trades_pnl:{symbol}"):
+                error_logger.warning(
+                    "userTrades PnL fetch failed for %s %s: %s",
+                    symbol,
+                    position_side,
+                    exc,
+                )
+
+        try:
+            rows = self._throttled_call(
+                self.client.futures_income_history,
+                symbol=symbol,
+                startTime=start_ms,
+                incomeType="REALIZED_PNL",
+                limit=1000,
+            )
+            income_total = 0.0
+            income_rows = 0
+            for row in rows or []:
+                trade_time = int(safe_float(row.get("time")))
+                if trade_time < start_ms or trade_time > end_ms:
+                    continue
+                if str(row.get("incomeType", "")).upper() != "REALIZED_PNL":
+                    continue
+                income_total += safe_float(row.get("income"))
+                income_rows += 1
+
+            if income_rows > 0:
+                result.realized_pnl = income_total
+                result.fill_count = income_rows
+                result.source = "income"
+                return result
+        except Exception as exc:
+            if self._rest_block_log.should_log(f"income_pnl:{symbol}"):
+                error_logger.warning(
+                    "Income PnL fetch failed for %s %s: %s",
+                    symbol,
+                    position_side,
+                    exc,
+                )
+
+        return result
 
     # ---------------- Market data ----------------
 

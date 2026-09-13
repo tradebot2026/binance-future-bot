@@ -460,6 +460,11 @@ def main(controller: Optional[BotController] = None) -> str:
 
     controller = controller or BotController()
     controller.reset()
+    controller.mark_started()
+
+    from core.bot_health import mark_bot_started
+
+    mark_bot_started()
 
     db = DatabaseManager()
     exchange = BinanceExchangeManager()
@@ -530,6 +535,7 @@ def main(controller: Optional[BotController] = None) -> str:
         )
         tg.manager = manager
         tg.scanner = scanner
+        tg.market_data = market_data
         market_data.register_price_tick_listener(manager.on_price_tick)
 
         tg.start_listening()

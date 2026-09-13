@@ -6,6 +6,7 @@ import time
 from typing import Any, Optional
 
 from config import Config
+from core.bot_health import touch_scan_cycle
 from core.assignment_manager import AssignmentManager
 from core.event_scheduler import EventScheduler
 from core.scan_priority_queue import ScanPriorityQueue
@@ -197,6 +198,15 @@ class EventScanOrchestrator:
         candidates.extend(self.process_hot_scan_cycle())
         candidates.extend(self.process_background_scan_cycle())
         candidates.extend(self._process_due_event_candidates())
+
+        universe_total = len(self.priority_queue.full_universe) or len(
+            self._tier1_symbols
+        )
+        hot_count = len(self.priority_queue.hot_symbols)
+        touch_scan_cycle(
+            scanned=max(hot_count, universe_total),
+            universe_total=max(universe_total, hot_count),
+        )
 
         dict_results = [c.to_dict() for c in candidates]
         if dict_results:

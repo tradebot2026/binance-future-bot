@@ -18,7 +18,13 @@ from config import Config
 from constants import TP1_PORTION, TP2_PORTION, TP3_PORTION, strategy_display_label
 from database import DatabaseManager
 from logger import error_logger, system_logger
-from telegram_alerts import format_active_positions_message, format_watchlist_message
+from reporter import format_bot_health_message
+from telegram_alerts import (
+    format_active_positions_message,
+    format_daily_status_message,
+    format_live_account_header,
+    format_watchlist_message,
+)
 from utils import escape_html, safe_float, utc_today_str
 
 if TYPE_CHECKING:
@@ -74,6 +80,7 @@ class TelegramManager:
         self.manager = manager
         self.controller = controller
         self.scanner: Any = None
+        self.market_data: Any = None
 
         self.token = Config.TELEGRAM_BOT_TOKEN.strip()
         self.chat_id = str(Config.TELEGRAM_CHAT_ID).strip()
@@ -218,12 +225,17 @@ class TelegramManager:
         pnl: Optional[float] = None,
         strategy: str = "",
     ) -> None:
-        if "TP" in reason.upper():
+        reason_upper = reason.upper()
+        if "TP" in reason_upper and "STOP" not in reason_upper:
             emoji = "✅"
             title = "TAKE PROFIT HIT"
-        elif "STOP" in reason.upper():
-            emoji = "🛑"
-            title = "STOP LOSS HIT"
+        elif "STOP" in reason_upper:
+            if pnl is not None and pnl >= 0:
+                emoji = "🎯"
+                title = "TRAILING / PROFIT SL HIT"
+            else:
+                emoji = "🛑"
+                title = "STOP LOSS HIT"
         else:
             emoji = "ℹ️"
             title = "POSITION CLOSED"
@@ -236,7 +248,10 @@ class TelegramManager:
         if strategy:
             msg += f"\n🧠 <b>Strategy:</b> {escape_html(strategy_display_label(strategy))}"
         if pnl is not None:
-            msg += f"\n💰 <b>Realized PnL:</b> ${pnl:.4f}"
+            if pnl >= 0:
+                msg += f"\n💰 <b>Realized Profit:</b> +${pnl:.4f}"
+            else:
+                msg += f"\n💰 <b>Realized PnL:</b> -${abs(pnl):.4f}"
         self.send_message(msg)
 
     def send_tp_level_alert(
@@ -385,6 +400,18 @@ class TelegramManager:
                 f"🟢 <b>Bot online</b> — actively monitoring markets ({escape_html(mode)}).",
             )
 
+        @self.bot.message_handler(commands=["health", "pulse"])
+        @authorized
+        def health_handler(message: telebot.types.Message) -> None:
+            text = format_bot_health_message(
+                exchange=self.exchange,
+                market_data=self.market_data,
+                scanner=self.scanner,
+                controller=self.controller,
+                scheduler=self.scheduler,
+            )
+            self.bot.reply_to(message, text)
+
         @self.bot.message_handler(commands=["status"])
         @authorized
         def status_handler(message: telebot.types.Message) -> None:
@@ -398,36 +425,15 @@ class TelegramManager:
                 self.bot.reply_to(message, "⚠️ No daily stats recorded yet today.")
                 return
 
-            analytics = self.db.get_daily_trade_analytics(today)
-            if self.scheduler:
-                analytics = {
-                    "wins": stats.get("wins", analytics.get("wins", 0)),
-                    "losses": stats.get("losses", analytics.get("losses", 0)),
-                    "win_rate": stats.get("win_rate", analytics.get("win_rate", 0.0)),
-                    "profit_factor": stats.get(
-                        "profit_factor", analytics.get("profit_factor", 0.0)
-                    ),
-                    "total_pnl": stats.get("total_pnl", analytics.get("total_pnl", 0.0)),
-                    "closes": stats.get("trades_count", analytics.get("closes", 0)),
-                }
-            pf = analytics.get("profit_factor", 0.0)
-            pf_display = "∞" if pf == float("inf") else f"{pf:.2f}"
-            realized_pnl = safe_float(analytics.get("total_pnl", stats.get("total_pnl")))
+            if not self.exchange:
+                self.bot.reply_to(message, "⚠️ Exchange not attached.")
+                return
 
-            msg = (
-                f"📊 <b>Daily Status ({escape_html(today)})</b>\n\n"
-                f"💰 <b>Reference:</b> ${safe_float(stats.get('start_balance')):.2f}\n"
-                f"💵 <b>Balance:</b> ${safe_float(stats.get('current_balance')):.2f}\n"
-                f"📈 <b>Realized PnL:</b> ${realized_pnl:.2f}\n"
-                f"📊 <b>Total PnL:</b> ${safe_float(stats.get('computed_total_pnl', realized_pnl)):.2f} "
-                f"({safe_float(stats.get('computed_pnl_percent', 0)):.2f}%)\n"
-                f"📉 <b>Unrealized:</b> ${safe_float(stats.get('unrealized_pnl', 0)):.2f}\n"
-                f"🏆 <b>Win Rate:</b> {analytics.get('win_rate', 0.0):.1f}% "
-                f"({analytics.get('wins', 0)}W / {analytics.get('losses', 0)}L)\n"
-                f"📐 <b>Profit Factor:</b> {pf_display}\n"
-                f"🆕 <b>Entries:</b> {int(stats.get('entries_count', 0))}/{Config.MAX_DAILY_TRADES}\n"
-                f"🔄 <b>Closes:</b> {int(analytics.get('closes', stats.get('trades_count', 0)))}\n"
-                f"⚙️ <b>Status:</b> {escape_html(str(stats.get('status', 'UNKNOWN')))}"
+            msg = format_daily_status_message(
+                self.exchange,
+                self.db,
+                stats,
+                today=today,
             )
             self.bot.reply_to(message, msg)
 
@@ -608,8 +614,8 @@ class TelegramManager:
             if not self.exchange:
                 self.bot.reply_to(message, "Exchange not attached.")
                 return
-            balance = self.exchange.get_futures_balance(force_refresh=False)
-            self.bot.reply_to(message, f"💵 <b>Available balance:</b> ${balance:.2f}")
+            header = format_live_account_header(self.exchange).rstrip()
+            self.bot.reply_to(message, header)
 
         @self.bot.message_handler(commands=["active"])
         @authorized
@@ -671,7 +677,8 @@ class TelegramManager:
                 "/balance — live futures balance\n"
                 "/active — open positions (DB + Binance REST)\n"
                 "/watchlist — Tier 1 hot scan + Tier 2 candidates\n"
-                "/ping — bot health\n"
+                "/health — system diagnostics (alias /pulse)\n"
+                "/ping — quick online check\n"
                 "/help — this message",
             )
 

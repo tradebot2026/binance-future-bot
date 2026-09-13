@@ -45,6 +45,25 @@ def get_monitor_stall_seconds() -> float:
     return max(time.monotonic() - _monitor_last_tick_mono, 0.0)
 
 
+def get_main_stall_seconds() -> float:
+    if _main_last_tick_mono <= 0:
+        return float("inf")
+    return max(time.monotonic() - _main_last_tick_mono, 0.0)
+
+
+def read_heartbeat_payload() -> dict:
+    """Read the latest on-disk heartbeat written by the main/monitor loops."""
+    path = Config.WATCHDOG_HEARTBEAT_FILE
+    try:
+        if not os.path.isfile(path):
+            return {}
+        with open(path, encoding="utf-8") as handle:
+            data = json.load(handle)
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
 def write_bot_heartbeat(*, cycle: Optional[int] = None, source: str = "main") -> None:
     """Touch heartbeat file (throttled to avoid excessive disk I/O)."""
     global _last_write_monotonic
