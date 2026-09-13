@@ -1,6 +1,7 @@
 """
-Dynamic daily starting balance — resets at 00:00 UTC using account equity (margin balance).
+Dynamic daily starting balance — resets at 00:00 UTC using USDT wallet balance.
 Persisted to disk so mid-day restarts do not overwrite the day's baseline.
+Matches Day PnL in risk_manager: current_wallet - daily_starting_balance.
 """
 
 from __future__ import annotations
@@ -59,15 +60,29 @@ def _save_state(state: DailyBalanceState) -> None:
         system_logger.warning("Failed to persist daily balance state: %s", exc)
 
 
+def fetch_daily_wallet_baseline(
+    exchange: "BinanceExchangeManager",
+    *,
+    force: bool = False,
+) -> float:
+    """USDT wallet balance — daily baseline and Day PnL use the same metric."""
+    if hasattr(exchange, "fetch_live_account_snapshot"):
+        snap = exchange.fetch_live_account_snapshot(
+            include_today_income=False,
+            force_refresh=force,
+        )
+        wallet = safe_float(snap.wallet_balance)
+        if wallet > 0:
+            return wallet
+    wallet = exchange.get_futures_balance(force_refresh=force)
+    if wallet <= 0 and force:
+        wallet = exchange.get_futures_balance(force_refresh=True)
+    return wallet
+
+
 def fetch_account_equity(exchange: "BinanceExchangeManager", *, force: bool = False) -> float:
-    """Total margin balance (wallet + unrealized) — daily compounding baseline."""
-    snap = exchange.fetch_live_account_snapshot(include_today_income=False)
-    equity = safe_float(snap.margin_balance)
-    if equity <= 0:
-        equity = safe_float(snap.wallet_balance)
-    if equity <= 0 and force:
-        equity = exchange.get_futures_balance(force_refresh=True)
-    return equity
+    """Alias for wallet baseline (kept for scheduler compatibility)."""
+    return fetch_daily_wallet_baseline(exchange, force=force)
 
 
 def ensure_daily_baseline(
@@ -79,31 +94,31 @@ def ensure_daily_baseline(
 ) -> float:
     """
     Return today's daily_starting_balance.
-    - New UTC day: snapshot current equity and persist.
+    - New UTC day: snapshot current wallet balance and persist.
     - Same day restart: reuse persisted baseline (never overwrite mid-day).
     """
     today = utc_day or utc_today_str()
 
     if force_new_day:
-        equity = fetch_account_equity(exchange, force=True)
-        if equity <= 0:
+        wallet = fetch_daily_wallet_baseline(exchange, force=True)
+        if wallet <= 0:
             persisted = _load_state()
             if persisted and persisted.daily_starting_balance > 0:
-                equity = persisted.daily_starting_balance
-        if equity <= 0:
+                wallet = persisted.daily_starting_balance
+        if wallet <= 0:
             system_logger.warning(
-                "Could not resolve account equity for new day %s.", today
+                "Could not resolve wallet balance for new day %s.", today
             )
             return 0.0
-        _save_state(DailyBalanceState(today, equity))
-        db.initialize_daily_stats(today, equity)
-        db.update_daily_balance(today, equity, DAILY_STATUS_ACTIVE)
+        _save_state(DailyBalanceState(today, wallet))
+        db.initialize_daily_stats(today, wallet)
+        db.update_daily_balance(today, wallet, DAILY_STATUS_ACTIVE)
         system_logger.info(
-            "UTC day rollover — new daily starting balance for %s: $%.2f",
+            "UTC day rollover — new daily starting wallet for %s: $%.2f",
             today,
-            equity,
+            wallet,
         )
-        return equity
+        return wallet
 
     persisted = _load_state()
     stats = db.get_daily_stats(today)
@@ -129,26 +144,26 @@ def ensure_daily_baseline(
         _save_state(DailyBalanceState(today, baseline))
         return baseline
 
-    equity = fetch_account_equity(exchange, force=True)
-    if equity <= 0 and persisted and persisted.daily_starting_balance > 0:
-        equity = persisted.daily_starting_balance
+    wallet = fetch_daily_wallet_baseline(exchange, force=True)
+    if wallet <= 0 and persisted and persisted.daily_starting_balance > 0:
+        wallet = persisted.daily_starting_balance
 
-    if equity <= 0:
+    if wallet <= 0:
         system_logger.warning(
-            "Could not resolve account equity for daily baseline on %s.",
+            "Could not resolve wallet balance for daily baseline on %s.",
             today,
         )
         return 0.0
 
-    _save_state(DailyBalanceState(today, equity))
-    db.initialize_daily_stats(today, equity)
-    db.update_daily_balance(today, equity, DAILY_STATUS_ACTIVE)
+    _save_state(DailyBalanceState(today, wallet))
+    db.initialize_daily_stats(today, wallet)
+    db.update_daily_balance(today, wallet, DAILY_STATUS_ACTIVE)
     system_logger.info(
-        "Daily starting balance set for %s: $%.2f (margin/equity snapshot).",
+        "Daily starting wallet set for %s: $%.2f.",
         today,
-        equity,
+        wallet,
     )
-    return equity
+    return wallet
 
 
 def on_utc_day_rollover(
@@ -156,7 +171,7 @@ def on_utc_day_rollover(
     db: "DatabaseManager",
     new_day: str,
 ) -> float:
-    """Begin a new UTC trading day — baseline = current account equity."""
+    """Begin a new UTC trading day — baseline = current USDT wallet balance."""
     return ensure_daily_baseline(
         exchange, db, utc_day=new_day, force_new_day=True
     )

@@ -10,7 +10,14 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from config import Config
-from constants import DAILY_STATUS_PAUSED, STRATEGY_RANGE_REVERSION, TRADE_STATUS_CLOSED, is_range_strategy
+from constants import (
+    DAILY_STATUS_ACTIVE,
+    DAILY_STATUS_PAUSED,
+    STRATEGY_RANGE_REVERSION,
+    TRADE_STATUS_CLOSED,
+    is_range_strategy,
+)
+from core.daily_balance_manager import fetch_daily_wallet_baseline
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from logger import performance_logger, system_logger, trade_logger
@@ -22,14 +29,35 @@ if TYPE_CHECKING:
 
 @dataclass
 class DailyPnLMetrics:
-    """Daily performance metrics — target decisions use realized PnL only."""
+    """Daily performance metrics — circuit breakers use wallet equity vs daily start."""
 
     start_balance: float
+    current_wallet: float
+    equity_day_pnl: float
+    equity_day_pnl_percent: float
     realized_pnl: float
     unrealized_pnl: float
     total_pnl: float
     realized_pnl_percent: float
     total_pnl_percent: float
+
+
+def resolve_current_wallet_balance(exchange: BinanceExchangeManager) -> float:
+    """Live USDT wallet balance for equity-based daily PnL."""
+    return fetch_daily_wallet_baseline(exchange, force=False)
+
+
+def daily_profit_target_reached(metrics: DailyPnLMetrics) -> bool:
+    return metrics.equity_day_pnl_percent >= Config.DAILY_TARGET_PERCENT
+
+
+def daily_max_loss_reached(metrics: DailyPnLMetrics) -> bool:
+    """Never trip max loss while wallet equity is above the day's starting balance."""
+    if metrics.start_balance <= 0:
+        return False
+    if metrics.current_wallet > metrics.start_balance:
+        return False
+    return metrics.equity_day_pnl_percent <= -Config.DAILY_STOP_PERCENT
 
 
 @dataclass
@@ -57,33 +85,54 @@ def compute_daily_pnl_metrics(
 ) -> DailyPnLMetrics:
     """
     Compute today's PnL metrics.
-    Daily profit/loss circuit breakers must use realized_pnl_percent only.
+    Day PnL = current wallet balance - daily starting balance (equity difference).
     """
     stats = db.get_daily_stats(date_str) or {}
     start_balance = safe_float(stats.get("start_balance"))
+    current_wallet = resolve_current_wallet_balance(exchange)
+
+    equity_day_pnl = 0.0
+    equity_day_pnl_percent = 0.0
+    if start_balance > 0 and current_wallet > 0:
+        equity_day_pnl = current_wallet - start_balance
+        equity_day_pnl_percent = (equity_day_pnl / start_balance) * 100.0
+
+    if (
+        start_balance > 0
+        and current_wallet > start_balance
+        and stats.get("status") == DAILY_STATUS_PAUSED
+    ):
+        db.set_daily_status(date_str, DAILY_STATUS_ACTIVE, current_wallet)
+        system_logger.info(
+            "Daily status auto-cleared to ACTIVE — wallet $%.2f above start $%.2f.",
+            current_wallet,
+            start_balance,
+        )
+
     trade_analytics = db.get_daily_trade_analytics(date_str)
-    realized_pnl = safe_float(trade_analytics.get("total_pnl"))
-    if realized_pnl == 0:
-        realized_pnl = safe_float(stats.get("total_pnl"))
+    db_realized_pnl = safe_float(trade_analytics.get("total_pnl"))
+    if db_realized_pnl == 0:
+        db_realized_pnl = safe_float(stats.get("total_pnl"))
+
     unrealized_pnl = exchange.get_unrealized_pnl_total()
     if unrealized_pnl == 0 and exchange.get_open_positions_count() > 0:
         unrealized_pnl = exchange.get_unrealized_pnl_total(force_refresh=True)
-    total_pnl = realized_pnl + unrealized_pnl
 
-    if start_balance > 0:
-        realized_pnl_percent = (realized_pnl / start_balance) * 100.0
-        total_pnl_percent = (total_pnl / start_balance) * 100.0
-    else:
-        realized_pnl_percent = 0.0
-        total_pnl_percent = 0.0
+    db_total_pnl = db_realized_pnl + unrealized_pnl
+    db_realized_percent = (
+        (db_realized_pnl / start_balance) * 100.0 if start_balance > 0 else 0.0
+    )
 
     return DailyPnLMetrics(
         start_balance=start_balance,
-        realized_pnl=realized_pnl,
+        current_wallet=current_wallet,
+        equity_day_pnl=equity_day_pnl,
+        equity_day_pnl_percent=equity_day_pnl_percent,
+        realized_pnl=db_realized_pnl,
         unrealized_pnl=unrealized_pnl,
-        total_pnl=total_pnl,
-        realized_pnl_percent=realized_pnl_percent,
-        total_pnl_percent=total_pnl_percent,
+        total_pnl=equity_day_pnl,
+        realized_pnl_percent=db_realized_percent,
+        total_pnl_percent=equity_day_pnl_percent,
     )
 
 
@@ -248,24 +297,23 @@ class RiskManager:
             return False, ""
 
         today = utc_today_str()
+        metrics = compute_daily_pnl_metrics(self.exchange, self.db, today)
         stats = self.db.get_daily_stats(today) or {}
         if stats.get("status") == DAILY_STATUS_PAUSED:
             return True, "Daily limit already reached — entries paused for today."
-
-        metrics = compute_daily_pnl_metrics(self.exchange, self.db, today)
         if metrics.start_balance <= 0:
             return False, ""
 
-        if metrics.realized_pnl_percent >= Config.DAILY_TARGET_PERCENT:
+        if daily_profit_target_reached(metrics):
             reason = (
-                f"Daily profit target reached (+{metrics.realized_pnl_percent:.2f}%). "
+                f"Daily profit target reached (+{metrics.equity_day_pnl_percent:.2f}% equity). "
                 f"Target={Config.DAILY_TARGET_PERCENT:.2f}%."
             )
             return True, reason
 
-        if metrics.realized_pnl_percent <= -Config.DAILY_STOP_PERCENT:
+        if daily_max_loss_reached(metrics):
             reason = (
-                f"Daily max loss reached ({metrics.realized_pnl_percent:.2f}%). "
+                f"Daily max loss reached ({metrics.equity_day_pnl_percent:.2f}% equity). "
                 f"Limit=-{Config.DAILY_STOP_PERCENT:.2f}%."
             )
             return True, reason
@@ -284,6 +332,7 @@ class RiskManager:
         open_positions = max(exchange_open, db_open)
 
         today = utc_today_str()
+        pnl_metrics = compute_daily_pnl_metrics(self.exchange, self.db, today)
         daily_stats = self.db.get_daily_stats(today) or {}
 
         daily_entries = int(daily_stats.get("entries_count", 0) or 0)
@@ -292,8 +341,6 @@ class RiskManager:
             trade_analytics.get("closes", daily_stats.get("trades_count", 0))
         )
         consecutive_losses = self._count_consecutive_losses(Config.MAX_CONSECUTIVE_LOSSES)
-
-        pnl_metrics = compute_daily_pnl_metrics(self.exchange, self.db, today)
         if pnl_metrics.realized_pnl > self._peak_realized_pnl:
             self._peak_realized_pnl = pnl_metrics.realized_pnl
 
@@ -329,19 +376,13 @@ class RiskManager:
                 f"Realized PnL drawdown limit reached ({drawdown:.2f}% >= "
                 f"{Config.MAX_ACCOUNT_DRAWDOWN:.2f}%)."
             )
-        elif (
-            not daily_override
-            and pnl_metrics.realized_pnl_percent >= Config.DAILY_TARGET_PERCENT
-        ):
+        elif not daily_override and daily_profit_target_reached(pnl_metrics):
             block_reason = (
-                f"Daily profit target reached (+{pnl_metrics.realized_pnl_percent:.2f}%)."
+                f"Daily profit target reached (+{pnl_metrics.equity_day_pnl_percent:.2f}%)."
             )
-        elif (
-            not daily_override
-            and pnl_metrics.realized_pnl_percent <= -Config.DAILY_STOP_PERCENT
-        ):
+        elif not daily_override and daily_max_loss_reached(pnl_metrics):
             block_reason = (
-                f"Daily max loss reached ({pnl_metrics.realized_pnl_percent:.2f}%)."
+                f"Daily max loss reached ({pnl_metrics.equity_day_pnl_percent:.2f}%)."
             )
 
         entries_allowed = block_reason == ""
@@ -356,8 +397,8 @@ class RiskManager:
             consecutive_losses=consecutive_losses,
             drawdown_percent=drawdown,
             current_balance=current_balance,
-            daily_realized_pnl=pnl_metrics.realized_pnl,
-            daily_realized_pnl_percent=pnl_metrics.realized_pnl_percent,
+            daily_realized_pnl=pnl_metrics.equity_day_pnl,
+            daily_realized_pnl_percent=pnl_metrics.equity_day_pnl_percent,
             unrealized_pnl=pnl_metrics.unrealized_pnl,
             entries_allowed=entries_allowed,
             block_reason=block_reason,

@@ -19,7 +19,11 @@ from core.daily_balance_manager import (
     fetch_account_equity,
     on_utc_day_rollover,
 )
-from risk_manager import compute_daily_pnl_metrics
+from risk_manager import (
+    compute_daily_pnl_metrics,
+    daily_max_loss_reached,
+    daily_profit_target_reached,
+)
 from utils import safe_float, utc_today_str
 
 if TYPE_CHECKING:
@@ -153,6 +157,9 @@ class DailyScheduler:
         if self.controller and self.controller.is_daily_limit_overridden():
             return False, ""
 
+        metrics = compute_daily_pnl_metrics(self.exchange, self.db, self.today_str)
+        stats = self.db.get_daily_stats(self.today_str) or stats
+
         if stats.get("status") == DAILY_STATUS_PAUSED:
             return True, "Daily limit already reached — entries paused for today."
 
@@ -161,7 +168,6 @@ class DailyScheduler:
             return False, ""
 
         self._last_limit_check_at = now
-        metrics = compute_daily_pnl_metrics(self.exchange, self.db, self.today_str)
         if metrics.start_balance <= 0:
             system_logger.warning(
                 "Daily PnL check skipped: invalid start balance for %s.",
@@ -172,28 +178,29 @@ class DailyScheduler:
         current_balance = self._get_balance(force_refresh=False)
         self.db.update_daily_balance(self.today_str, current_balance, DAILY_STATUS_ACTIVE)
 
-        if metrics.realized_pnl_percent >= Config.DAILY_TARGET_PERCENT:
+        if daily_profit_target_reached(metrics):
             reason = (
-                f"Daily profit target reached (+{metrics.realized_pnl_percent:.2f}% realized). "
+                f"Daily profit target reached (+{metrics.equity_day_pnl_percent:.2f}% equity). "
                 f"Target={Config.DAILY_TARGET_PERCENT:.2f}%."
             )
             self._pause_entries(current_balance, reason, metrics)
             return True, reason
 
-        if metrics.realized_pnl_percent <= -Config.DAILY_STOP_PERCENT:
+        if daily_max_loss_reached(metrics):
             reason = (
-                f"Daily max loss reached ({metrics.realized_pnl_percent:.2f}% realized). "
+                f"Daily max loss reached ({metrics.equity_day_pnl_percent:.2f}% equity). "
                 f"Limit=-{Config.DAILY_STOP_PERCENT:.2f}%."
             )
             self._pause_entries(current_balance, reason, metrics)
             return True, reason
 
         performance_logger.info(
-            "Daily realized PnL $%.2f (%.2f%%) | unrealized=$%.2f | ref=$%.2f",
-            metrics.realized_pnl,
-            metrics.realized_pnl_percent,
-            metrics.unrealized_pnl,
+            "Daily equity PnL $%.2f (%.2f%%) | wallet=$%.2f | start=$%.2f | unrealized=$%.2f",
+            metrics.equity_day_pnl,
+            metrics.equity_day_pnl_percent,
+            metrics.current_wallet,
             metrics.start_balance,
+            metrics.unrealized_pnl,
         )
         return False, ""
 
@@ -220,7 +227,9 @@ class DailyScheduler:
         enriched["trades_count"] = int(analytics.get("closes", stats.get("trades_count", 0)))
         enriched["computed_total_pnl"] = metrics.total_pnl
         enriched["computed_pnl_percent"] = metrics.total_pnl_percent
-        enriched["computed_realized_pnl_percent"] = metrics.realized_pnl_percent
+        enriched["computed_realized_pnl_percent"] = metrics.equity_day_pnl_percent
+        enriched["equity_day_pnl"] = metrics.equity_day_pnl
+        enriched["current_wallet"] = metrics.current_wallet
         enriched["unrealized_pnl"] = metrics.unrealized_pnl
         enriched["win_rate"] = analytics.get("win_rate", 0.0)
         enriched["wins"] = analytics.get("wins", 0)
@@ -264,7 +273,7 @@ class DailyScheduler:
             )
         if baseline <= 0:
             system_logger.warning(
-                "Could not initialize daily stats for %s: equity unavailable.",
+                "Could not initialize daily stats for %s: wallet unavailable.",
                 self.today_str,
             )
             return
@@ -294,8 +303,8 @@ class DailyScheduler:
             pnl_line = ""
             if metrics is not None:
                 pnl_line = (
-                    f"\n📈 <b>Realized PnL:</b> ${safe_float(getattr(metrics, 'realized_pnl', 0)):.2f} "
-                    f"({safe_float(getattr(metrics, 'realized_pnl_percent', 0)):.2f}%)"
+                    f"\n📈 <b>Day PnL (equity):</b> ${safe_float(getattr(metrics, 'equity_day_pnl', 0)):.2f} "
+                    f"({safe_float(getattr(metrics, 'equity_day_pnl_percent', 0)):.2f}%)"
                 )
             self.telegram.send_message(
                 "⏸ <b>Entries paused</b>\n"

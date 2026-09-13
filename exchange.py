@@ -5,6 +5,7 @@ Thread-safe symbol rules cache, rate limiting, balance caching, and order execut
 
 from __future__ import annotations
 
+import json
 import random
 import threading
 import time
@@ -511,7 +512,65 @@ class BinanceExchangeManager:
         return ws_balance
 
     @staticmethod
-    def _extract_quote_balance(account_info: dict[str, Any], quote: str) -> float:
+    def _coerce_api_payload(data: Any) -> Any:
+        """
+        Normalize Binance REST payloads that may arrive as dict, list, or JSON string.
+        Returns None for HTML/plain-text error bodies and other unsupported shapes.
+        """
+        if isinstance(data, (dict, list)):
+            return data
+        if isinstance(data, str):
+            text = data.strip()
+            if not text or text[0] not in "{[":
+                return None
+            try:
+                return json.loads(text)
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    @staticmethod
+    def _parse_futures_account_payload(
+        data: Any,
+        quote: str,
+    ) -> Optional[dict[str, Any]]:
+        """Convert futures_account or futures_account_balance responses to account dict."""
+        payload = BinanceExchangeManager._coerce_api_payload(data)
+        if payload is None:
+            return None
+
+        if isinstance(payload, dict):
+            if (
+                payload.get("assets")
+                or payload.get("totalWalletBalance") is not None
+                or payload.get("totalMarginBalance") is not None
+                or payload.get("totalCrossWalletBalance") is not None
+            ):
+                return payload
+            return None
+
+        if isinstance(payload, list):
+            account_info = BinanceExchangeManager._account_info_from_asset_balances(
+                payload, quote
+            )
+            if (
+                safe_float(account_info.get("totalWalletBalance")) > 0
+                or safe_float(account_info.get("totalMarginBalance")) > 0
+                or BinanceExchangeManager._extract_quote_balance(account_info, quote) > 0
+            ):
+                return account_info
+        return None
+
+    @staticmethod
+    def _extract_quote_balance(account_info: Any, quote: str) -> float:
+        if not isinstance(account_info, dict):
+            parsed = BinanceExchangeManager._parse_futures_account_payload(
+                account_info, quote
+            )
+            if not parsed:
+                return 0.0
+            account_info = parsed
+
         for key in (
             "availableBalance",
             "totalCrossWalletBalance",
@@ -520,14 +579,49 @@ class BinanceExchangeManager:
             value = safe_float(account_info.get(key))
             if value > 0:
                 return value
-        for asset in account_info.get("assets", []):
-            if asset.get("asset") != quote:
+
+        assets = account_info.get("assets", [])
+        if not isinstance(assets, list):
+            return 0.0
+
+        for asset in assets:
+            if not isinstance(asset, dict):
                 continue
-            for field in ("availableBalance", "crossWalletBalance", "walletBalance"):
+            if str(asset.get("asset", "")).upper() != quote.upper():
+                continue
+            for field in (
+                "availableBalance",
+                "crossWalletBalance",
+                "walletBalance",
+                "balance",
+            ):
                 value = safe_float(asset.get(field))
                 if value > 0:
                     return value
         return 0.0
+
+    @staticmethod
+    def _extract_margin_balance(account_info: Any, quote: str) -> float:
+        """Return total margin balance (wallet + unrealized) when present."""
+        if not isinstance(account_info, dict):
+            parsed = BinanceExchangeManager._parse_futures_account_payload(
+                account_info, quote
+            )
+            if not parsed:
+                return 0.0
+            account_info = parsed
+
+        margin = safe_float(account_info.get("totalMarginBalance"))
+        if margin > 0:
+            return margin
+
+        wallet = safe_float(account_info.get("totalWalletBalance"))
+        if wallet <= 0:
+            wallet = BinanceExchangeManager._extract_quote_balance(account_info, quote)
+        unrealized = safe_float(account_info.get("totalUnrealizedProfit"))
+        if wallet > 0:
+            return wallet + unrealized
+        return wallet
 
     def _ws_margin_balance_estimate(self) -> Optional[float]:
         """Wallet + unrealized PnL from user stream when REST balance is unavailable."""
@@ -694,7 +788,12 @@ class BinanceExchangeManager:
 
     def _return_cached_account_call(self, func: Any) -> Any:
         name = getattr(func, "__name__", "")
-        if name in ("futures_account", "futures_account_balance"):
+        if name == "futures_account_balance":
+            cached = self._cached_futures_account_response()
+            if cached and isinstance(cached.get("assets"), list):
+                return list(cached["assets"])
+            return []
+        if name == "futures_account":
             cached = self._cached_futures_account_response()
             if cached is not None:
                 return cached
@@ -833,10 +932,13 @@ class BinanceExchangeManager:
                 self._enforce_kline_rest_pace()
             try:
                 result = func(*args, **kwargs)
-                if getattr(func, "__name__", "") == "futures_account" and isinstance(
-                    result, dict
-                ):
-                    self._store_account_rest_response(result)
+                if getattr(func, "__name__", "") == "futures_account":
+                    parsed = self._parse_futures_account_payload(
+                        result, Config.QUOTE_ASSET
+                    )
+                    if parsed:
+                        self._store_account_rest_response(parsed)
+                        result = parsed
                 elif getattr(func, "__name__", "") == "futures_position_information":
                     self._last_account_rest_at = time.monotonic()
                 return result
@@ -1175,20 +1277,54 @@ class BinanceExchangeManager:
             return self._balance_cache.value
 
         try:
-            account_info = self._throttled_call(
+            raw = self._throttled_call(
                 self.client.futures_account,
                 **self.recv_window_param,
             )
-            balance = self._extract_quote_balance(account_info, quote)
-            if balance >= 0:
-                self._balance_cache.set(balance)
-                return balance
+            account_info = self._parse_futures_account_payload(raw, quote)
+            if account_info:
+                balance = self._extract_quote_balance(account_info, quote)
+                if balance >= 0:
+                    self._balance_cache.set(balance)
+                    return balance
         except ExchangeRateLimitError:
             pass
         except Exception as exc:
             error_logger.warning("Startup balance fetch failed: %s", exc)
 
         return self._balance_cache.value
+
+    def fetch_account_balance(self, force_refresh: bool = False) -> float:
+        """
+        Return USDT margin balance from Binance Futures account endpoints.
+        Safe against dict/list/JSON-string responses; falls back to cache/WS on failure.
+        """
+        quote = Config.QUOTE_ASSET
+
+        ws_balance = self._hydrate_balance_from_ws()
+        if ws_balance is not None and ws_balance > 0:
+            margin_est = self._ws_margin_balance_estimate()
+            return margin_est if margin_est is not None and margin_est > 0 else ws_balance
+
+        try:
+            account_info, _ = self._fetch_futures_account_rest(
+                force_live=force_refresh,
+                max_attempts=max(Config.STARTUP_BALANCE_MAX_ATTEMPTS, 2),
+            )
+            if account_info:
+                margin = self._extract_margin_balance(account_info, quote)
+                if margin > 0:
+                    self._balance_cache.set(margin)
+                    return margin
+                wallet = self._extract_quote_balance(account_info, quote)
+                if wallet > 0:
+                    self._balance_cache.set(wallet)
+                    return wallet
+        except Exception as exc:
+            if self._rest_block_log.should_log("fetch_account_balance"):
+                error_logger.warning("fetch_account_balance failed: %s", exc)
+
+        return self.get_futures_balance(force_refresh=force_refresh)
 
     def get_futures_balance(self, force_refresh: bool = False) -> float:
         """
@@ -1264,7 +1400,7 @@ class BinanceExchangeManager:
             )
             if account_info:
                 balance = self._extract_quote_balance(account_info, quote)
-                if balance <= 0:
+                if balance <= 0 and isinstance(account_info, dict):
                     balance = safe_float(account_info.get("totalWalletBalance"))
                 if balance > 0:
                     return balance
@@ -1293,8 +1429,22 @@ class BinanceExchangeManager:
             return self._balance_cache.value
 
     @staticmethod
+    def _normalize_balance_rows(data: Any) -> list[dict[str, Any]]:
+        """Accept fapi/v2/balance list or assets[] from a cached account dict."""
+        payload = BinanceExchangeManager._coerce_api_payload(data)
+        if payload is None:
+            return []
+        if isinstance(payload, list):
+            return [row for row in payload if isinstance(row, dict)]
+        if isinstance(payload, dict):
+            assets = payload.get("assets")
+            if isinstance(assets, list):
+                return [row for row in assets if isinstance(row, dict)]
+        return []
+
+    @staticmethod
     def _account_info_from_asset_balances(
-        rows: list[dict[str, Any]],
+        rows: Any,
         quote: str,
     ) -> dict[str, Any]:
         """Build a futures_account-like payload from fapi/v2/balance rows."""
@@ -1303,7 +1453,7 @@ class BinanceExchangeManager:
         available = 0.0
         unrealized = 0.0
         assets: list[dict[str, Any]] = []
-        for row in rows or []:
+        for row in BinanceExchangeManager._normalize_balance_rows(rows):
             if str(row.get("asset", "")).upper() != quote:
                 continue
             wallet = safe_float(row.get("balance"))
@@ -1328,6 +1478,12 @@ class BinanceExchangeManager:
         account_info: dict[str, Any],
     ) -> None:
         quote = Config.QUOTE_ASSET
+        if not isinstance(account_info, dict):
+            parsed = self._parse_futures_account_payload(account_info, quote)
+            if not parsed:
+                return
+            account_info = parsed
+
         snapshot.wallet_balance = safe_float(account_info.get("totalWalletBalance"))
         if snapshot.wallet_balance <= 0:
             snapshot.wallet_balance = self._extract_quote_balance(account_info, quote)
@@ -1370,16 +1526,14 @@ class BinanceExchangeManager:
             if self.is_rest_blocked()[0] and not force_live:
                 break
             try:
-                account_info = self._throttled_call(
+                raw = self._throttled_call(
                     self.client.futures_account,
                     execution_priority=force_live,
                     bypass_account_cache=force_live,
                     **self.recv_window_param,
                 )
-                if account_info and (
-                    safe_float(account_info.get("totalWalletBalance")) > 0
-                    or self._extract_quote_balance(account_info, quote) > 0
-                ):
+                account_info = self._parse_futures_account_payload(raw, quote)
+                if account_info:
                     self._store_account_rest_response(account_info)
                     wallet = safe_float(account_info.get("totalWalletBalance"))
                     if wallet <= 0:
@@ -1387,6 +1541,10 @@ class BinanceExchangeManager:
                     if wallet > 0:
                         self._balance_cache.set(wallet)
                     return account_info, "REST (live)"
+                if raw is not None and not isinstance(raw, (dict, list)):
+                    last_exc = TypeError(
+                        f"futures_account returned unsupported {type(raw).__name__}"
+                    )
             except ExchangeRateLimitError as exc:
                 last_exc = exc
                 if not force_live:
@@ -1405,16 +1563,18 @@ class BinanceExchangeManager:
 
         if not self.is_rest_blocked()[0] or force_live:
             try:
-                rows = self._throttled_call(
+                raw = self._throttled_call(
                     self.client.futures_account_balance,
                     execution_priority=force_live,
                     bypass_account_cache=force_live,
                     **self.recv_window_param,
                 )
-                account_info = self._account_info_from_asset_balances(rows or [], quote)
-                if self._extract_quote_balance(account_info, quote) > 0:
+                account_info = self._parse_futures_account_payload(raw, quote)
+                if account_info:
                     self._store_account_rest_response(account_info)
                     wallet = safe_float(account_info.get("totalWalletBalance"))
+                    if wallet <= 0:
+                        wallet = self._extract_quote_balance(account_info, quote)
                     if wallet > 0:
                         self._balance_cache.set(wallet)
                     return account_info, "REST balance endpoint"

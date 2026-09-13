@@ -429,11 +429,17 @@ class TelegramManager:
                 self.bot.reply_to(message, "⚠️ Exchange not attached.")
                 return
 
+            engine_status = "RUNNING"
+            if self.scheduler:
+                paused, _ = self.scheduler.is_entry_paused()
+                engine_status = "PAUSED" if paused else "RUNNING"
+
             msg = format_daily_status_message(
                 self.exchange,
                 self.db,
                 stats,
                 today=today,
+                engine_status=engine_status,
             )
             self.bot.reply_to(message, msg)
 

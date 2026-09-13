@@ -8,6 +8,7 @@ from config import Config
 from constants import strategy_display_label
 from database import DatabaseManager
 from reconciliation import sync_active_trades_on_demand
+from risk_manager import compute_daily_pnl_metrics
 from utils import escape_html, safe_float, utc_today_str
 
 
@@ -116,45 +117,72 @@ def format_live_account_header(
     )
 
 
+def _resolve_live_wallet_unrealized(exchange: Any) -> tuple[float, float]:
+    """Fetch wallet and unrealized PnL once for compact status display."""
+    snap = _fetch_live_account(exchange)
+    if snap is not None and snap.wallet_balance > 0:
+        return snap.wallet_balance, snap.unrealized_pnl
+    wallet = safe_float(exchange.get_futures_balance(force_refresh=True))
+    unrealized = safe_float(exchange.get_unrealized_pnl_total(force_refresh=True))
+    return wallet, unrealized
+
+
 def format_daily_status_message(
     exchange: Any,
     db: DatabaseManager,
     stats: dict,
     *,
     today: Optional[str] = None,
+    engine_status: str = "RUNNING",
 ) -> str:
-    """Build /status reply — live exchange balances + DB trade analytics."""
+    """Build /status reply — single cohesive daily performance summary."""
     date_str = today or utc_today_str()
     db.sync_daily_stats_from_trades(date_str)
     analytics = db.get_daily_trade_analytics(date_str)
     pf = analytics.get("profit_factor", 0.0)
     pf_display = "∞" if pf == float("inf") else f"{pf:.2f}"
 
-    daily_start = safe_float(stats.get("start_balance"))
-    bot_realized = safe_float(analytics.get("total_pnl", stats.get("total_pnl")))
-    daily_pct = 0.0
-    if daily_start > 0:
-        daily_pct = (bot_realized / daily_start) * 100.0
+    metrics = compute_daily_pnl_metrics(exchange, db, date_str)
+    daily_start = metrics.start_balance
+    day_pnl = metrics.equity_day_pnl
+    daily_pct = metrics.equity_day_pnl_percent
+    wallet = metrics.current_wallet
+    unrealized = metrics.unrealized_pnl
 
-    lines = [
-        f"📊 <b>Daily Status ({escape_html(date_str)})</b>\n",
-        format_live_account_header(
-            exchange,
-            session_ref=daily_start,
-            db=db,
-            date_str=date_str,
-        ).rstrip(),
-        "",
-        f"💰 <b>Daily Start (UTC):</b> ${daily_start:.2f}",
-        f"📈 <b>Day PnL vs Start:</b> ${bot_realized:.2f} ({daily_pct:+.2f}%)",
+    wallet_line = f"${wallet:,.2f}" if wallet > 0 else "unavailable"
+
+    if day_pnl >= 0:
+        day_pnl_line = (
+            f"📈 <b>Day PnL:</b> +${day_pnl:.2f} ({daily_pct:+.2f}%)"
+        )
+    else:
+        day_pnl_line = (
+            f"📉 <b>Day PnL:</b> -${abs(day_pnl):.2f} ({daily_pct:.2f}%)"
+        )
+
+    daily_status = escape_html(str(stats.get("status", "ACTIVE")))
+    engine_label = escape_html(engine_status.upper())
+    closes = int(analytics.get("closes", stats.get("trades_count", 0)))
+    entries = int(stats.get("entries_count", 0))
+
+    return (
+        f"📊 <b>DAILY PERFORMANCE STATUS</b>\n"
+        f"<i>{escape_html(date_str)} UTC</i>\n"
+        f"───────────────────────\n"
+        f"💵 <b>Wallet Balance:</b> {wallet_line}\n"
+        f"📈 <b>Daily Start (UTC):</b> ${daily_start:,.2f}\n"
+        f"{day_pnl_line}\n"
+        f"📊 <b>Unrealized PnL:</b> ${unrealized:.2f}\n"
+        f"\n"
+        f"🎯 <b>TRADE STATS (TODAY)</b>\n"
+        f"───────────────────────\n"
         f"🏆 <b>Win Rate:</b> {analytics.get('win_rate', 0.0):.1f}% "
-        f"({analytics.get('wins', 0)}W / {analytics.get('losses', 0)}L)",
-        f"📐 <b>Profit Factor:</b> {pf_display}",
-        f"🆕 <b>Entries:</b> {int(stats.get('entries_count', 0))}/{Config.MAX_DAILY_TRADES}",
-        f"🔄 <b>Closes:</b> {int(analytics.get('closes', stats.get('trades_count', 0)))}",
-        f"⚙️ <b>Status:</b> {escape_html(str(stats.get('status', 'UNKNOWN')))}",
-    ]
-    return "\n".join(lines)
+        f"({analytics.get('wins', 0)}W / {analytics.get('losses', 0)}L)\n"
+        f"⚖️ <b>Profit Factor:</b> {pf_display}\n"
+        f"🚀 <b>Entries:</b> {entries}/{Config.MAX_DAILY_TRADES} | "
+        f"<b>Closes:</b> {closes}\n"
+        f"⚙️ <b>Bot Status:</b> {engine_label} / {daily_status}"
+    )
 
 
 def format_daily_stats_footer(db: DatabaseManager, date_str: str) -> str:
