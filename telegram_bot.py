@@ -542,6 +542,32 @@ class TelegramManager:
                     f"{consec_line}{allowed_line}",
                 )
 
+        @self.bot.message_handler(commands=["forceresume", "force_start"])
+        @authorized
+        def forceresume_handler(message: telebot.types.Message) -> None:
+            if not self.scheduler:
+                self.bot.reply_to(message, "Scheduler not attached.")
+                return
+
+            note = self.scheduler.force_resume_entries()
+            if self.risk_manager:
+                self.risk_manager.reset_consecutive_loss_block()
+                snap = self.risk_manager.get_risk_snapshot()
+                status_line = (
+                    f"\n⚙️ <b>Status:</b> RUNNING"
+                    f"\n✅ <b>Entries allowed:</b> {snap.entries_allowed}"
+                )
+            else:
+                status_line = "\n⚙️ <b>Status:</b> RUNNING"
+
+            self.bot.reply_to(
+                message,
+                "🚀 <b>Force resume activated</b>\n"
+                f"{escape_html(note)}"
+                f"{status_line}\n"
+                "<i>Daily max-loss lock cleared. Override resets at next UTC day.</i>",
+            )
+
         @self.bot.message_handler(commands=["closeall"])
         @authorized
         def closeall_handler(message: telebot.types.Message) -> None:
@@ -614,7 +640,11 @@ class TelegramManager:
             if not self.exchange:
                 self.bot.reply_to(message, "Exchange not attached.")
                 return
-            header = format_live_account_header(self.exchange).rstrip()
+            header = format_live_account_header(
+                self.exchange,
+                db=self.db,
+                date_str=utc_today_str(),
+            ).rstrip()
             self.bot.reply_to(message, header)
 
         @self.bot.message_handler(commands=["active"])

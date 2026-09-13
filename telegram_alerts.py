@@ -58,7 +58,10 @@ def _build_exchange_position_map(
 def _fetch_live_account(exchange: Any):
     """Always request a fresh REST account snapshot for Telegram display."""
     if hasattr(exchange, "fetch_live_account_snapshot"):
-        return exchange.fetch_live_account_snapshot(include_today_income=True)
+        return exchange.fetch_live_account_snapshot(
+            include_today_income=True,
+            force_refresh=True,
+        )
     return None
 
 
@@ -74,10 +77,17 @@ def format_live_account_header(
     if snap is None or snap.wallet_balance <= 0:
         balance = safe_float(exchange.get_futures_balance(force_refresh=True))
         unrealized = safe_float(exchange.get_unrealized_pnl_total(force_refresh=True))
+        if balance <= 0 and unrealized == 0:
+            return (
+                "💵 <b>Wallet:</b> unavailable\n"
+                "📉 <b>Unrealized:</b> unavailable\n"
+                "<i>Source: REST unavailable — check API connectivity</i>\n"
+            )
+        source_note = "WS/cache fallback" if balance > 0 else "partial cache"
         return (
             f"💵 <b>Wallet:</b> ${balance:.2f}\n"
             f"📉 <b>Unrealized:</b> ${unrealized:.2f}\n"
-            f"<i>Source: fallback cache</i>\n"
+            f"<i>Source: {escape_html(source_note)}</i>\n"
         )
 
     realized_today = snap.today_realized_pnl

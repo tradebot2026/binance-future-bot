@@ -17,6 +17,7 @@ class BotController:
         self._restart = threading.Event()
         self._manual_pause = False
         self._manual_pause_reason = ""
+        self._force_daily_limit_override = False
         self.started_at_mono: float = 0.0
 
     def mark_started(self) -> None:
@@ -65,6 +66,21 @@ class BotController:
         with self._lock:
             self._manual_pause = False
             self._manual_pause_reason = ""
+
+    def force_resume_daily_limits(self) -> None:
+        """Override daily profit/loss circuit breaker (testnet manual recovery)."""
+        with self._lock:
+            self._force_daily_limit_override = True
+            self._manual_pause = False
+            self._manual_pause_reason = ""
+
+    def clear_daily_limit_override(self) -> None:
+        with self._lock:
+            self._force_daily_limit_override = False
+
+    def is_daily_limit_overridden(self) -> bool:
+        with self._lock:
+            return self._force_daily_limit_override
 
     def is_manually_paused(self) -> tuple[bool, str]:
         with self._lock:

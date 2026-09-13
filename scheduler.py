@@ -105,6 +105,39 @@ class DailyScheduler:
         if self.controller:
             self.controller.resume_entries()
 
+    def force_resume_entries(self) -> str:
+        """
+        Clear manual pause and override daily max-loss / profit-target circuit breaker.
+        Sets daily_stats status back to ACTIVE for manual testnet recovery.
+        """
+        self.ensure_startup_initialized()
+        if self.controller:
+            self.controller.force_resume_daily_limits()
+        else:
+            self.resume_entries_manual()
+
+        self.exchange.invalidate_balance_cache()
+        current_balance = self._get_balance(force_refresh=True)
+        if current_balance <= 0:
+            current_balance = safe_float(
+                (self.db.get_daily_stats(self.today_str) or {}).get("current_balance")
+            )
+
+        self.db.set_daily_status(
+            self.today_str,
+            DAILY_STATUS_ACTIVE,
+            current_balance if current_balance > 0 else 0.0,
+        )
+        self._last_limit_check_at = 0.0
+        trade_logger.warning(
+            "FORCE RESUME — daily circuit breaker overridden for %s.",
+            self.today_str,
+        )
+        return (
+            "Daily limit override active — entries forced RUNNING "
+            f"({self.today_str} UTC)."
+        )
+
     def check_daily_limits(self) -> tuple[bool, str]:
         """Evaluate day rollover and realized-PnL daily profit/loss thresholds."""
         self.ensure_startup_initialized()
@@ -116,6 +149,9 @@ class DailyScheduler:
             stats = self.db.get_daily_stats(self.today_str)
             if not stats:
                 return False, ""
+
+        if self.controller and self.controller.is_daily_limit_overridden():
+            return False, ""
 
         if stats.get("status") == DAILY_STATUS_PAUSED:
             return True, "Daily limit already reached — entries paused for today."
@@ -207,6 +243,8 @@ class DailyScheduler:
         system_logger.info("UTC day rollover detected: %s -> %s", self.today_str, current_day)
         self.today_str = current_day
         self._last_limit_check_at = 0.0
+        if self.controller:
+            self.controller.clear_daily_limit_override()
         self._initialize_trading_day(force_balance_refresh=False)
 
         if self.telegram:

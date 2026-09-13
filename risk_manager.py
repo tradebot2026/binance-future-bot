@@ -7,7 +7,7 @@ and realized-PnL-based drawdown. Works alongside DailyScheduler (daily pause).
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from config import Config
 from constants import DAILY_STATUS_PAUSED, STRATEGY_RANGE_REVERSION, TRADE_STATUS_CLOSED, is_range_strategy
@@ -15,6 +15,9 @@ from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from logger import performance_logger, system_logger, trade_logger
 from utils import minimum_order_quantity, safe_float, utc_now, utc_today_str
+
+if TYPE_CHECKING:
+    from bot_controller import BotController
 
 
 @dataclass
@@ -87,9 +90,15 @@ def compute_daily_pnl_metrics(
 class RiskManager:
     """Enforces portfolio-level constraints before new entries are executed."""
 
-    def __init__(self, exchange: BinanceExchangeManager, db: DatabaseManager) -> None:
+    def __init__(
+        self,
+        exchange: BinanceExchangeManager,
+        db: DatabaseManager,
+        controller: Optional["BotController"] = None,
+    ) -> None:
         self.exchange = exchange
         self.db = db
+        self.controller = controller
         self._peak_realized_pnl = 0.0
         self._reference_balance = 0.0
         # Only closed trades after this timestamp count toward consecutive-loss blocks.
@@ -228,8 +237,16 @@ class RiskManager:
 
         return True, ""
 
+    def _daily_limit_override_active(self) -> bool:
+        return bool(
+            self.controller and self.controller.is_daily_limit_overridden()
+        )
+
     def is_daily_pnl_limit_reached(self) -> tuple[bool, str]:
         """Return whether daily profit target or max loss has been hit (realized PnL)."""
+        if self._daily_limit_override_active():
+            return False, ""
+
         today = utc_today_str()
         stats = self.db.get_daily_stats(today) or {}
         if stats.get("status") == DAILY_STATUS_PAUSED:
@@ -289,8 +306,9 @@ class RiskManager:
         if current_balance <= 0:
             current_balance = self.exchange.get_futures_balance(force_refresh=True)
         block_reason = ""
+        daily_override = self._daily_limit_override_active()
 
-        if daily_stats.get("status") == DAILY_STATUS_PAUSED:
+        if not daily_override and daily_stats.get("status") == DAILY_STATUS_PAUSED:
             block_reason = "Daily PnL limit reached — entries paused for today."
         elif exchange_open >= Config.MAX_POSITIONS:
             block_reason = (
@@ -311,11 +329,17 @@ class RiskManager:
                 f"Realized PnL drawdown limit reached ({drawdown:.2f}% >= "
                 f"{Config.MAX_ACCOUNT_DRAWDOWN:.2f}%)."
             )
-        elif pnl_metrics.realized_pnl_percent >= Config.DAILY_TARGET_PERCENT:
+        elif (
+            not daily_override
+            and pnl_metrics.realized_pnl_percent >= Config.DAILY_TARGET_PERCENT
+        ):
             block_reason = (
                 f"Daily profit target reached (+{pnl_metrics.realized_pnl_percent:.2f}%)."
             )
-        elif pnl_metrics.realized_pnl_percent <= -Config.DAILY_STOP_PERCENT:
+        elif (
+            not daily_override
+            and pnl_metrics.realized_pnl_percent <= -Config.DAILY_STOP_PERCENT
+        ):
             block_reason = (
                 f"Daily max loss reached ({pnl_metrics.realized_pnl_percent:.2f}%)."
             )

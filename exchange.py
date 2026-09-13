@@ -120,7 +120,7 @@ class AccountRestCache:
 
 
 ACCOUNT_REST_ENDPOINTS = frozenset(
-    {"futures_account", "futures_position_information"}
+    {"futures_account", "futures_position_information", "futures_account_balance"}
 )
 
 
@@ -674,7 +674,7 @@ class BinanceExchangeManager:
         blocked, reason = self.is_rest_blocked()
         if blocked:
             return reason
-        if name == "futures_account":
+        if name in ("futures_account", "futures_account_balance"):
             if not execution_priority and not self._account_rest_interval_elapsed():
                 return "account_rest_interval"
             if Config.ENABLE_STRICT_RATE_LIMIT:
@@ -694,7 +694,7 @@ class BinanceExchangeManager:
 
     def _return_cached_account_call(self, func: Any) -> Any:
         name = getattr(func, "__name__", "")
-        if name == "futures_account":
+        if name in ("futures_account", "futures_account_balance"):
             cached = self._cached_futures_account_response()
             if cached is not None:
                 return cached
@@ -1258,16 +1258,16 @@ class BinanceExchangeManager:
             return self._balance_cache.value
 
         try:
-            account_info = self._throttled_call(
-                self.client.futures_account,
-                **self.recv_window_param,
+            account_info, _ = self._fetch_futures_account_rest(
+                force_live=force_refresh,
+                max_attempts=max(Config.REST_NETWORK_MAX_RETRIES, 2),
             )
-            balance = self._extract_quote_balance(account_info, quote)
-            if balance > 0:
-                self._balance_cache.set(balance)
-                self._account_rest_cache.account_info = account_info
-                self._account_rest_cache.updated_at = now
-                return balance
+            if account_info:
+                balance = self._extract_quote_balance(account_info, quote)
+                if balance <= 0:
+                    balance = safe_float(account_info.get("totalWalletBalance"))
+                if balance > 0:
+                    return balance
             margin_est = self._ws_margin_balance_estimate()
             if margin_est is not None and margin_est > 0:
                 return margin_est
@@ -1292,66 +1292,179 @@ class BinanceExchangeManager:
                 return margin_est
             return self._balance_cache.value
 
+    @staticmethod
+    def _account_info_from_asset_balances(
+        rows: list[dict[str, Any]],
+        quote: str,
+    ) -> dict[str, Any]:
+        """Build a futures_account-like payload from fapi/v2/balance rows."""
+        quote = quote.upper()
+        wallet = 0.0
+        available = 0.0
+        unrealized = 0.0
+        assets: list[dict[str, Any]] = []
+        for row in rows or []:
+            if str(row.get("asset", "")).upper() != quote:
+                continue
+            wallet = safe_float(row.get("balance"))
+            if wallet <= 0:
+                wallet = safe_float(row.get("crossWalletBalance"))
+            available = safe_float(row.get("availableBalance"))
+            unrealized = safe_float(row.get("crossUnPnl"))
+            assets.append(dict(row))
+        margin = wallet + unrealized if wallet > 0 else 0.0
+        return {
+            "totalWalletBalance": str(wallet),
+            "totalMarginBalance": str(margin),
+            "totalCrossWalletBalance": str(wallet),
+            "totalUnrealizedProfit": str(unrealized),
+            "availableBalance": str(available),
+            "assets": assets,
+        }
+
+    def _apply_account_info_to_snapshot(
+        self,
+        snapshot: LiveAccountSnapshot,
+        account_info: dict[str, Any],
+    ) -> None:
+        quote = Config.QUOTE_ASSET
+        snapshot.wallet_balance = safe_float(account_info.get("totalWalletBalance"))
+        if snapshot.wallet_balance <= 0:
+            snapshot.wallet_balance = self._extract_quote_balance(account_info, quote)
+        snapshot.margin_balance = safe_float(account_info.get("totalMarginBalance"))
+        if snapshot.margin_balance <= 0:
+            snapshot.margin_balance = safe_float(
+                account_info.get("totalCrossWalletBalance")
+            )
+        if snapshot.margin_balance <= 0 and snapshot.wallet_balance > 0:
+            snapshot.margin_balance = snapshot.wallet_balance + safe_float(
+                account_info.get("totalUnrealizedProfit")
+            )
+        snapshot.unrealized_pnl = safe_float(
+            account_info.get("totalUnrealizedProfit")
+        )
+        if snapshot.unrealized_pnl == 0 and snapshot.margin_balance > snapshot.wallet_balance:
+            snapshot.unrealized_pnl = snapshot.margin_balance - snapshot.wallet_balance
+        snapshot.available_balance = safe_float(account_info.get("availableBalance"))
+        if snapshot.available_balance <= 0:
+            snapshot.available_balance = self._extract_quote_balance(
+                account_info, quote
+            )
+
+    def _fetch_futures_account_rest(
+        self,
+        *,
+        force_live: bool = False,
+        max_attempts: Optional[int] = None,
+    ) -> tuple[Optional[dict[str, Any]], str]:
+        """
+        Fetch USDT-M account state via fapi/v2/account with retries.
+        Falls back to fapi/v2/balance, then WS/cache.
+        """
+        attempts = max(max_attempts or Config.STARTUP_BALANCE_MAX_ATTEMPTS, 1)
+        delay = max(Config.STARTUP_BALANCE_RETRY_SECONDS, 0.5)
+        quote = Config.QUOTE_ASSET
+        last_exc: Optional[Exception] = None
+
+        for attempt in range(1, attempts + 1):
+            if self.is_rest_blocked()[0] and not force_live:
+                break
+            try:
+                account_info = self._throttled_call(
+                    self.client.futures_account,
+                    execution_priority=force_live,
+                    bypass_account_cache=force_live,
+                    **self.recv_window_param,
+                )
+                if account_info and (
+                    safe_float(account_info.get("totalWalletBalance")) > 0
+                    or self._extract_quote_balance(account_info, quote) > 0
+                ):
+                    self._store_account_rest_response(account_info)
+                    wallet = safe_float(account_info.get("totalWalletBalance"))
+                    if wallet <= 0:
+                        wallet = self._extract_quote_balance(account_info, quote)
+                    if wallet > 0:
+                        self._balance_cache.set(wallet)
+                    return account_info, "REST (live)"
+            except ExchangeRateLimitError as exc:
+                last_exc = exc
+                if not force_live:
+                    break
+            except Exception as exc:
+                last_exc = exc
+                if self._rest_block_log.should_log("account_fetch_retry"):
+                    error_logger.warning(
+                        "futures_account fetch attempt %s/%s failed: %s",
+                        attempt,
+                        attempts,
+                        exc,
+                    )
+            if attempt < attempts:
+                time.sleep(delay * attempt)
+
+        if not self.is_rest_blocked()[0] or force_live:
+            try:
+                rows = self._throttled_call(
+                    self.client.futures_account_balance,
+                    execution_priority=force_live,
+                    bypass_account_cache=force_live,
+                    **self.recv_window_param,
+                )
+                account_info = self._account_info_from_asset_balances(rows or [], quote)
+                if self._extract_quote_balance(account_info, quote) > 0:
+                    self._store_account_rest_response(account_info)
+                    wallet = safe_float(account_info.get("totalWalletBalance"))
+                    if wallet > 0:
+                        self._balance_cache.set(wallet)
+                    return account_info, "REST balance endpoint"
+            except Exception as exc:
+                last_exc = exc
+                if self._rest_block_log.should_log("account_balance_fallback"):
+                    error_logger.warning(
+                        "futures_account_balance fallback failed: %s", exc
+                    )
+
+        cached = self._cached_futures_account_response()
+        if cached:
+            return cached, "WS/cache"
+
+        if last_exc and self._rest_block_log.should_log("account_fetch_exhausted"):
+            error_logger.warning("All account REST fetch attempts failed: %s", last_exc)
+        return None, "unavailable"
+
     def fetch_live_account_snapshot(
         self,
         *,
         include_today_income: bool = True,
+        force_refresh: bool = True,
     ) -> LiveAccountSnapshot:
         """
         Live wallet/margin/unrealized from Binance fapi/v2/account (futures_account).
-        Used by Telegram /status and /active — always prefers a fresh REST read.
+        Used by Telegram /status and /active — prefers a fresh REST read with retries.
         """
         snapshot = LiveAccountSnapshot()
-        account_info: Optional[dict[str, Any]] = None
-        source = "cache"
-
-        if not self.is_rest_blocked()[0]:
-            try:
-                account_info = self._throttled_call(
-                    self.client.futures_account,
-                    **self.recv_window_param,
-                )
-                if account_info:
-                    source = "REST (live)"
-                    now = time.monotonic()
-                    self._last_account_rest_at = now
-                    self._account_rest_cache.account_info = account_info
-                    self._account_rest_cache.updated_at = now
-                    wallet = safe_float(account_info.get("totalWalletBalance"))
-                    if wallet > 0:
-                        self._balance_cache.set(wallet)
-            except ExchangeRateLimitError:
-                pass
-            except Exception as exc:
-                if self._rest_block_log.should_log("live_account_snapshot"):
-                    error_logger.warning("Live account snapshot REST failed: %s", exc)
-
-        if not account_info:
-            account_info = self._cached_futures_account_response()
-            if account_info:
-                source = "WS/cache"
+        account_info, source = self._fetch_futures_account_rest(
+            force_live=force_refresh,
+        )
 
         if account_info:
-            snapshot.wallet_balance = safe_float(
-                account_info.get("totalWalletBalance")
-            )
-            snapshot.margin_balance = safe_float(
-                account_info.get("totalMarginBalance")
-            )
-            if snapshot.margin_balance <= 0:
-                snapshot.margin_balance = safe_float(
-                    account_info.get("totalCrossWalletBalance")
+            self._apply_account_info_to_snapshot(snapshot, account_info)
+        else:
+            ws_wallet = self._hydrate_balance_from_ws()
+            if ws_wallet is not None and ws_wallet > 0:
+                snapshot.wallet_balance = ws_wallet
+                margin_est = self._ws_margin_balance_estimate()
+                snapshot.margin_balance = (
+                    margin_est if margin_est is not None else ws_wallet
                 )
-            snapshot.unrealized_pnl = safe_float(
-                account_info.get("totalUnrealizedProfit")
-            )
-            snapshot.available_balance = safe_float(
-                account_info.get("availableBalance")
-            )
-            if snapshot.available_balance <= 0:
-                snapshot.available_balance = self._extract_quote_balance(
-                    account_info, Config.QUOTE_ASSET
-                )
+                if margin_est is not None and margin_est >= ws_wallet:
+                    snapshot.unrealized_pnl = margin_est - ws_wallet
+                elif self._market_data:
+                    snapshot.unrealized_pnl = (
+                        self._market_data.get_ws_unrealized_pnl_total()
+                    )
+                source = "WS user stream"
 
         if include_today_income and not self.is_rest_blocked()[0]:
             snapshot.today_realized_pnl = self._fetch_today_realized_income_rest()

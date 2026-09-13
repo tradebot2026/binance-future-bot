@@ -507,7 +507,7 @@ def main(controller: Optional[BotController] = None) -> str:
 
     scheduler = DailyScheduler(exchange, db, telegram=None, controller=controller)
     scheduler.ensure_startup_initialized()
-    risk = RiskManager(exchange, db)
+    risk = RiskManager(exchange, db, controller=controller)
 
     tg: Optional[TelegramManager] = None
     monitor_stop = threading.Event()
