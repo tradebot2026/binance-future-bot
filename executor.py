@@ -621,6 +621,12 @@ class TradeExecutor:
         structure_metadata: Optional[dict[str, Any]] = None,
     ) -> Optional[dict[str, Any]]:
         """Execute entry under high-priority REST path (not blocked by scan loops)."""
+        if Config.is_mega_cap_blacklisted(symbol):
+            log_execution_rejected(
+                symbol, "mega-cap pair excluded from trading", strategy=strategy
+            )
+            return None
+
         on_cooldown, cooldown_reason = self.db.is_symbol_on_cooldown(symbol)
         if on_cooldown:
             log_execution_rejected(

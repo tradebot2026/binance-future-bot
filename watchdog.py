@@ -592,6 +592,13 @@ class PositionWatchdog:
             book_daily_pnl=True,
             daily_pnl_delta=None,
         )
+        symbol = str(trade.get("symbol", "")).upper()
+        if symbol:
+            self.db.set_symbol_cooldown(
+                symbol,
+                Config.POST_TRADE_COOLDOWN_MINUTES,
+                reason=f"WATCHDOG_{reason}",
+            )
         watchdog_logger.info(
             "[POSITION_CLOSED] Pair: %s %s | Reason: Watchdog %s | exit=%.6f",
             trade.get("symbol"),

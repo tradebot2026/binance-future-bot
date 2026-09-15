@@ -224,18 +224,37 @@ class TelegramManager:
         reason: str,
         pnl: Optional[float] = None,
         strategy: str = "",
+        *,
+        trade_id: str = "",
     ) -> None:
+        from core.close_notification_guard import try_claim_close_notification
+
+        if trade_id and not try_claim_close_notification(trade_id):
+            system_logger.debug(
+                "Skipping duplicate close alert for trade %s.", trade_id[:8]
+            )
+            return
+
         reason_upper = reason.upper()
-        if "TP" in reason_upper and "STOP" not in reason_upper:
+        if pnl is not None and pnl > 0:
+            if "STOP" in reason_upper:
+                emoji = "🎯"
+                title = "TRAILING / PROFIT SL HIT"
+            elif "TP" in reason_upper:
+                emoji = "✅"
+                title = "TAKE PROFIT HIT"
+            else:
+                emoji = "✅"
+                title = "POSITION CLOSED (PROFIT)"
+        elif pnl is not None and pnl < 0:
+            emoji = "🛑"
+            title = "STOP LOSS HIT" if "STOP" in reason_upper else "POSITION CLOSED (LOSS)"
+        elif "TP" in reason_upper and "STOP" not in reason_upper:
             emoji = "✅"
             title = "TAKE PROFIT HIT"
         elif "STOP" in reason_upper:
-            if pnl is not None and pnl >= 0:
-                emoji = "🎯"
-                title = "TRAILING / PROFIT SL HIT"
-            else:
-                emoji = "🛑"
-                title = "STOP LOSS HIT"
+            emoji = "🛑"
+            title = "STOP LOSS HIT"
         else:
             emoji = "ℹ️"
             title = "POSITION CLOSED"
@@ -248,10 +267,12 @@ class TelegramManager:
         if strategy:
             msg += f"\n🧠 <b>Strategy:</b> {escape_html(strategy_display_label(strategy))}"
         if pnl is not None:
-            if pnl >= 0:
+            if pnl > 0:
                 msg += f"\n💰 <b>Realized Profit:</b> +${pnl:.4f}"
-            else:
+            elif pnl < 0:
                 msg += f"\n💰 <b>Realized PnL:</b> -${abs(pnl):.4f}"
+            else:
+                msg += f"\n💰 <b>Realized PnL:</b> $0.0000"
         self.send_message(msg)
 
     def send_tp_level_alert(

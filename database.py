@@ -20,6 +20,7 @@ from constants import (
     ALLOWED_TRADE_COLUMNS,
     DAILY_STATUS_ACTIVE,
     DAILY_STATUS_PAUSED,
+    TRADE_STATUS_CLOSED,
 )
 from exceptions import DatabaseError
 from logger import error_logger, system_logger
@@ -1043,11 +1044,18 @@ class DatabaseManager:
     ) -> float:
         """
         Mark a trade CLOSED with exit metadata and refresh daily aggregates.
-        Returns the final realized PnL stored on the trade row.
+        Idempotent — returns stored PnL without re-booking if already CLOSED.
         """
         trade_id = str(trade.get("trade_id", ""))
         if not trade_id:
             return 0.0
+
+        existing = self.get_trade(trade_id)
+        if existing and str(existing.get("status")) == TRADE_STATUS_CLOSED:
+            return safe_float(existing.get("realized_pnl") or existing.get("pnl"))
+
+        if existing:
+            trade = existing
 
         closed_at = closed_at or utc_now().isoformat()
         prior_pnl = safe_float(trade.get("realized_pnl"))
@@ -1066,7 +1074,7 @@ class DatabaseManager:
             daily_pnl_delta = 0.0
 
         updates: dict[str, Any] = {
-            "status": "CLOSED",
+            "status": TRADE_STATUS_CLOSED,
             "closed_at": closed_at,
             "exit_reason": exit_reason,
             "exit_price": exit_price,
@@ -1076,7 +1084,40 @@ class DatabaseManager:
         if duration is not None:
             updates["duration"] = duration
 
-        self.update_trade(trade_id, updates)
+        filtered = {k: v for k, v in updates.items() if k in ALLOWED_TRADE_COLUMNS}
+        if not filtered:
+            return pnl
+
+        placeholders = ",".join("?" for _ in ACTIVE_TRADE_STATUSES)
+        set_clause = ", ".join(f"{column} = ?" for column in filtered)
+        values: list[Any] = list(filtered.values())
+        values.extend([trade_id, *ACTIVE_TRADE_STATUSES])
+
+        with self._write_lock:
+            try:
+                with self.connection() as conn:
+                    cursor = conn.execute(
+                        f"""
+                        UPDATE trades
+                        SET {set_clause}
+                        WHERE trade_id = ? AND status IN ({placeholders})
+                        """,
+                        tuple(values),
+                    )
+                    conn.commit()
+                    if cursor.rowcount == 0:
+                        row = conn.execute(
+                            "SELECT realized_pnl, pnl FROM trades WHERE trade_id = ?",
+                            (trade_id,),
+                        ).fetchone()
+                        if row:
+                            return safe_float(row[0] or row[1])
+                        return pnl
+            except sqlite3.Error as exc:
+                error_logger.error(
+                    "Failed idempotent close for trade %s: %s", trade_id, exc
+                )
+                return pnl
 
         date_str = closed_at[:10]
         if book_daily_pnl and daily_pnl_delta:

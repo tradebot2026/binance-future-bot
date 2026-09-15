@@ -100,6 +100,22 @@ def release_exit(trade_id: str, owner: Optional[str] = None) -> None:
         pass
 
 
+def get_exit_claim_owner(trade_id: str, *, ttl_seconds: Optional[int] = None) -> Optional[str]:
+    """Return the owner of a non-expired exit claim, or None."""
+    ttl = ttl_seconds or Config.EXIT_CLAIM_TTL_SECONDS
+    path = _claim_path(trade_id)
+    if not os.path.isfile(path):
+        return None
+    data = _read_claim(path)
+    if not data:
+        return None
+    ts = float(data.get("timestamp", 0))
+    if (time.time() - ts) >= ttl:
+        return None
+    owner = str(data.get("owner", "")).strip()
+    return owner or None
+
+
 def exit_claim_active(trade_id: str, *, ttl_seconds: Optional[int] = None) -> bool:
     """True when another process holds a non-expired exit claim."""
     ttl = ttl_seconds or Config.EXIT_CLAIM_TTL_SECONDS

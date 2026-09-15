@@ -82,6 +82,9 @@ class SymbolConflictGuard:
                     f"DB scale-in blocked: {symbol} {action} owned by {trade_strategy}"
                 )
 
+        if Config.is_mega_cap_blacklisted(symbol):
+            return False, f"{symbol} excluded (mega-cap blacklist)"
+
         on_cooldown, cooldown_reason = self.db.is_symbol_on_cooldown(symbol)
         if on_cooldown:
             return False, f"{symbol} on cooldown ({cooldown_reason})"

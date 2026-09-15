@@ -552,7 +552,7 @@ def main(controller: Optional[BotController] = None) -> str:
             )
 
         try:
-            reconcile_positions_at_startup(exchange, db, tg)
+            reconcile_positions_at_startup(exchange, db, tg, manager=manager)
         except Exception as exc:
             error_logger.error("Startup reconciliation failed (continuing): %s", exc)
 
@@ -595,7 +595,9 @@ def main(controller: Optional[BotController] = None) -> str:
                 now_mono = time.monotonic()
                 if now_mono - last_reconciliation >= Config.RECONCILIATION_INTERVAL_SECONDS:
                     if not market_data.is_rest_blocked()[0]:
-                        reconcile_positions(exchange, db, tg, context="periodic")
+                        reconcile_positions(
+                            exchange, db, tg, manager=manager, context="periodic"
+                        )
                     db.cleanup_expired_cooldowns()
                     last_reconciliation = now_mono
 

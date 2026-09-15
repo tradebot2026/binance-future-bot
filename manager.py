@@ -27,7 +27,13 @@ from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from exceptions import OrderExecutionError, PositionAlreadyClosedError
 from logger import error_logger, trade_logger
-from exit_coordinator import claim_exit, exit_claim_active, release_exit
+from core.trade_close_mutex import trade_close_mutex
+from exit_coordinator import (
+    claim_exit,
+    exit_claim_active,
+    get_exit_claim_owner,
+    release_exit,
+)
 from reconciliation import (
     confirm_external_close_allowed,
     is_exchange_sync_close_reason,
@@ -1108,13 +1114,6 @@ class TradeManager:
         resolved = resolve_exchange_close_pnl(self.exchange, self.db, trade)
         if resolved.exit_price > 0:
             exit_price = resolved.exit_price
-        if self.telegram:
-            self.telegram.send_message(
-                f"🔄 <b>{escape_html(symbol)}</b> synced: Already closed on exchange "
-                f"(ReduceOnly rejected).\n"
-                f"💰 <b>Exchange PnL:</b> ${resolved.realized_pnl:.4f} "
-                f"<i>({escape_html(resolved.source)})</i>"
-            )
         self._mark_trade_closed(
             trade,
             reason=exit_reason,
@@ -1333,20 +1332,18 @@ class TradeManager:
         )
 
         if is_full_close:
-            from reconciliation import trade_opened_at_ms
-
-            lifecycle = self.exchange.fetch_closed_position_realized_pnl(
-                symbol,
-                str(position_side),
-                trade_opened_at_ms(trade),
+            cumulative_pnl, pnl_source, lifecycle_exit = (
+                self._resolve_full_close_pnl(
+                    trade,
+                    symbol,
+                    position_side,
+                    prior_pnl=prior_pnl,
+                    leg_pnl=leg_pnl,
+                    leg_source=pnl_source,
+                )
             )
-            if lifecycle.source in ("userTrades", "income", "ws") and (
-                lifecycle.fill_count > 0 or abs(lifecycle.realized_pnl) > 0
-            ):
-                cumulative_pnl = lifecycle.realized_pnl
-                pnl_source = lifecycle.source
-            else:
-                cumulative_pnl = prior_pnl + leg_pnl
+            if lifecycle_exit > 0 and exit_price <= 0:
+                exit_price = lifecycle_exit
         else:
             cumulative_pnl = prior_pnl + leg_pnl
 
@@ -1402,12 +1399,49 @@ class TradeManager:
         else:
             if live_remaining <= 0:
                 self.exchange.clear_position_cache(symbol, position_side)
-            elif self.telegram and "STOP" in reason.upper():
-                self.telegram.send_close_alert(
-                    symbol=symbol, reason=reason, pnl=leg_pnl
-                )
 
         return True
+
+    def _resolve_full_close_pnl(
+        self,
+        trade: dict[str, Any],
+        symbol: str,
+        position_side: str,
+        *,
+        prior_pnl: float,
+        leg_pnl: float,
+        leg_source: str,
+    ) -> tuple[float, str, float]:
+        """Resolve total realized PnL for a full close with REST retries."""
+        from reconciliation import trade_opened_at_ms
+
+        opened_ms = trade_opened_at_ms(trade)
+        lifecycle = None
+        for attempt in range(1, 4):
+            lifecycle = self.exchange.fetch_closed_position_realized_pnl(
+                symbol,
+                str(position_side),
+                opened_ms,
+            )
+            if lifecycle.source in ("userTrades", "income", "ws") and (
+                lifecycle.fill_count > 0 or abs(lifecycle.realized_pnl) > 0
+            ):
+                return (
+                    lifecycle.realized_pnl,
+                    lifecycle.source,
+                    lifecycle.exit_price,
+                )
+            if attempt < 3:
+                time.sleep(1.0 * attempt)
+
+        if leg_source not in ("unknown", "unavailable") and leg_pnl != 0:
+            return prior_pnl + leg_pnl, leg_source, 0.0
+
+        resolved = resolve_exchange_close_pnl(self.exchange, self.db, trade)
+        if resolved.fill_count > 0 or abs(resolved.realized_pnl) > 0:
+            return resolved.realized_pnl, resolved.source, resolved.exit_price
+
+        return prior_pnl + leg_pnl, leg_source or "unavailable", 0.0
 
     def _log_position_closed(
         self,
@@ -1447,9 +1481,73 @@ class TradeManager:
         book_daily_pnl: bool = True,
         pnl: Optional[float] = None,
         pnl_source: str = "",
-    ) -> None:
-        trade_id = trade["trade_id"]
-        symbol = trade["symbol"]
+    ) -> float:
+        trade_id = str(trade["trade_id"])
+        symbol = str(trade.get("symbol", ""))
+        position_side = str(trade.get("side", "LONG")).upper()
+
+        with trade_close_mutex(trade_id, blocking=True) as acquired:
+            if not acquired:
+                existing = self.db.get_trade(trade_id)
+                return safe_float(
+                    existing.get("realized_pnl") or existing.get("pnl")
+                    if existing
+                    else 0.0
+                )
+
+            fresh = self.db.get_trade(trade_id)
+            if fresh:
+                trade = fresh
+            if trade.get("status") == TRADE_STATUS_CLOSED:
+                return safe_float(trade.get("realized_pnl") or trade.get("pnl"))
+
+            claim_owner = get_exit_claim_owner(trade_id)
+            acquired_claim = False
+            if claim_owner and claim_owner not in ("main", "close_pipeline"):
+                trade_logger.debug(
+                    "[%s] Close skipped — exit claim held by %s",
+                    trade_id[:8],
+                    claim_owner,
+                )
+                return safe_float(trade.get("realized_pnl") or trade.get("pnl"))
+            if claim_owner != "close_pipeline":
+                if not claim_exit(trade_id, "close_pipeline"):
+                    if exit_claim_active(trade_id):
+                        trade_logger.debug(
+                            "[%s] Close skipped — exit claim contention",
+                            trade_id[:8],
+                        )
+                        return safe_float(trade.get("realized_pnl") or trade.get("pnl"))
+                else:
+                    acquired_claim = True
+
+            try:
+                return self._finalize_trade_closed(
+                    trade,
+                    reason=reason,
+                    exit_price=exit_price,
+                    notify=notify,
+                    book_daily_pnl=book_daily_pnl,
+                    pnl=pnl,
+                    pnl_source=pnl_source,
+                )
+            finally:
+                if acquired_claim:
+                    release_exit(trade_id, "close_pipeline")
+
+    def _finalize_trade_closed(
+        self,
+        trade: dict[str, Any],
+        reason: str,
+        exit_price: float,
+        *,
+        notify: bool,
+        book_daily_pnl: bool,
+        pnl: Optional[float],
+        pnl_source: str,
+    ) -> float:
+        trade_id = str(trade["trade_id"])
+        symbol = str(trade.get("symbol", ""))
         position_side = str(trade.get("side", "LONG")).upper()
         closed_at = utc_now().isoformat()
 
@@ -1464,13 +1562,12 @@ class TradeManager:
             except ValueError:
                 duration = None
 
-        position_reconcile_guard.note_present(str(trade_id))
+        position_reconcile_guard.note_present(trade_id)
         self._cancel_all_native_orders(trade)
         self.exchange.clear_position_cache(symbol, position_side)
         with self._monitored_lock:
-            self._monitored_symbols.discard(str(symbol).upper())
-        self.exchange.invalidate_balance_cache()
-        balance = self.exchange.get_futures_balance(force_refresh=False)
+            self._monitored_symbols.discard(symbol.upper())
+        balance = self.exchange.refresh_wallet_after_trade()
 
         if pnl is None and is_exchange_sync_close_reason(reason):
             resolved = resolve_exchange_close_pnl(self.exchange, self.db, trade)
@@ -1478,6 +1575,14 @@ class TradeManager:
             pnl_source = resolved.source
             if resolved.exit_price > 0:
                 exit_price = resolved.exit_price
+
+        if safe_float(pnl) == 0 and pnl_source in ("unknown", "unavailable", ""):
+            resolved = resolve_exchange_close_pnl(self.exchange, self.db, trade)
+            if resolved.fill_count > 0 or abs(resolved.realized_pnl) > 0:
+                pnl = resolved.realized_pnl
+                pnl_source = resolved.source
+                if resolved.exit_price > 0:
+                    exit_price = resolved.exit_price
 
         total_pnl = self.db.close_trade_and_sync_stats(
             trade,
@@ -1508,59 +1613,54 @@ class TradeManager:
                 reason=reason,
                 pnl=safe_float(trade.get("pnl")),
                 strategy=str(trade.get("strategy", "")),
+                trade_id=trade_id,
             )
 
         outcome = "WIN" if safe_float(trade.get("pnl")) > 0 else "LOSS"
         strategy = str(trade.get("strategy", ""))
-        pnl = safe_float(trade.get("pnl"))
+        pnl_val = safe_float(trade.get("pnl"))
         reason_upper = reason.upper()
 
         soft_exit = reason in (
             "RANGE_TIME_STOP",
             "RANGE_BOUNDARY_BREAKOUT",
-        ) and pnl >= 0
+        ) and pnl_val >= 0
+
+        cooldown_minutes = Config.POST_TRADE_COOLDOWN_MINUTES
+        cooldown_reason = f"POST_TRADE_{reason}"
 
         if is_range_strategy(strategy):
-            if reason == "STOP_LOSS" or (pnl < 0 and "STOP" in reason_upper):
-                self.db.set_symbol_cooldown(
-                    symbol,
-                    Config.RANGE_COOLDOWN_MINUTES,
-                    reason="RANGE_STOP_LOSS",
-                )
+            if reason == "STOP_LOSS" or (pnl_val < 0 and "STOP" in reason_upper):
+                cooldown_minutes = max(cooldown_minutes, Config.RANGE_COOLDOWN_MINUTES)
+                cooldown_reason = "RANGE_STOP_LOSS"
             elif soft_exit:
-                self.db.set_symbol_cooldown(
-                    symbol,
-                    Config.RANGE_COOLDOWN_SOFT_MINUTES,
-                    reason="RANGE_SOFT_EXIT",
+                cooldown_minutes = max(
+                    cooldown_minutes, Config.RANGE_COOLDOWN_SOFT_MINUTES
                 )
+                cooldown_reason = "RANGE_SOFT_EXIT"
             else:
-                self.db.set_symbol_cooldown(
-                    symbol,
-                    Config.RANGE_COOLDOWN_MINUTES,
-                    reason="RANGE_CLOSE",
-                )
-        elif reason == "STOP_LOSS" or (pnl < 0 and "STOP" in reason_upper):
+                cooldown_minutes = max(cooldown_minutes, Config.RANGE_COOLDOWN_MINUTES)
+                cooldown_reason = "RANGE_CLOSE"
+        elif reason == "STOP_LOSS" or (pnl_val < 0 and "STOP" in reason_upper):
             outcome = "LOSS"
-            self.db.set_symbol_cooldown(
-                symbol,
-                Config.SYMBOL_COOLDOWN_MINUTES,
-                reason="STOP_LOSS",
-            )
+            cooldown_minutes = max(cooldown_minutes, Config.SYMBOL_COOLDOWN_MINUTES)
+            cooldown_reason = "STOP_LOSS"
         elif soft_exit:
-            self.db.set_symbol_cooldown(
-                symbol,
-                Config.SYMBOL_COOLDOWN_SOFT_MINUTES,
-                reason="SOFT_EXIT",
+            cooldown_minutes = max(
+                cooldown_minutes, Config.SYMBOL_COOLDOWN_SOFT_MINUTES
             )
-        elif pnl > 0:
+            cooldown_reason = "SOFT_EXIT"
+        elif pnl_val > 0:
             outcome = "WIN"
 
+        self.db.set_symbol_cooldown(symbol, cooldown_minutes, reason=cooldown_reason)
         self.db.record_signal_outcome(trade_id, outcome)
 
         if self.scheduler:
             self.scheduler.notify_trade_event()
         if self.risk_manager:
             self.risk_manager.notify_trade_event()
+        return total_pnl
 
     def close_all_positions(self, reason: str = "MANUAL_CLOSE_ALL") -> dict[str, Any]:
         """Close all tracked DB trades and any remaining exchange positions."""

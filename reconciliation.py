@@ -18,6 +18,7 @@ from utils import safe_float, utc_now
 if TYPE_CHECKING:
     from database import DatabaseManager
     from exchange import BinanceExchangeManager
+    from manager import TradeManager
     from telegram_bot import TelegramManager
 
 
@@ -93,8 +94,9 @@ def finalize_reconciled_trade_close(
     db: "DatabaseManager",
     trade: dict[str, Any],
     exit_reason: str,
+    manager: Optional["TradeManager"] = None,
 ) -> float:
-    """Close a DB trade using Binance-reported realized PnL when the exchange is flat."""
+    """Close a DB trade through the normal manager pipeline when exchange is flat."""
     symbol = str(trade.get("symbol", "")).upper()
     side = str(trade.get("side", "LONG")).upper()
     resolved = resolve_exchange_close_pnl(exchange, db, trade)
@@ -102,7 +104,22 @@ def finalize_reconciled_trade_close(
     if exit_price <= 0:
         exit_price = safe_float(exchange.get_market_price(symbol, side))
 
-    balance = exchange.get_futures_balance(force_refresh=False)
+    if manager is not None:
+        return manager._mark_trade_closed(
+            trade,
+            reason=exit_reason,
+            exit_price=exit_price,
+            pnl=resolved.realized_pnl,
+            pnl_source=resolved.source,
+            notify=True,
+            book_daily_pnl=True,
+        )
+
+    if hasattr(exchange, "refresh_wallet_after_trade"):
+        balance = exchange.refresh_wallet_after_trade()
+    else:
+        exchange.invalidate_balance_cache()
+        balance = exchange.get_futures_balance(force_refresh=True)
     total_pnl = db.close_trade_and_sync_stats(
         trade,
         exit_price=exit_price,
@@ -234,6 +251,7 @@ def sync_active_trades_on_demand(
     exchange: "BinanceExchangeManager",
     db: "DatabaseManager",
     telegram: Optional["TelegramManager"] = None,
+    manager: Optional["TradeManager"] = None,
     *,
     force_rest: bool = True,
 ) -> dict[str, Any]:
@@ -324,7 +342,11 @@ def sync_active_trades_on_demand(
             continue
 
         closed_pnl = finalize_reconciled_trade_close(
-            exchange, db, trade, "RECONCILED_MANUAL_CLOSE"
+            exchange,
+            db,
+            trade,
+            "RECONCILED_MANUAL_CLOSE",
+            manager=manager,
         )
         position_reconcile_guard.note_present(trade_id)
         summary["closed"].append(
@@ -340,7 +362,7 @@ def sync_active_trades_on_demand(
 
     summary["exchange_open"] = len(exchange_keys)
 
-    if summary["closed"] and telegram:
+    if summary["closed"] and telegram and manager is None:
         lines = [
             "🔄 <b>Position sync</b>",
             f"Closed {len(summary['closed'])} DB trade(s) no longer on exchange:",
@@ -387,15 +409,19 @@ def reconcile_positions_at_startup(
     exchange: "BinanceExchangeManager",
     db: "DatabaseManager",
     telegram: Optional["TelegramManager"] = None,
+    manager: Optional["TradeManager"] = None,
 ) -> None:
     """Run full reconciliation on boot."""
-    reconcile_positions(exchange, db, telegram=telegram, context="startup")
+    reconcile_positions(
+        exchange, db, telegram=telegram, manager=manager, context="startup"
+    )
 
 
 def reconcile_positions(
     exchange: "BinanceExchangeManager",
     db: "DatabaseManager",
     telegram: Optional["TelegramManager"] = None,
+    manager: Optional["TradeManager"] = None,
     context: str = "periodic",
 ) -> dict[str, int]:
     """
@@ -475,7 +501,11 @@ def reconcile_positions(
                     continue
 
                 closed_pnl = finalize_reconciled_trade_close(
-                    exchange, db, trade, "RECONCILED_PHANTOM_PURGE"
+                    exchange,
+                    db,
+                    trade,
+                    "RECONCILED_PHANTOM_PURGE",
+                    manager=manager,
                 )
                 position_reconcile_guard.note_present(trade_id)
                 closed_externally += 1

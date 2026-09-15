@@ -23,6 +23,13 @@ def _env_float(key: str, default: float) -> float:
     return float(os.getenv(key, str(default)))
 
 
+def _env_csv_list(key: str, default: list[str]) -> list[str]:
+    raw = os.getenv(key)
+    if not raw:
+        return [item.strip().upper() for item in default if item.strip()]
+    return [item.strip().upper() for item in raw.split(",") if item.strip()]
+
+
 class Config:
     """Runtime configuration loaded from environment variables."""
 
@@ -268,7 +275,8 @@ class Config:
     MIN_TP1_RR_ACCEPT: float = _env_float("MIN_TP1_RR_ACCEPT", 0.75)
     MIN_TP1_RISK_REWARD: float = _env_float("MIN_TP1_RISK_REWARD", 1.0)
     MIN_SL_ATR_NOISE: float = _env_float("MIN_SL_ATR_NOISE", 0.35)
-    SYMBOL_COOLDOWN_MINUTES: int = _env_int("SYMBOL_COOLDOWN_MINUTES", 20)
+    SYMBOL_COOLDOWN_MINUTES: int = _env_int("SYMBOL_COOLDOWN_MINUTES", 60)
+    POST_TRADE_COOLDOWN_MINUTES: int = _env_int("POST_TRADE_COOLDOWN_MINUTES", 60)
 
     # ---------------- Range regime ----------------
     ENABLE_RANGE_REGIME: bool = _env_bool("ENABLE_RANGE_REGIME", True)
@@ -371,6 +379,25 @@ class Config:
     SMC_MAX_CONSECUTIVE_LOSSES: int = _env_int("SMC_MAX_CONSECUTIVE_LOSSES", 3)
 
     # ---------------- Market filters / universe ----------------
+    DEFAULT_MEGA_CAP_BLACKLIST: list[str] = _env_csv_list(
+        "DEFAULT_MEGA_CAP_BLACKLIST",
+        ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"],
+    )
+    TOP_UNIVERSE_POOL_SIZE: int = _env_int("TOP_UNIVERSE_POOL_SIZE", 60)
+    ROTATION_EXTENDED_POOL_SIZE: int = _env_int("ROTATION_EXTENDED_POOL_SIZE", 60)
+    ROTATION_EVALUATED_MEMORY_MIN_MINUTES: int = _env_int(
+        "ROTATION_EVALUATED_MEMORY_MIN_MINUTES", 45
+    )
+    ROTATION_EVALUATED_MEMORY_MAX_MINUTES: int = _env_int(
+        "ROTATION_EVALUATED_MEMORY_MAX_MINUTES", 60
+    )
+    ROTATION_MEMORY_PURGE_HOURS: float = _env_float("ROTATION_MEMORY_PURGE_HOURS", 3.5)
+    ENABLE_DYNAMIC_SYMBOL_ROTATION: bool = _env_bool(
+        "ENABLE_DYNAMIC_SYMBOL_ROTATION", True
+    )
+    UNIVERSE_RANK_VOLUME_WEIGHT: float = _env_float("UNIVERSE_RANK_VOLUME_WEIGHT", 0.40)
+    UNIVERSE_RANK_RANGE_WEIGHT: float = _env_float("UNIVERSE_RANK_RANGE_WEIGHT", 0.35)
+    UNIVERSE_RANK_ATR_WEIGHT: float = _env_float("UNIVERSE_RANK_ATR_WEIGHT", 0.25)
     MIN_24H_VOLUME_USDT: float = _env_float("MIN_24H_VOLUME_USDT", 10_000_000.0)
     MAX_SPREAD_PERCENT: float = _env_float("MAX_SPREAD_PERCENT", 0.08)
     MIN_SCAN_UNIVERSE: int = _env_int("MIN_SCAN_UNIVERSE", 50)
@@ -423,7 +450,7 @@ class Config:
     ENABLE_DAILY_REPORT: bool = _env_bool("ENABLE_DAILY_REPORT", True)
     ENABLE_WEEKLY_REPORT: bool = _env_bool("ENABLE_WEEKLY_REPORT", True)
     ENABLE_MONTHLY_REPORT: bool = _env_bool("ENABLE_MONTHLY_REPORT", True)
-    MAX_SCAN_UNIVERSE: int = _env_int("MAX_SCAN_UNIVERSE", 80)
+    MAX_SCAN_UNIVERSE: int = _env_int("MAX_SCAN_UNIVERSE", 60)
     MAX_ENTRIES_PER_CYCLE: int = _env_int("MAX_ENTRIES_PER_CYCLE", 3)
     MULTI_CONFLUENCE_MIN_SCORE: float = _env_float("MULTI_CONFLUENCE_MIN_SCORE", 65.0)
     NEAR_MISS_SCORE_MIN: float = _env_float("NEAR_MISS_SCORE_MIN", 65.0)
@@ -453,6 +480,10 @@ class Config:
     )
     WATCHDOG_FORCE_REST: bool = _env_bool("WATCHDOG_FORCE_REST", False)
     EXIT_CLAIM_TTL_SECONDS: int = _env_int("EXIT_CLAIM_TTL_SECONDS", 120)
+
+    @classmethod
+    def is_mega_cap_blacklisted(cls, symbol: str) -> bool:
+        return symbol.upper() in cls.DEFAULT_MEGA_CAP_BLACKLIST
 
     @classmethod
     def get_scan_kline_intervals(cls) -> list[str]:

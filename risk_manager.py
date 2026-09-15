@@ -42,9 +42,13 @@ class DailyPnLMetrics:
     total_pnl_percent: float
 
 
-def resolve_current_wallet_balance(exchange: BinanceExchangeManager) -> float:
+def resolve_current_wallet_balance(
+    exchange: BinanceExchangeManager,
+    *,
+    force: bool = False,
+) -> float:
     """Live USDT wallet balance for equity-based daily PnL."""
-    return fetch_daily_wallet_baseline(exchange, force=False)
+    return fetch_daily_wallet_baseline(exchange, force=force)
 
 
 def daily_profit_target_reached(metrics: DailyPnLMetrics) -> bool:
@@ -82,6 +86,8 @@ def compute_daily_pnl_metrics(
     exchange: BinanceExchangeManager,
     db: DatabaseManager,
     date_str: str,
+    *,
+    force_wallet_refresh: bool = False,
 ) -> DailyPnLMetrics:
     """
     Compute today's PnL metrics.
@@ -89,7 +95,9 @@ def compute_daily_pnl_metrics(
     """
     stats = db.get_daily_stats(date_str) or {}
     start_balance = safe_float(stats.get("start_balance"))
-    current_wallet = resolve_current_wallet_balance(exchange)
+    current_wallet = resolve_current_wallet_balance(
+        exchange, force=force_wallet_refresh
+    )
 
     equity_day_pnl = 0.0
     equity_day_pnl_percent = 0.0
@@ -405,13 +413,21 @@ class RiskManager:
         )
 
     def notify_trade_event(self) -> None:
-        """Refresh realized PnL peak tracking after entries, exits, or partial closes."""
+        """Refresh wallet + daily metrics immediately after entries, exits, or partial closes."""
+        if hasattr(self.exchange, "refresh_wallet_after_trade"):
+            self.exchange.refresh_wallet_after_trade()
+        else:
+            self.exchange.invalidate_balance_cache()
+            self.exchange.get_futures_balance(force_refresh=True)
+
         today = utc_today_str()
         metrics = compute_daily_pnl_metrics(self.exchange, self.db, today)
         if metrics.realized_pnl > self._peak_realized_pnl:
             self._peak_realized_pnl = metrics.realized_pnl
 
-        balance = self.exchange.get_futures_balance(force_refresh=False)
+        balance = metrics.current_wallet or self.exchange.get_futures_balance(
+            force_refresh=False
+        )
         if balance > 0 and self._reference_balance <= 0:
             self._reference_balance = balance
 

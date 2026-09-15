@@ -1087,6 +1087,24 @@ class BinanceExchangeManager:
     def invalidate_balance_cache(self) -> None:
         self._balance_cache.invalidate()
 
+    def refresh_wallet_after_trade(self) -> float:
+        """Force REST wallet refresh after a fill/close — updates balance + account cache."""
+        self.invalidate_balance_cache()
+        self._account_rest_cache.updated_at = 0.0
+        self._last_account_rest_at = 0.0
+        account_info, _ = self._fetch_futures_account_rest(
+            force_live=True,
+            max_attempts=max(Config.STARTUP_BALANCE_MAX_ATTEMPTS, 3),
+        )
+        if account_info:
+            wallet = self._extract_quote_balance(account_info, Config.QUOTE_ASSET)
+            if wallet <= 0:
+                wallet = safe_float(account_info.get("totalWalletBalance"))
+            if wallet > 0:
+                self._balance_cache.set(wallet)
+                return wallet
+        return self.get_futures_balance(force_refresh=True)
+
     def invalidate_position_cache(self) -> None:
         self._position_cache.updated_at = 0.0
 
@@ -1768,11 +1786,12 @@ class BinanceExchangeManager:
         order_id: str,
         *,
         position_side: str = "",
-        wait_seconds: float = 3.0,
+        wait_seconds: float = 5.0,
+        rest_retries: int = 3,
     ) -> ClosedPositionPnl:
         """
         Authoritative realized PnL for a single close order fill.
-        WS ORDER_TRADE_UPDATE (rp) → REST userTrades by orderId.
+        WS ORDER_TRADE_UPDATE (rp) → REST userTrades by orderId (with retries).
         """
         symbol = symbol.upper()
         order_id = str(order_id or "").strip()
@@ -1802,46 +1821,63 @@ class BinanceExchangeManager:
         if self.is_rest_blocked()[0]:
             return result
 
-        try:
-            kwargs: dict[str, Any] = {"symbol": symbol, "orderId": int(order_id)}
-            rows = self._throttled_call(
-                self.client.futures_account_trades,
-                **kwargs,
-            )
-            close_qty = 0.0
-            close_notional = 0.0
-            for row in rows or []:
-                row_ps = str(row.get("positionSide", "BOTH")).upper()
-                if position_side and row_ps not in (position_side.upper(), "BOTH"):
-                    continue
-                result.realized_pnl += safe_float(row.get("realizedPnl"))
-                result.commission += safe_float(row.get("commission"))
-                result.fill_count += 1
-                qty = safe_float(row.get("qty"))
-                price = safe_float(row.get("price"))
-                if qty > 0 and price > 0:
-                    close_qty += qty
-                    close_notional += price * qty
+        delay = max(Config.STARTUP_BALANCE_RETRY_SECONDS, 0.5)
+        attempts = max(rest_retries, 1)
+        for attempt in range(1, attempts + 1):
+            try:
+                kwargs: dict[str, Any] = {"symbol": symbol, "orderId": int(order_id)}
+                raw = self._throttled_call(
+                    self.client.futures_account_trades,
+                    execution_priority=True,
+                    bypass_account_cache=True,
+                    **kwargs,
+                )
+                payload = self._coerce_api_payload(raw)
+                if isinstance(payload, list):
+                    rows = [row for row in payload if isinstance(row, dict)]
+                else:
+                    rows = []
 
-            if result.fill_count > 0:
-                result.source = "userTrades"
-                if close_qty > 0:
-                    result.exit_price = close_notional / close_qty
-                trade_logger.info(
-                    "[%s] Fill PnL from REST order %s | rp=%.4f | fills=%s",
-                    symbol,
-                    order_id,
-                    result.realized_pnl,
-                    result.fill_count,
-                )
-        except Exception as exc:
-            if self._rest_block_log.should_log(f"order_pnl:{symbol}:{order_id}"):
-                error_logger.warning(
-                    "Order fill PnL REST fetch failed for %s order %s: %s",
-                    symbol,
-                    order_id,
-                    exc,
-                )
+                close_qty = 0.0
+                close_notional = 0.0
+                result = ClosedPositionPnl(source="unknown")
+                for row in rows:
+                    row_ps = str(row.get("positionSide", "BOTH")).upper()
+                    if position_side and row_ps not in (position_side.upper(), "BOTH"):
+                        continue
+                    result.realized_pnl += safe_float(row.get("realizedPnl"))
+                    result.commission += safe_float(row.get("commission"))
+                    result.fill_count += 1
+                    qty = safe_float(row.get("qty"))
+                    price = safe_float(row.get("price"))
+                    if qty > 0 and price > 0:
+                        close_qty += qty
+                        close_notional += price * qty
+
+                if result.fill_count > 0:
+                    result.source = "userTrades"
+                    if close_qty > 0:
+                        result.exit_price = close_notional / close_qty
+                    trade_logger.info(
+                        "[%s] Fill PnL from REST order %s | rp=%.4f | fills=%s",
+                        symbol,
+                        order_id,
+                        result.realized_pnl,
+                        result.fill_count,
+                    )
+                    return result
+            except Exception as exc:
+                if self._rest_block_log.should_log(f"order_pnl:{symbol}:{order_id}"):
+                    error_logger.warning(
+                        "Order fill PnL REST attempt %s/%s failed for %s order %s: %s",
+                        attempt,
+                        attempts,
+                        symbol,
+                        order_id,
+                        exc,
+                    )
+            if attempt < attempts:
+                time.sleep(delay * attempt)
 
         return result
 

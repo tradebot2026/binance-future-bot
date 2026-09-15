@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import time
+from typing import Optional
 
 from config import Config
+from core.symbol_rotation_manager import SymbolRotationManager
 
 
 class ScanPriorityQueue:
@@ -20,6 +22,8 @@ class ScanPriorityQueue:
         self._background_bootstrap_index: int = 0
         self._last_hot_scan_at: float = 0.0
         self._last_background_batch_at: float = 0.0
+        self.rotation = SymbolRotationManager()
+        self._last_batch: list[str] = []
 
     @property
     def hot_symbols(self) -> list[str]:
@@ -33,12 +37,19 @@ class ScanPriorityQueue:
     def full_universe(self) -> list[str]:
         return self._hot + self._background
 
-    def update(self, ranked_symbols: list[str]) -> None:
-        """Split ranked universe into hot watchlist and background queue."""
-        ranked = [s.upper() for s in ranked_symbols if s]
-        hot_size = max(Config.HOT_SCAN_SIZE, 1)
-        self._hot = ranked[:hot_size]
-        self._background = ranked[hot_size:]
+    def update(
+        self,
+        ranked_symbols: list[str],
+        *,
+        extended_symbols: Optional[list[str]] = None,
+        trigger_scores: Optional[dict[str, float]] = None,
+    ) -> None:
+        """Split ranked universe into active_watch (hot) and background rotation queue."""
+        self._hot, self._background = self.rotation.build_scan_slices(
+            ranked_symbols,
+            extended_symbols or [],
+            trigger_scores,
+        )
         if self._background_index >= len(self._background):
             self._background_index = 0
 
@@ -76,7 +87,14 @@ class ScanPriorityQueue:
             batch.append(sym)
 
         self._last_background_batch_at = time.monotonic()
+        self._last_batch = list(batch)
         return batch
+
+    def mark_last_background_batch_evaluated(self) -> None:
+        """Move the last background batch into evaluated memory (45–60 min skip)."""
+        if self._last_batch:
+            self.rotation.mark_evaluated(self._last_batch)
+            self._last_batch = []
 
     def next_background_bootstrap_symbols(self, count: int | None = None) -> list[str]:
         """Rotate through background symbols for paced REST kline seeding."""

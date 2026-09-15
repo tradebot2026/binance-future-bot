@@ -209,7 +209,10 @@ class DailyScheduler:
         Called after trade entry, exit, or partial close.
         Invalidates balance cache and allows an immediate limit re-check next cycle.
         """
-        self.exchange.invalidate_balance_cache()
+        if hasattr(self.exchange, "refresh_wallet_after_trade"):
+            self.exchange.refresh_wallet_after_trade()
+        else:
+            self.exchange.invalidate_balance_cache()
         self._last_limit_check_at = 0.0
 
     def get_today_stats(self) -> Optional[dict]:

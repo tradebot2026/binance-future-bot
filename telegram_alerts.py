@@ -119,6 +119,13 @@ def format_live_account_header(
 
 def _resolve_live_wallet_unrealized(exchange: Any) -> tuple[float, float]:
     """Fetch wallet and unrealized PnL once for compact status display."""
+    if hasattr(exchange, "fetch_live_account_snapshot"):
+        snap = exchange.fetch_live_account_snapshot(
+            include_today_income=False,
+            force_refresh=True,
+        )
+        if snap.wallet_balance > 0:
+            return snap.wallet_balance, snap.unrealized_pnl
     snap = _fetch_live_account(exchange)
     if snap is not None and snap.wallet_balance > 0:
         return snap.wallet_balance, snap.unrealized_pnl
@@ -142,7 +149,7 @@ def format_daily_status_message(
     pf = analytics.get("profit_factor", 0.0)
     pf_display = "∞" if pf == float("inf") else f"{pf:.2f}"
 
-    metrics = compute_daily_pnl_metrics(exchange, db, date_str)
+    metrics = compute_daily_pnl_metrics(exchange, db, date_str, force_wallet_refresh=True)
     daily_start = metrics.start_balance
     day_pnl = metrics.equity_day_pnl
     daily_pct = metrics.equity_day_pnl_percent
@@ -208,10 +215,12 @@ def format_active_positions_message(
     """Format /active — reconcile DB vs Binance then list verified open trades."""
     from utils import utc_today_str
 
+    manager = getattr(telegram, "manager", None) if telegram is not None else None
     sync_summary = sync_active_trades_on_demand(
         exchange,
         db,
         telegram=telegram,
+        manager=manager,
         force_rest=True,
     )
     trades = db.get_open_trades()

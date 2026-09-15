@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -23,9 +24,12 @@ class UniverseFilterStats:
     rejected_stagnant: int = 0
     rejected_atr: int = 0
     rejected_blacklist: int = 0
+    rejected_mega_cap: int = 0
     rejected_no_price: int = 0
     filter_profile: str = "strict"
-    candidates: list[tuple[str, float, float, float]] = field(default_factory=list)
+    candidates: list[tuple[str, float, float, float, float, float]] = field(
+        default_factory=list
+    )
 
 
 @dataclass(frozen=True)
@@ -44,6 +48,8 @@ class UniverseResult:
     price_map: dict[str, float]
     volume_ranks: dict[str, int]
     top_volume_symbols: list[str]
+    extended_symbols: list[str]
+    volatility_scores: dict[str, float]
     stats: UniverseFilterStats
 
 
@@ -124,19 +130,14 @@ class UniverseBuilder:
             return None
         return ((high - low) / last_price) * 100.0
 
-    def _passes_atr_volatility_filter(
-        self,
-        symbol: str,
-        last_price: float,
-        profile: _FilterProfile,
-    ) -> bool:
-        if not profile.enable_atr or last_price <= 0 or not self._hub:
-            return True
+    def _resolve_atr_pct(self, symbol: str, last_price: float) -> float:
+        if last_price <= 0 or not self._hub:
+            return 0.0
 
         limit = max(Config.UNIVERSE_ATR_LOOKBACK_BARS + 14, 30)
         df = self._hub.get_candles_cached_only(symbol, self.entry_tf, limit)
         if df.empty or len(df) < Config.UNIVERSE_ATR_LOOKBACK_BARS + 5:
-            return True
+            return 0.0
 
         window = df.tail(Config.UNIVERSE_ATR_LOOKBACK_BARS + 14)
         atr_series = ta.volatility.average_true_range(
@@ -147,9 +148,35 @@ class UniverseBuilder:
         )
         atr = safe_float(atr_series.iloc[-1])
         if atr <= 0:
+            return 0.0
+        return (atr / last_price) * 100.0
+
+    def _passes_atr_volatility_filter(
+        self,
+        symbol: str,
+        last_price: float,
+        profile: _FilterProfile,
+        atr_pct: float,
+    ) -> bool:
+        if not profile.enable_atr or last_price <= 0:
+            return True
+        if atr_pct <= 0:
             return True
         threshold = profile.min_atr_pct if profile.min_atr_pct > 0 else Config.MIN_UNIVERSE_ATR_PCT
-        return (atr / last_price) * 100.0 >= threshold
+        return atr_pct >= threshold
+
+    @staticmethod
+    def _composite_volatility_score(
+        volume_24h: float,
+        range_pct: float,
+        atr_pct: float,
+    ) -> float:
+        vol_log = math.log10(max(volume_24h, 1.0))
+        return (
+            Config.UNIVERSE_RANK_VOLUME_WEIGHT * vol_log
+            + Config.UNIVERSE_RANK_RANGE_WEIGHT * max(range_pct, 0.0)
+            + Config.UNIVERSE_RANK_ATR_WEIGHT * max(atr_pct, 0.0)
+        )
 
     def _resolve_last_price(
         self, symbol: str, ticker: dict[str, Any], book_map: dict[str, dict[str, Any]]
@@ -202,7 +229,14 @@ class UniverseBuilder:
                 stats.rejected_stagnant += 1
                 continue
 
-            if not self._passes_atr_volatility_filter(symbol, last_price, profile):
+            if Config.is_mega_cap_blacklisted(symbol):
+                stats.rejected_mega_cap += 1
+                continue
+
+            atr_pct = self._resolve_atr_pct(symbol, last_price)
+            if not self._passes_atr_volatility_filter(
+                symbol, last_price, profile, atr_pct
+            ):
                 stats.rejected_atr += 1
                 continue
 
@@ -210,11 +244,21 @@ class UniverseBuilder:
                 stats.rejected_blacklist += 1
                 continue
 
+            vol_score = self._composite_volatility_score(
+                volume_24h, range_pct or 0.0, atr_pct
+            )
             stats.candidates.append(
-                (symbol, volume_24h, spread_pct or 0.0, range_pct or 0.0)
+                (
+                    symbol,
+                    volume_24h,
+                    spread_pct or 0.0,
+                    range_pct or 0.0,
+                    atr_pct,
+                    vol_score,
+                )
             )
 
-        stats.candidates.sort(key=lambda row: row[1], reverse=True)
+        stats.candidates.sort(key=lambda row: row[5], reverse=True)
         return stats
 
     def _build_volume_fallback(
@@ -228,11 +272,14 @@ class UniverseBuilder:
             filter_profile="volume_fallback",
         )
         self.db.cleanup_expired_blacklist()
-        rows: list[tuple[str, float, float, float]] = []
+        rows: list[tuple[str, float, float, float, float, float]] = []
 
         for symbol, ticker in ticker_map.items():
             if not self._is_usdt_perpetual(symbol):
                 stats.rejected_quote += 1
+                continue
+            if Config.is_mega_cap_blacklisted(symbol):
+                stats.rejected_mega_cap += 1
                 continue
             if self.db.is_blacklisted(symbol):
                 stats.rejected_blacklist += 1
@@ -245,11 +292,17 @@ class UniverseBuilder:
 
             volume_24h = safe_float(ticker.get("quoteVolume"))
             range_pct = self._compute_24h_range_pct(ticker, last_price)
+            atr_pct = self._resolve_atr_pct(symbol, last_price)
             book = book_map.get(symbol, {})
             spread_pct = self._compute_spread_pct(book) or 0.0
-            rows.append((symbol, volume_24h, spread_pct, range_pct or 0.0))
+            vol_score = self._composite_volatility_score(
+                volume_24h, range_pct or 0.0, atr_pct
+            )
+            rows.append(
+                (symbol, volume_24h, spread_pct, range_pct or 0.0, atr_pct, vol_score)
+            )
 
-        rows.sort(key=lambda row: row[1], reverse=True)
+        rows.sort(key=lambda row: row[5], reverse=True)
         top_n = max(Config.UNIVERSE_FALLBACK_TOP_N, Config.UNIVERSE_RELAXED_MIN_SYMBOLS)
         stats.candidates = rows[:top_n]
         return stats
@@ -316,17 +369,25 @@ class UniverseBuilder:
                     scanner_logger.warning(
                         "Universe empty — no symbols passed filters."
                     )
-                return UniverseResult([], {}, {}, [], UniverseFilterStats())
+                return UniverseResult([], {}, {}, [], [], {}, UniverseFilterStats())
 
             book_map = self.exchange.get_book_ticker_map()
             stats = self._build_with_relaxation(ticker_map, book_map)
-            selected = stats.candidates[: Config.MAX_SCAN_UNIVERSE]
+            pool_size = max(Config.TOP_UNIVERSE_POOL_SIZE, Config.MAX_SCAN_UNIVERSE)
+            extended_size = max(Config.ROTATION_EXTENDED_POOL_SIZE, 0)
+            primary_rows = stats.candidates[:pool_size]
+            extended_rows = stats.candidates[pool_size : pool_size + extended_size]
+            selected = primary_rows[: Config.MAX_SCAN_UNIVERSE]
             symbols = self._prioritize([row[0] for row in selected], priority_symbols)
+            extended_symbols = [row[0] for row in extended_rows]
 
             price_map: dict[str, float] = {}
             volume_ranks: dict[str, int] = {}
-            for rank, (symbol, volume, _, _) in enumerate(stats.candidates, start=1):
+            volatility_scores: dict[str, float] = {}
+            for rank, row in enumerate(stats.candidates, start=1):
+                symbol = row[0]
                 volume_ranks[symbol] = rank
+                volatility_scores[symbol] = row[5]
                 if symbol in symbols:
                     ticker = ticker_map.get(symbol, {})
                     price = self._resolve_last_price(symbol, ticker, book_map)
@@ -341,11 +402,13 @@ class UniverseBuilder:
                 price_map=price_map,
                 volume_ranks=volume_ranks,
                 top_volume_symbols=top_volume,
+                extended_symbols=extended_symbols,
+                volatility_scores=volatility_scores,
                 stats=stats,
             )
         except Exception as exc:
             error_logger.error("Failed to build tradable universe: %s", exc)
-            return UniverseResult([], {}, {}, [], UniverseFilterStats())
+            return UniverseResult([], {}, {}, [], [], {}, UniverseFilterStats())
 
     @staticmethod
     def _prioritize(
@@ -367,9 +430,9 @@ class UniverseBuilder:
             extra = f" (+{len(symbols) - preview_n} more)"
 
         scanner_logger.info(
-            "Universe created: %s active high-volume pairs selected for scanning "
+            "Universe created: %s active volatility-ranked pairs selected for scanning "
             "(target %s-%s | profile=%s | tickers=%s | rejected: volume=%s spread=%s "
-            "stagnant=%s atr=%s blacklist=%s no_price=%s).",
+            "stagnant=%s atr=%s mega_cap=%s blacklist=%s no_price=%s).",
             len(symbols),
             Config.MIN_SCAN_UNIVERSE,
             Config.MAX_SCAN_UNIVERSE,
@@ -379,6 +442,7 @@ class UniverseBuilder:
             stats.rejected_spread,
             stats.rejected_stagnant,
             stats.rejected_atr,
+            stats.rejected_mega_cap,
             stats.rejected_blacklist,
             stats.rejected_no_price,
         )

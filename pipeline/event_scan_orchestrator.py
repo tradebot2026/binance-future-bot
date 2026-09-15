@@ -76,9 +76,17 @@ class EventScanOrchestrator:
                 return self._tier1_symbols
 
         universe = self.universe_builder.build()
-        cap = min(len(universe.symbols), Config.TIER1_WATCHLIST_SIZE)
-        self._tier1_symbols = universe.symbols[:cap]
-        self.priority_queue.update(self._tier1_symbols)
+        pool_cap = min(len(universe.symbols), Config.TOP_UNIVERSE_POOL_SIZE)
+        self._tier1_symbols = universe.symbols[:pool_cap]
+        trigger_scores = {
+            sym: score.normalized_score
+            for sym, score in self.assignment_manager._last_best.items()
+        }
+        self.priority_queue.update(
+            self._tier1_symbols,
+            extended_symbols=universe.extended_symbols,
+            trigger_scores=trigger_scores,
+        )
         self._price_map = universe.price_map
         self._volume_ranks = universe.volume_ranks
         self._last_universe_refresh_at = now
@@ -87,11 +95,13 @@ class EventScanOrchestrator:
             self._hub.subscribe_kline_streams(self._tier1_symbols)
 
         scanner_logger.info(
-            "Tier1 watchlist refreshed — %s symbols (hot=%s, background=%s, cap=%s).",
+            "Tier1 watchlist refreshed — pool=%s active_watch=%s background=%s "
+            "evaluated=%s (pool_cap=%s).",
             len(self._tier1_symbols),
             len(self.priority_queue.hot_symbols),
             len(self.priority_queue.background_symbols),
-            Config.TIER1_WATCHLIST_SIZE,
+            self.priority_queue.rotation.evaluated_count,
+            Config.TOP_UNIVERSE_POOL_SIZE,
         )
         return self._tier1_symbols
 
@@ -294,6 +304,7 @@ class EventScanOrchestrator:
                 if signal is not None:
                     candidates.append(signal)
 
+        self.priority_queue.mark_last_background_batch_evaluated()
         if candidates:
             scanner_logger.info(
                 "Background scan produced %s execution candidate(s) from batch=%s.",
@@ -347,6 +358,16 @@ class EventScanOrchestrator:
         mark_event: Optional[CandleCloseEvent] = None,
     ) -> Optional[SignalCandidate]:
         symbol = symbol.upper()
+        if self.priority_queue.rotation.is_in_evaluated_memory(symbol):
+            scanner_logger.debug(
+                "Skip %s — in evaluated memory (rotation cooldown).", symbol
+            )
+            if mark_event is not None:
+                self.event_scheduler.mark_evaluated(
+                    symbol, mark_event.timeframe, mark_event.bar_open_ms
+                )
+            return None
+
         ticker = ticker_map.get(symbol, {})
         book = book_map.get(symbol, {})
         price = self._price_map.get(symbol, float(ticker.get("lastPrice", 0) or 0))

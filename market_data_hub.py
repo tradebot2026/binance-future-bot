@@ -1163,7 +1163,10 @@ class MarketDataHub:
                         bars.append(row)
                 else:
                     bars.append(row)
-                self._sync_candles_from_klines(symbol, interval)
+                if row["closed"]:
+                    self._sync_candles_from_klines(symbol, interval)
+                else:
+                    self._patch_candle_cache_last_row(symbol, interval, row)
             if row["closed"]:
                 self._emit_candle_close(symbol, interval, row["open_ms"])
         except Exception as exc:
@@ -1224,6 +1227,8 @@ class MarketDataHub:
                 del self._kline_bars[key]
             for key in [k for k in self._candles if k[0] == symbol]:
                 del self._candles[key]
+            for pair in [p for p in self._bootstrapped_pairs if p[0] == symbol]:
+                self._bootstrapped_pairs.discard(pair)
 
         if to_remove and self._ws_manager and self._ws_running:
             self._rebuild_kline_socket_pool()
@@ -1259,9 +1264,45 @@ class MarketDataHub:
         bar_open_ms = self._current_bar_open_ms(interval)
         cache_key = (symbol, interval, limit)
         self._candles[cache_key] = _CandleCacheEntry(
-            dataframe=df.copy(),
+            dataframe=df,
             last_bar_open_ms=bar_open_ms,
         )
+
+    def _patch_candle_cache_last_row(
+        self, symbol: str, interval: str, row: dict[str, Any]
+    ) -> None:
+        """Update the forming bar in-place instead of rebuilding the full DataFrame."""
+        limit = Config.CANDLE_FETCH_LIMIT
+        cache_key = (symbol, interval, limit)
+        entry = self._candles.get(cache_key)
+        if entry is None or entry.dataframe.empty:
+            self._sync_candles_from_klines(symbol, interval)
+            return
+
+        df = entry.dataframe
+        ts = row["timestamp"]
+        last_idx = len(df) - 1
+        last_ts = df.iloc[last_idx]["timestamp"]
+        if pd.Timestamp(last_ts) != pd.Timestamp(ts):
+            new_row = {
+                "timestamp": ts,
+                "open": row["open"],
+                "high": row["high"],
+                "low": row["low"],
+                "close": row["close"],
+                "volume": row["volume"],
+            }
+            df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
+            if len(df) > limit:
+                df = df.iloc[-limit:].reset_index(drop=True)
+            entry.dataframe = df
+            return
+
+        df.iloc[last_idx, df.columns.get_loc("open")] = row["open"]
+        df.iloc[last_idx, df.columns.get_loc("high")] = row["high"]
+        df.iloc[last_idx, df.columns.get_loc("low")] = row["low"]
+        df.iloc[last_idx, df.columns.get_loc("close")] = row["close"]
+        df.iloc[last_idx, df.columns.get_loc("volume")] = row["volume"]
 
     def subscribe_kline_streams(
         self,

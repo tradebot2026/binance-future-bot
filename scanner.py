@@ -157,6 +157,10 @@ class MarketScanner:
                 stats.rejected_stagnant += 1
                 continue
 
+            if Config.is_mega_cap_blacklisted(symbol):
+                stats.rejected_blacklist += 1
+                continue
+
             if not self._passes_atr_volatility_filter(symbol, last_price):
                 stats.rejected_atr += 1
                 continue
@@ -342,6 +346,8 @@ class MarketScanner:
             "tier1_hot": orchestrator.priority_queue.hot_symbols,
             "tier1_background": orchestrator.priority_queue.background_symbols,
             "tier1_full": orchestrator.tier1_symbols,
+            "rotation_evaluated": orchestrator.priority_queue.rotation.evaluated_count,
+            "rotation_cycle": orchestrator.priority_queue.rotation.rotation_cycle,
             "tier2": orchestrator.tier2_summary(),
             "tier2_near_miss": orchestrator.assignment_manager.near_miss_summary(),
         }
