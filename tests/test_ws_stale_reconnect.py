@@ -169,6 +169,20 @@ class TestWsStaleReconnect(unittest.TestCase):
             self.assertFalse(hub._book_stream_is_stale())
             self.assertEqual(hub.get_ws_health_snapshot()["state"], "HEALTHY")
 
+    def test_execution_requires_rest_when_ticker_row_is_stale(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._last_ticker_event_at = time.monotonic()
+        hub._tickers["BTCUSDT"] = {
+            "symbol": "BTCUSDT",
+            "lastPrice": 50000.0,
+            "updated_at": time.monotonic() - 600.0,
+        }
+        with patch.object(Config, "ENABLE_WS_BOOK_STREAM", False), patch.object(
+            Config, "USE_TESTNET", True
+        ), patch.object(Config, "WS_STALE_SECONDS_TESTNET", 60):
+            self.assertTrue(hub.execution_requires_rest_price("BTCUSDT"))
+            self.assertIsNone(hub.get_execution_ticker_price("BTCUSDT"))
+
 
 if __name__ == "__main__":
     unittest.main()

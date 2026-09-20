@@ -618,6 +618,13 @@ class TradeExecutor:
 
         with self.exchange.execution_context():
             live_price = self._resolve_live_execution_price(symbol, current_price)
+            if live_price <= 0:
+                log_execution_rejected(
+                    symbol,
+                    "no live price from REST or cache — cannot place order",
+                    strategy=strategy,
+                )
+                return None
             return self._execute_trade_inner(
                 symbol,
                 action,
@@ -628,36 +635,94 @@ class TradeExecutor:
                 structure_metadata,
             )
 
-    def _ws_needs_execution_rest_price(self) -> bool:
+    def _ws_needs_execution_rest_price(self, symbol: str, current_price: float) -> bool:
+        if current_price <= 0:
+            return True
         hub = None
         if hasattr(self.exchange, "get_market_data_hub"):
             hub = self.exchange.get_market_data_hub()
         if hub is None:
-            return False
+            return True
+        requires_fn = getattr(hub, "execution_requires_rest_price", None)
+        if callable(requires_fn):
+            try:
+                if requires_fn(symbol) is True:
+                    return True
+            except Exception:
+                return True
         if getattr(hub, "_reconnect_in_progress", False) is True:
             return True
         warming_fn = getattr(hub, "is_ws_warming_up", None)
         if callable(warming_fn) and warming_fn() is True:
+            return True
+        stale_fn = getattr(hub, "ws_is_stale", None)
+        if callable(stale_fn) and stale_fn() is True:
             return True
         snap_fn = getattr(hub, "get_ws_health_snapshot", None)
         if callable(snap_fn):
             snap = snap_fn()
             if isinstance(snap, dict):
                 state = str(snap.get("state", "")).upper()
-                return state in {"WARMING", "RECONNECTING", "STALE"}
+                if state in {"WARMING", "RECONNECTING", "STALE"}:
+                    return True
+        fresh_fn = getattr(hub, "get_fresh_ticker_price", None)
+        if callable(fresh_fn):
+            try:
+                fresh = safe_float(fresh_fn(symbol))
+            except Exception:
+                fresh = 0.0
+            if fresh <= 0:
+                return True
         return False
 
+    def _fetch_execution_rest_price(self, symbol: str) -> float:
+        """Immediate REST last price — never waits on WebSocket recovery."""
+        for name in ("fetch_ticker", "get_symbol_price", "get_ticker"):
+            fn = getattr(self.exchange, name, None)
+            if not callable(fn):
+                continue
+            try:
+                price = safe_float(fn(symbol))
+            except Exception as exc:
+                trade_logger.debug(
+                    "Execution REST %s failed for %s: %s", name, symbol, exc
+                )
+                continue
+            if price > 0:
+                return price
+        if hasattr(self.exchange, "get_live_mark_price"):
+            try:
+                mark = safe_float(
+                    self.exchange.get_live_mark_price(symbol, allow_rest=True)
+                )
+            except Exception:
+                mark = 0.0
+            if mark > 0:
+                return mark
+        return 0.0
+
+    def _cached_execution_price(self, symbol: str, current_price: float) -> float:
+        hub = None
+        if hasattr(self.exchange, "get_market_data_hub"):
+            hub = self.exchange.get_market_data_hub()
+        if hub is not None and hasattr(hub, "get_price"):
+            try:
+                cached = safe_float(hub.get_price(symbol))
+            except Exception:
+                cached = 0.0
+            if cached > 0:
+                return cached
+        return current_price if current_price > 0 else 0.0
+
     def _resolve_live_execution_price(self, symbol: str, current_price: float) -> float:
-        """Use REST last price when WS is warming/reconnecting so entries are not dropped."""
-        if current_price > 0 and not self._ws_needs_execution_rest_price():
+        """
+        Never drop an approved entry because WS is STALE/WARMING.
+        Prefer a REST ticker immediately; if REST fails, use cache/signal price.
+        """
+        if not self._ws_needs_execution_rest_price(symbol, current_price):
             return current_price
-        rest_price = 0.0
-        if hasattr(self.exchange, "get_ticker"):
-            rest_price = safe_float(self.exchange.get_ticker(symbol))
-        if rest_price <= 0 and hasattr(self.exchange, "get_live_mark_price"):
-            rest_price = safe_float(
-                self.exchange.get_live_mark_price(symbol, allow_rest=True)
-            )
+
+        rest_price = self._fetch_execution_rest_price(symbol)
         if rest_price > 0:
             trade_logger.info(
                 "Execution price REST fallback %s | signal=%.6f rest=%.6f",
@@ -666,7 +731,16 @@ class TradeExecutor:
                 rest_price,
             )
             return rest_price
-        return current_price
+
+        fallback = self._cached_execution_price(symbol, current_price)
+        if fallback > 0:
+            trade_logger.warning(
+                "REST ticker unavailable for %s — proceeding with cached/signal "
+                "price %.6f (WS stale/warming).",
+                symbol,
+                fallback,
+            )
+        return fallback
 
     def _execute_trade_inner(
         self,

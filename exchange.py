@@ -2292,20 +2292,34 @@ class BinanceExchangeManager:
             return live
         return None
 
-    def get_ticker(self, symbol: str) -> Optional[float]:
+    def get_ticker(self, symbol: str, *, force_rest: bool = False) -> Optional[float]:
         """
-        Last traded price for execution. Prefers a fresh WS miniTicker;
-        falls back to a throttled futures_symbol_ticker REST call.
+        Last traded price for execution. Uses WS only when the miniTicker row is
+        fresh; otherwise an immediate futures_symbol_ticker REST call.
         """
         symbol = symbol.upper()
-        max_age = float(max(Config.WS_STALE_SECONDS, 30))
-        if self._market_data:
-            fresh = self._market_data.get_fresh_ticker_price(
-                symbol, max_age_seconds=max_age
-            )
+        hub = self._market_data
+        needs_rest = force_rest
+        if hub is not None and not needs_rest:
+            requires_fn = getattr(hub, "execution_requires_rest_price", None)
+            if callable(requires_fn):
+                try:
+                    needs_rest = bool(requires_fn(symbol))
+                except Exception:
+                    needs_rest = True
+            elif hasattr(hub, "ws_is_stale") and hub.ws_is_stale():
+                needs_rest = True
+            elif hasattr(hub, "is_ws_warming_up") and hub.is_ws_warming_up():
+                needs_rest = True
+        if hub is not None and not needs_rest:
+            max_age = float(max(Config.WS_STALE_SECONDS, 30))
+            fresh = hub.get_fresh_ticker_price(symbol, max_age_seconds=max_age)
             if fresh is not None and fresh > 0:
                 return fresh
-        if self.is_rest_blocked()[0]:
+            needs_rest = True
+        if not needs_rest:
+            return None
+        if self.is_rest_blocked()[0] and not self._is_execution_priority():
             return None
         try:
             ticker = self._throttled_call(
@@ -2321,6 +2335,14 @@ class BinanceExchangeManager:
             if self._rest_block_log.should_log(f"get_ticker_{symbol}"):
                 error_logger.warning("REST ticker fetch failed for %s: %s", symbol, exc)
             return None
+
+    def fetch_ticker(self, symbol: str) -> Optional[float]:
+        """Force REST last price for execution (alias of get_ticker(force_rest=True))."""
+        return self.get_ticker(symbol, force_rest=True)
+
+    def get_symbol_price(self, symbol: str) -> Optional[float]:
+        """Force REST last price for execution (alias of fetch_ticker)."""
+        return self.fetch_ticker(symbol)
 
     def get_market_price(self, symbol: str, position_side: str = "LONG") -> Optional[float]:
         if self._market_data:

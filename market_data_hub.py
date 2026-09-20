@@ -463,6 +463,31 @@ class MarketDataHub:
         if stream in ("book", "all"):
             self._last_book_event_at = now
 
+    def execution_requires_rest_price(self, symbol: str = "") -> bool:
+        """True when execution must not trust WS last price (stale/warming/no fresh tick)."""
+        if self._reconnect_in_progress or not self._ws_running:
+            return True
+        if self.is_ws_warming_up() or self.ws_is_stale() or self._book_stream_is_stale():
+            return True
+        snap = self.get_ws_health_snapshot()
+        if str(snap.get("state", "")).upper() in {"STALE", "WARMING", "RECONNECTING"}:
+            return True
+        if symbol:
+            fresh = self.get_fresh_ticker_price(
+                symbol,
+                max_age_seconds=self._effective_ticker_stale_seconds(),
+            )
+            if fresh is None or fresh <= 0:
+                return True
+        return False
+
+    def get_execution_ticker_price(self, symbol: str) -> Optional[float]:
+        """WS last price only if the miniTicker row is within the stale window."""
+        return self.get_fresh_ticker_price(
+            symbol,
+            max_age_seconds=self._effective_ticker_stale_seconds(),
+        )
+
     def get_rest_block_remaining_seconds(self) -> int:
         with self._lock:
             return max(int(self._rest_blocked_until - time.time()), 0)
