@@ -97,10 +97,15 @@ def format_bot_health_message(
         ws_state = str(ws.get("state", "UNKNOWN")).upper()
         feeds = int(ws.get("active_feeds", 0))
         tickers = int(ws.get("ticker_symbols", 0))
-        if ws_state == "CONNECTED":
-            ws_line = f"CONNECTED ({feeds} active feeds | {tickers} tickers cached)"
+        if ws_state in {"HEALTHY", "CONNECTED"}:
+            ws_line = f"HEALTHY ({feeds} active feeds | {tickers} tickers cached)"
         elif ws_state == "RECONNECTING":
             ws_line = f"RECONNECTING ({feeds} feeds scheduled)"
+        elif ws_state == "WARMING":
+            ws_line = (
+                f"WARMING ({feeds} feeds | waiting for first tick, "
+                f"age {_format_duration(safe_float(ws.get('ticker_age_seconds', -1)))})"
+            )
         else:
             ws_line = f"{ws_state} ({feeds} feeds | ticker age {_format_duration(safe_float(ws.get('ticker_age_seconds', -1)))})"
     else:

@@ -160,6 +160,7 @@ class MarketDataHub:
         self._price_tick_listeners: list[Callable[[str, float], None]] = []
         self._ws_running = False
         self._last_ticker_event_at: float = 0.0
+        self._last_book_event_at: float = 0.0
         self._last_user_event_at: float = 0.0
         self._positions: list[dict[str, Any]] = []
         self._unrealized_pnl_total: float = 0.0
@@ -205,10 +206,12 @@ class MarketDataHub:
                 state = "RECONNECTING"
             elif not self._ws_running:
                 state = "STOPPED"
-            elif self.ws_is_stale():
+            elif self._last_ticker_event_at <= 0:
+                state = "WARMING" if self.is_ws_warming_up() else "STALE"
+            elif self.ws_is_stale() or self._book_stream_is_stale():
                 state = "STALE"
             else:
-                state = "CONNECTED"
+                state = "HEALTHY"
 
             return {
                 "state": state,
@@ -216,6 +219,7 @@ class MarketDataHub:
                 "ticker_symbols": len(self._tickers),
                 "kline_streams": len(self._subscribed_kline_streams),
                 "ticker_age_seconds": ticker_age,
+                "book_age_seconds": self.book_cache_age_seconds(),
                 "user_stream_age_seconds": user_age,
                 "user_stream_ok": self.user_stream_has_account_data()
                 and not self.user_stream_is_stale(),
@@ -236,16 +240,23 @@ class MarketDataHub:
             return time.monotonic() - self._ws_started_at
         return float("inf")
 
+    def book_cache_age_seconds(self) -> float:
+        """Seconds since last WS bookTicker event (or since WS start if none yet)."""
+        if self._last_book_event_at > 0:
+            return time.monotonic() - self._last_book_event_at
+        if self._ws_started_at > 0:
+            return time.monotonic() - self._ws_started_at
+        return float("inf")
+
     @staticmethod
     def _effective_ticker_stale_seconds() -> float:
-        """Testnet streams are often quiet — use a longer stale threshold."""
-        if Config.USE_TESTNET:
-            return float(max(Config.WS_STALE_SECONDS_TESTNET, 60))
+        """miniTicker / bookTicker are stale after this many seconds without a WS event."""
         return float(max(Config.WS_STALE_SECONDS, 30))
 
     def _preserve_cache_on_reconnect(self) -> bool:
         """True when cached tickers/klines should survive a WS reconnect."""
         return self.is_ticker_cache_usable(min_symbols=10) or bool(self._kline_bars)
+
     def needs_ticker_rest_fallback(self) -> bool:
         """True when WS ticker cache is empty or stale beyond the REST threshold."""
         if not Config.ENABLE_REST_TICKER_FALLBACK and not Config.STARTUP_TICKER_REST_SEED:
@@ -321,14 +332,10 @@ class MarketDataHub:
         return blocked
 
     def _should_reconnect_for_stale_ticker(self) -> bool:
-        if not self.ws_is_stale():
-            return False
-        # Testnet miniTicker can go silent for long stretches — keep cached data.
-        if Config.USE_TESTNET and self.is_ticker_cache_usable(min_symbols=10):
-            return False
-        if self._rest_quiet_mode() and self.is_ticker_cache_usable(min_symbols=10):
-            return False
-        return True
+        """True when miniTicker or bookTicker age exceeds the 30s stale threshold."""
+        if self.ws_is_stale():
+            return True
+        return self._book_stream_is_stale()
 
     def is_ticker_cache_usable(self, min_symbols: int = 1) -> bool:
         """Scanner may proceed when tickers are present (WS or REST)."""
@@ -403,17 +410,15 @@ class MarketDataHub:
         )
 
     def is_ws_warming_up(self) -> bool:
+        """True until the first live miniTicker after (re)subscribe, within grace."""
         if not self._ws_running:
             return False
-        if self.is_ticker_cache_usable(min_symbols=10):
+        if self._last_ticker_event_at > 0:
             return False
         if self._ws_started_at <= 0:
             return True
-        if self._last_ticker_event_at <= 0:
-            return (
-                time.monotonic() - self._ws_started_at
-            ) < Config.TICKER_REST_FALLBACK_AFTER_SECONDS
-        return False
+        grace = max(self._effective_ticker_stale_seconds(), 15.0)
+        return (time.monotonic() - self._ws_started_at) < grace
 
     def get_rest_block_remaining_seconds(self) -> int:
         with self._lock:
@@ -450,11 +455,10 @@ class MarketDataHub:
                 loop=ws_loop,
             )
             self._ws_manager.start()
-            if preserve_cache:
-                if self._tickers:
-                    self._last_ticker_event_at = time.monotonic()
-            else:
-                self._last_ticker_event_at = 0.0
+            # HEALTHY requires a live WS event — never stamp freshness from cache.
+            self._last_ticker_event_at = 0.0
+            self._last_book_event_at = 0.0
+            if not preserve_cache:
                 self._last_user_event_at = 0.0
 
             manager = self._ws_manager
@@ -492,7 +496,7 @@ class MarketDataHub:
         self._watchdog_thread.start()
 
     def _watchdog_loop(self) -> None:
-        interval = max(Config.WS_HEALTH_CHECK_SECONDS, 10)
+        interval = max(float(Config.WS_HEALTH_CHECK_SECONDS), 5.0)
         while not self._watchdog_stop.wait(interval):
             if not self._ws_running or self._reconnect_in_progress:
                 continue
@@ -503,8 +507,13 @@ class MarketDataHub:
             if not blocked and not self._rest_quiet_mode() and self.needs_ticker_rest_fallback():
                 self.refresh_ticker_cache_from_rest()
             if self._should_reconnect_for_stale_ticker():
-                self._request_reconnect("ticker stream stale — no events received")
-            if self._should_reconnect_for_stale_user_stream():
+                age = self.ticker_cache_age_seconds()
+                self._request_reconnect(
+                    f"ticker stream stale — age {age:.0f}s "
+                    f"(threshold {self._effective_ticker_stale_seconds():.0f}s) "
+                    "resetting miniTicker/bookTicker/userData"
+                )
+            elif self._should_reconnect_for_stale_user_stream():
                 self._request_reconnect(
                     "user data stream stale — no account events received"
                 )
@@ -515,6 +524,9 @@ class MarketDataHub:
         if self._rest_quiet_mode():
             return False
         if not self.user_stream_has_account_data():
+            # A live miniTicker feed means the WS manager is up; listen-key can be quiet.
+            if not self.ws_is_stale() and self._last_ticker_event_at > 0:
+                return False
             return True
         with self._lock:
             has_open_positions = any(
@@ -522,14 +534,10 @@ class MarketDataHub:
             )
         if has_open_positions:
             return True
-        if not self.ws_is_stale():
+        if not self.ws_is_stale() and self._last_ticker_event_at > 0:
             idle = time.monotonic() - self._last_user_event_at
             if idle < Config.WS_USER_IDLE_RECONNECT_SECONDS:
                 return False
-        if Config.USE_TESTNET:
-            with self._lock:
-                if self._wallet_balances:
-                    return False
         return True
 
     @staticmethod
@@ -597,13 +605,7 @@ class MarketDataHub:
         if self.is_ws_warming_up():
             return
 
-        is_stale_reason = "stale" in reason.lower()
         preserve_cache = self._preserve_cache_on_reconnect()
-        if is_stale_reason:
-            if Config.USE_TESTNET and self.is_ticker_cache_usable(min_symbols=10):
-                return
-            if self._rest_quiet_mode() and self.is_ticker_cache_usable(min_symbols=10):
-                return
 
         now = time.monotonic()
         if (now - self._last_reconnect_request_at) < Config.WS_RECONNECT_DEBOUNCE_SECONDS:
@@ -615,7 +617,7 @@ class MarketDataHub:
                 return
             self._reconnect_in_progress = True
 
-        silent = preserve_cache
+        silent = preserve_cache and "stale" not in reason.lower()
         if self._ws_log.should_log(reason):
             if silent:
                 system_logger.debug(
@@ -654,6 +656,11 @@ class MarketDataHub:
             )
             self._start_ws_internal(preserve_cache=preserve_cache)
             self._ws_log.reset()
+            system_logger.info(
+                "WebSocket streams re-subscribed (miniTicker + bookTicker + userData) "
+                "after: %s",
+                reason,
+            )
             if not self._rest_quiet_mode() and not preserve_cache:
                 self.refresh_ticker_cache_from_rest(force=True)
             elif preserve_cache and self._ws_log.should_log("ws_reconnect_quiet"):
@@ -885,6 +892,7 @@ class MarketDataHub:
                         "is_proxy": False,
                         "updated_at": now,
                     }
+                    self._last_book_event_at = now
                 self._book_fetched_at = now
         except Exception as exc:
             error_logger.warning("Book ticker WS parse error: %s", exc)
@@ -1644,6 +1652,18 @@ class MarketDataHub:
             return True
         return (
             time.monotonic() - self._last_ticker_event_at
+        ) > self._effective_ticker_stale_seconds()
+
+    def _book_stream_is_stale(self) -> bool:
+        if not Config.ENABLE_WS_BOOK_STREAM:
+            return False
+        if not self._ws_running or self.is_ws_warming_up():
+            return False
+        if self._last_book_event_at <= 0:
+            started = self._ws_started_at if self._ws_started_at > 0 else time.monotonic()
+            return (time.monotonic() - started) > self._effective_ticker_stale_seconds()
+        return (
+            time.monotonic() - self._last_book_event_at
         ) > self._effective_ticker_stale_seconds()
 
     def user_stream_has_account_data(self) -> bool:

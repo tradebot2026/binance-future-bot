@@ -140,7 +140,7 @@ Scan, ranking, and sub-scans run under `exchange.scan_context()` which **blocks 
 
 #### Staleness & halt
 
-- Ticker stale: `WS_STALE_SECONDS` (testnet: `WS_STALE_SECONDS_TESTNET`)
+- Ticker / bookTicker stale: `WS_STALE_SECONDS` (30s). Watchdog force-resets `miniTicker`, `bookTicker`, and `userData`. `/health` is `HEALTHY` only after a live tick.
 - `-1003` IP ban → `halt_scanning()`; scanner returns empty; monitor continues
 - Startup `futures_ping()` defers REST init if already banned
 
