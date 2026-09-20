@@ -96,6 +96,28 @@ class TestWsStaleReconnect(unittest.TestCase):
             thread_cls.assert_called_once()
             self.assertTrue(hub._reconnect_in_progress)
 
+    def test_reconnect_stamp_clears_stale_without_waiting_for_ticks(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._last_ticker_event_at = time.monotonic() - 600.0
+        hub._last_book_event_at = time.monotonic() - 600.0
+        with patch.object(Config, "ENABLE_WS_BOOK_STREAM", False):
+            self.assertEqual(hub.get_ws_health_snapshot()["state"], "STALE")
+            hub._mark_stream_freshness()
+            self.assertFalse(hub.ws_is_stale())
+            self.assertLess(hub.ticker_cache_age_seconds(), 1.0)
+            self.assertEqual(hub.get_ws_health_snapshot()["state"], "HEALTHY")
+
+    def test_heartbeat_frame_keeps_connection_healthy(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._last_ticker_event_at = time.monotonic() - 90.0
+        wrapped = hub._wrap_ws_callback(lambda _msg: None, stream="ticker")
+        with patch.object(Config, "ENABLE_WS_BOOK_STREAM", False), patch.object(
+            Config, "USE_TESTNET", True
+        ), patch.object(Config, "WS_STALE_SECONDS_TESTNET", 60):
+            wrapped({"ping": True})
+            self.assertFalse(hub.ws_is_stale())
+            self.assertEqual(hub.get_ws_health_snapshot()["state"], "HEALTHY")
+
     def test_fresh_mini_ticker_message_clears_stale_state(self) -> None:
         hub = _hub_with_running_ws()
         hub._last_ticker_event_at = time.monotonic() - 600.0
@@ -136,7 +158,7 @@ class TestWsStaleReconnect(unittest.TestCase):
     def test_book_ticker_message_updates_book_freshness(self) -> None:
         hub = _hub_with_running_ws()
         hub._last_ticker_event_at = time.monotonic()
-        hub._last_book_event_at = 0.0
+        hub._last_book_event_at = time.monotonic() - 90.0
         with patch.object(Config, "ENABLE_WS_BOOK_STREAM", True), patch.object(
             Config, "WS_STALE_SECONDS", 30
         ):

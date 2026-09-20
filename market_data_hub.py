@@ -161,6 +161,7 @@ class MarketDataHub:
         self._ws_running = False
         self._last_ticker_event_at: float = 0.0
         self._last_book_event_at: float = 0.0
+        self._last_ws_seen_at: float = 0.0
         self._last_user_event_at: float = 0.0
         self._positions: list[dict[str, Any]] = []
         self._unrealized_pnl_total: float = 0.0
@@ -206,7 +207,7 @@ class MarketDataHub:
                 state = "RECONNECTING"
             elif not self._ws_running:
                 state = "STOPPED"
-            elif self._last_ticker_event_at <= 0:
+            elif self._last_health_stamp() <= 0:
                 state = "WARMING" if self.is_ws_warming_up() else "STALE"
             elif self.ws_is_stale() or self._book_stream_is_stale():
                 state = "STALE"
@@ -425,15 +426,42 @@ class MarketDataHub:
         )
 
     def is_ws_warming_up(self) -> bool:
-        """True until the first live miniTicker after (re)subscribe, within grace."""
+        """True only while reconnect/start is in flight before freshness is stamped."""
+        if self._reconnect_in_progress:
+            return True
         if not self._ws_running:
             return False
-        if self._last_ticker_event_at > 0:
+        if self._last_health_stamp() > 0:
             return False
         if self._ws_started_at <= 0:
             return True
         grace = max(self._effective_ticker_stale_seconds(), 15.0)
         return (time.monotonic() - self._ws_started_at) < grace
+
+    def _last_health_stamp(self) -> float:
+        return max(
+            self._last_ticker_event_at,
+            self._last_book_event_at,
+            self._last_ws_seen_at,
+        )
+
+    def _mark_stream_freshness(self) -> None:
+        """Stamp ticker/book/kline clocks so reconnect cannot look instantly stale."""
+        now = time.monotonic()
+        self._last_ticker_event_at = now
+        self._last_book_event_at = now
+        self._last_ws_seen_at = now
+        for sock in self._kline_sockets:
+            sock.last_event_at = now
+
+    def _note_ws_frame(self, stream: str = "") -> None:
+        """Any inbound frame (data, heartbeat, empty payload) counts as connection life."""
+        now = time.monotonic()
+        self._last_ws_seen_at = now
+        if stream in ("ticker", "all", ""):
+            self._last_ticker_event_at = now
+        if stream in ("book", "all"):
+            self._last_book_event_at = now
 
     def get_rest_block_remaining_seconds(self) -> int:
         with self._lock:
@@ -470,28 +498,28 @@ class MarketDataHub:
                 loop=ws_loop,
             )
             self._ws_manager.start()
-            # HEALTHY requires a live WS event — never stamp freshness from cache.
-            self._last_ticker_event_at = 0.0
-            self._last_book_event_at = 0.0
             if not preserve_cache:
                 self._last_user_event_at = 0.0
 
             manager = self._ws_manager
             self._ticker_conn_key = manager.start_futures_multiplex_socket(
-                callback=self._wrap_ws_callback(self._on_ticker_message),
+                callback=self._wrap_ws_callback(self._on_ticker_message, stream="ticker"),
                 streams=["!miniTicker@arr"],
             )
             if Config.ENABLE_WS_BOOK_STREAM:
                 self._book_ticker_conn_key = manager.start_futures_multiplex_socket(
-                    callback=self._wrap_ws_callback(self._on_book_ticker_message),
+                    callback=self._wrap_ws_callback(
+                        self._on_book_ticker_message, stream="book"
+                    ),
                     streams=["!bookTicker@arr"],
                 )
             self._user_conn_key = manager.start_futures_user_socket(
-                callback=self._wrap_ws_callback(self._on_user_message),
+                callback=self._wrap_ws_callback(self._on_user_message, stream="user"),
             )
             self._ws_running = True
             self._ws_started_at = time.monotonic()
             self._resubscribe_kline_streams()
+            self._mark_stream_freshness()
             streams = "miniTicker + user data"
             if Config.ENABLE_WS_BOOK_STREAM:
                 streams += " + bookTicker"
@@ -583,9 +611,12 @@ class MarketDataHub:
                 if is_read_loop_closed_error(detail):
                     self._request_kline_socket_reconnect(socket_idx, detail)
                 return
+            self._note_ws_frame("kline")
             try:
                 if 0 <= socket_idx < len(self._kline_sockets):
                     self._kline_sockets[socket_idx].last_event_at = time.monotonic()
+                if not isinstance(message, dict):
+                    return
                 handler(message)
             except Exception as exc:
                 if is_read_loop_closed_error(exc):
@@ -596,15 +627,20 @@ class MarketDataHub:
         return _wrapped
 
     def _wrap_ws_callback(
-        self, handler: Callable[[dict[str, Any]], None]
+        self,
+        handler: Callable[[dict[str, Any]], None],
+        stream: str = "ticker",
     ) -> Callable[[dict[str, Any]], None]:
-        """Catch library error passthrough and read-loop failures."""
+        """Catch library error passthrough and treat any frame as connection life."""
 
         def _wrapped(message: dict[str, Any]) -> None:
             if is_ws_error_message(message):
                 detail = str(message.get("m", message.get("type", "ws error")))
                 if is_read_loop_closed_error(detail):
                     self._request_reconnect(detail)
+                return
+            self._note_ws_frame(stream)
+            if not isinstance(message, dict):
                 return
             try:
                 handler(message)
@@ -678,6 +714,7 @@ class MarketDataHub:
                 blocking=False,
             )
             self._start_ws_internal(preserve_cache=preserve_cache)
+            self._mark_stream_freshness()
             self._ws_log.reset()
             system_logger.info(
                 "WebSocket streams re-subscribed (miniTicker + bookTicker + userData) "
@@ -1669,22 +1706,20 @@ class MarketDataHub:
     def ws_is_stale(self) -> bool:
         if not self._ws_running:
             return True
-        if self.is_ws_warming_up():
+        if self._reconnect_in_progress:
             return False
-        if self._last_ticker_event_at <= 0:
-            return True
-        return (
-            time.monotonic() - self._last_ticker_event_at
-        ) > self._effective_ticker_stale_seconds()
+        stamp = self._last_health_stamp()
+        if stamp <= 0:
+            return not self.is_ws_warming_up()
+        return (time.monotonic() - stamp) > self._effective_ticker_stale_seconds()
 
     def _book_stream_is_stale(self) -> bool:
         if not Config.ENABLE_WS_BOOK_STREAM:
             return False
-        if not self._ws_running or self.is_ws_warming_up():
+        if not self._ws_running or self._reconnect_in_progress:
             return False
         if self._last_book_event_at <= 0:
-            started = self._ws_started_at if self._ws_started_at > 0 else time.monotonic()
-            return (time.monotonic() - started) > self._effective_ticker_stale_seconds()
+            return self.ws_is_stale()
         return (
             time.monotonic() - self._last_book_event_at
         ) > self._effective_ticker_stale_seconds()

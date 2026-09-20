@@ -617,15 +617,56 @@ class TradeExecutor:
         )
 
         with self.exchange.execution_context():
+            live_price = self._resolve_live_execution_price(symbol, current_price)
             return self._execute_trade_inner(
                 symbol,
                 action,
                 atr,
-                current_price,
+                live_price,
                 strategy,
                 score,
                 structure_metadata,
             )
+
+    def _ws_needs_execution_rest_price(self) -> bool:
+        hub = None
+        if hasattr(self.exchange, "get_market_data_hub"):
+            hub = self.exchange.get_market_data_hub()
+        if hub is None:
+            return False
+        if getattr(hub, "_reconnect_in_progress", False) is True:
+            return True
+        warming_fn = getattr(hub, "is_ws_warming_up", None)
+        if callable(warming_fn) and warming_fn() is True:
+            return True
+        snap_fn = getattr(hub, "get_ws_health_snapshot", None)
+        if callable(snap_fn):
+            snap = snap_fn()
+            if isinstance(snap, dict):
+                state = str(snap.get("state", "")).upper()
+                return state in {"WARMING", "RECONNECTING", "STALE"}
+        return False
+
+    def _resolve_live_execution_price(self, symbol: str, current_price: float) -> float:
+        """Use REST last price when WS is warming/reconnecting so entries are not dropped."""
+        if current_price > 0 and not self._ws_needs_execution_rest_price():
+            return current_price
+        rest_price = 0.0
+        if hasattr(self.exchange, "get_ticker"):
+            rest_price = safe_float(self.exchange.get_ticker(symbol))
+        if rest_price <= 0 and hasattr(self.exchange, "get_live_mark_price"):
+            rest_price = safe_float(
+                self.exchange.get_live_mark_price(symbol, allow_rest=True)
+            )
+        if rest_price > 0:
+            trade_logger.info(
+                "Execution price REST fallback %s | signal=%.6f rest=%.6f",
+                symbol,
+                current_price,
+                rest_price,
+            )
+            return rest_price
+        return current_price
 
     def _execute_trade_inner(
         self,

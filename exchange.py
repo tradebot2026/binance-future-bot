@@ -2292,6 +2292,36 @@ class BinanceExchangeManager:
             return live
         return None
 
+    def get_ticker(self, symbol: str) -> Optional[float]:
+        """
+        Last traded price for execution. Prefers a fresh WS miniTicker;
+        falls back to a throttled futures_symbol_ticker REST call.
+        """
+        symbol = symbol.upper()
+        max_age = float(max(Config.WS_STALE_SECONDS, 30))
+        if self._market_data:
+            fresh = self._market_data.get_fresh_ticker_price(
+                symbol, max_age_seconds=max_age
+            )
+            if fresh is not None and fresh > 0:
+                return fresh
+        if self.is_rest_blocked()[0]:
+            return None
+        try:
+            ticker = self._throttled_call(
+                self.client.futures_symbol_ticker,
+                symbol=symbol,
+                execution_priority=True,
+            )
+            price = safe_float(ticker.get("price"))
+            return price if price > 0 else None
+        except ExchangeRateLimitError:
+            return None
+        except Exception as exc:
+            if self._rest_block_log.should_log(f"get_ticker_{symbol}"):
+                error_logger.warning("REST ticker fetch failed for %s: %s", symbol, exc)
+            return None
+
     def get_market_price(self, symbol: str, position_side: str = "LONG") -> Optional[float]:
         if self._market_data:
             cached = self._market_data.get_price(symbol)

@@ -59,6 +59,31 @@ class TestDryRunGuard(unittest.TestCase):
         exchange.execution_context.assert_called_once()
         inner.assert_called_once()
 
+    def test_warming_ws_uses_rest_ticker_for_execution_price(self) -> None:
+        exchange = MagicMock()
+        db = MagicMock()
+        hub = MagicMock()
+        hub._reconnect_in_progress = False
+        hub.is_ws_warming_up.return_value = True
+        hub.get_ws_health_snapshot.return_value = {"state": "WARMING"}
+        exchange.get_market_data_hub.return_value = hub
+        exchange.get_ticker.return_value = 123.45
+        executor = TradeExecutor(exchange, db)
+        with patch.object(Config, "DRY_RUN", False), patch.object(
+            executor, "_execute_trade_inner", return_value={"ok": True}
+        ) as inner:
+            result = executor.execute_trade(
+                symbol="ETHUSDT",
+                action="LONG",
+                atr=1.0,
+                current_price=100.0,
+                strategy="SMC_TREND",
+                score=80.0,
+            )
+        self.assertEqual(result, {"ok": True})
+        inner.assert_called_once()
+        self.assertEqual(inner.call_args.args[3], 123.45)
+
 
 class TestForceResumeMainnetLock(unittest.TestCase):
     def test_force_resume_blocked_on_mainnet(self) -> None:
