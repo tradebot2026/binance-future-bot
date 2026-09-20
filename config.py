@@ -18,11 +18,22 @@ def _env_bool(key: str, default: bool) -> bool:
     return str(raw).strip().lower() in ("true", "1", "t", "yes")
 
 
-def _env_dry_run() -> bool:
-    """Fail-safe: missing, empty, or unrecognized DRY_RUN stays True (no live orders)."""
-    raw = os.getenv("DRY_RUN")
+def _env_use_testnet() -> bool:
+    raw = os.getenv("USE_TESTNET")
     if raw is None or not str(raw).strip():
         return True
+    return str(raw).strip().lower() in ("true", "1", "t", "yes")
+
+
+def _env_dry_run() -> bool:
+    """
+    Explicit DRY_RUN wins. If missing/empty: False on testnet (live test orders),
+    True on mainnet (fail-closed — no live money without an explicit flag).
+    Unrecognized values stay True.
+    """
+    raw = os.getenv("DRY_RUN")
+    if raw is None or not str(raw).strip():
+        return not _env_use_testnet()
     value = str(raw).strip().lower()
     if value in ("false", "0", "f", "no"):
         return False
@@ -52,7 +63,7 @@ class Config:
     # ---------------- API & network ----------------
     BINANCE_API_KEY: str = os.getenv("BINANCE_API_KEY", "")
     BINANCE_API_SECRET: str = os.getenv("BINANCE_API_SECRET", "")
-    USE_TESTNET: bool = _env_bool("USE_TESTNET", True)
+    USE_TESTNET: bool = _env_use_testnet()
     DRY_RUN: bool = _env_dry_run()
     ALLOW_MAINNET_FORCE_RESUME: bool = _env_bool(
         "ALLOW_MAINNET_FORCE_RESUME", False
@@ -66,8 +77,9 @@ class Config:
     INIT_REST_DELAY_SECONDS: float = _env_float("INIT_REST_DELAY_SECONDS", 0.5)
     ENABLE_WEBSOCKET_STREAMS: bool = _env_bool("ENABLE_WEBSOCKET_STREAMS", True)
     WS_STALE_SECONDS: int = _env_int("WS_STALE_SECONDS", 30)
-    WS_STALE_SECONDS_TESTNET: int = _env_int("WS_STALE_SECONDS_TESTNET", 30)
+    WS_STALE_SECONDS_TESTNET: int = _env_int("WS_STALE_SECONDS_TESTNET", 60)
     WS_PING_INTERVAL_SECONDS: float = _env_float("WS_PING_INTERVAL_SECONDS", 15.0)
+    WS_PING_TIMEOUT_SECONDS: float = _env_float("WS_PING_TIMEOUT_SECONDS", 10.0)
     WS_USER_STALE_SECONDS: int = _env_int("WS_USER_STALE_SECONDS", 120)
     WS_USER_IDLE_RECONNECT_SECONDS: int = _env_int(
         "WS_USER_IDLE_RECONNECT_SECONDS", 1800

@@ -48,8 +48,12 @@ class RiskEngine:
         Hard reject when any risk rule fails.
         Score is informational only — never bypasses limits.
         """
-        if self.scheduler is not None and self.scheduler.is_entry_paused():
-            return False, "Scheduler paused entries (daily limit or manual pause)"
+        if self.scheduler is not None:
+            paused, pause_reason = self.scheduler.is_entry_paused()
+            if paused:
+                return False, pause_reason or (
+                    "Scheduler paused entries (daily limit or manual pause)"
+                )
 
         snapshot = self.risk.get_risk_snapshot()
         if not snapshot.entries_allowed:

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import random
+import inspect
 import threading
 import time
 from contextlib import contextmanager
@@ -191,12 +192,16 @@ class BinanceExchangeManager:
         self.api_secret = Config.BINANCE_API_SECRET
         self.testnet = Config.USE_TESTNET
 
-        self.client = Client(
-            api_key=self.api_key,
-            api_secret=self.api_secret,
-            testnet=self.testnet,
-            requests_params={"timeout": Config.REQUEST_TIMEOUT},
-        )
+        client_kwargs: dict[str, Any] = {
+            "api_key": self.api_key,
+            "api_secret": self.api_secret,
+            "testnet": self.testnet,
+            "requests_params": {"timeout": Config.REQUEST_TIMEOUT},
+        }
+        client_params = inspect.signature(Client.__init__).parameters
+        if "strict_rate_limit" in client_params:
+            client_kwargs["strict_rate_limit"] = Config.ENABLE_STRICT_RATE_LIMIT
+        self.client = Client(**client_kwargs)
         self.recv_window_param = {"recvWindow": 60000}
 
         self._rules_lock = threading.RLock()

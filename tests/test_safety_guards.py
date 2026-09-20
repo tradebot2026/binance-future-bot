@@ -29,16 +29,35 @@ class TestDryRunGuard(unittest.TestCase):
         self.assertIsNone(result)
         exchange.execution_context.assert_not_called()
 
-    def test_missing_or_empty_dry_run_defaults_true(self) -> None:
-        with patch.dict(os.environ, {}, clear=False):
+    def test_missing_or_empty_dry_run_follows_network(self) -> None:
+        with patch.dict(os.environ, {"USE_TESTNET": "true"}, clear=False):
             os.environ.pop("DRY_RUN", None)
-            self.assertTrue(_env_dry_run())
-        with patch.dict(os.environ, {"DRY_RUN": "  "}, clear=False):
+            self.assertFalse(_env_dry_run())
+        with patch.dict(os.environ, {"USE_TESTNET": "false", "DRY_RUN": "  "}, clear=False):
             self.assertTrue(_env_dry_run())
         with patch.dict(os.environ, {"DRY_RUN": "false"}, clear=False):
             self.assertFalse(_env_dry_run())
         with patch.dict(os.environ, {"DRY_RUN": "true"}, clear=False):
             self.assertTrue(_env_dry_run())
+
+    def test_execute_trade_places_order_when_dry_run_false(self) -> None:
+        exchange = MagicMock()
+        db = MagicMock()
+        executor = TradeExecutor(exchange, db)
+        with patch.object(Config, "DRY_RUN", False), patch.object(
+            executor, "_execute_trade_inner", return_value={"ok": True}
+        ) as inner:
+            result = executor.execute_trade(
+                symbol="ETHUSDT",
+                action="LONG",
+                atr=1.0,
+                current_price=100.0,
+                strategy="SMC_TREND",
+                score=80.0,
+            )
+        self.assertEqual(result, {"ok": True})
+        exchange.execution_context.assert_called_once()
+        inner.assert_called_once()
 
 
 class TestForceResumeMainnetLock(unittest.TestCase):
@@ -68,6 +87,65 @@ class TestForceResumeMainnetLock(unittest.TestCase):
             note = scheduler.force_resume_entries()
         self.assertFalse(note.startswith("BLOCKED"))
         scheduler.controller.force_resume_daily_limits.assert_called_once()
+
+
+class TestSchedulerPauseTuple(unittest.TestCase):
+    def test_risk_engine_does_not_block_when_scheduler_unpaused(self) -> None:
+        from core.risk_engine import RiskEngine
+        from risk_manager import RiskSnapshot
+
+        scheduler = MagicMock()
+        scheduler.is_entry_paused.return_value = (False, "")
+        risk = MagicMock()
+        risk.get_risk_snapshot.return_value = RiskSnapshot(
+            open_positions=0,
+            exchange_open_positions=0,
+            daily_entries=0,
+            daily_trades=0,
+            consecutive_losses=0,
+            drawdown_percent=0.0,
+            current_balance=1000.0,
+            daily_realized_pnl=0.0,
+            daily_realized_pnl_percent=0.0,
+            unrealized_pnl=0.0,
+            entries_allowed=True,
+            block_reason="",
+        )
+        risk.can_open_trade.return_value = (True, "")
+        engine = RiskEngine(risk, MagicMock(), MagicMock(), scheduler=scheduler)
+        ok, reason = engine.approve_entry("BTCUSDT", "SMC_TREND", 50000.0)
+        self.assertTrue(ok, reason)
+        self.assertEqual(reason, "")
+
+    def test_risk_engine_blocks_only_when_pause_flag_true(self) -> None:
+        from core.risk_engine import RiskEngine
+
+        scheduler = MagicMock()
+        scheduler.is_entry_paused.return_value = (
+            True,
+            "Daily limit already reached — entries paused for today.",
+        )
+        engine = RiskEngine(MagicMock(), MagicMock(), MagicMock(), scheduler=scheduler)
+        ok, reason = engine.approve_entry("BTCUSDT", "SMC_TREND", 50000.0)
+        self.assertFalse(ok)
+        self.assertIn("paused", reason.lower())
+
+    def test_utc_rollover_reinitializes_active_day(self) -> None:
+        scheduler = DailyScheduler.__new__(DailyScheduler)
+        scheduler.controller = MagicMock()
+        scheduler.telegram = None
+        scheduler.exchange = MagicMock()
+        scheduler.db = MagicMock()
+        scheduler.today_str = "2026-09-19"
+        scheduler._last_limit_check_at = 99.0
+        with patch(
+            "scheduler.utc_today_str", return_value="2026-09-20"
+        ), patch.object(scheduler, "_initialize_trading_day") as init_day:
+            scheduler._handle_day_rollover()
+        self.assertEqual(scheduler.today_str, "2026-09-20")
+        self.assertEqual(scheduler._last_limit_check_at, 0.0)
+        scheduler.controller.clear_daily_limit_override.assert_called_once()
+        init_day.assert_called_once_with(force_balance_refresh=True)
 
 
 class TestMergedPositionMonitor(unittest.TestCase):

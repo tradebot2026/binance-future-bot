@@ -317,7 +317,17 @@ class RiskManager:
         metrics = compute_daily_pnl_metrics(self.exchange, self.db, today)
         stats = self.db.get_daily_stats(today) or {}
         if stats.get("status") == DAILY_STATUS_PAUSED:
-            return True, "Daily limit already reached — entries paused for today."
+            still_in_breach = daily_profit_target_reached(
+                metrics
+            ) or daily_max_loss_reached(metrics)
+            if still_in_breach:
+                return True, "Daily limit already reached — entries paused for today."
+            balance = metrics.current_wallet if metrics.current_wallet > 0 else 0.0
+            self.db.set_daily_status(today, DAILY_STATUS_ACTIVE, balance)
+            system_logger.info(
+                "Daily PAUSED status cleared for %s — limits not in breach.",
+                today,
+            )
         if metrics.start_balance <= 0:
             return False, ""
 
@@ -390,7 +400,20 @@ class RiskManager:
         daily_override = self._daily_limit_override_active()
 
         if not daily_override and daily_stats.get("status") == DAILY_STATUS_PAUSED:
-            block_reason = "Daily PnL limit reached — entries paused for today."
+            still_in_breach = daily_profit_target_reached(
+                pnl_metrics
+            ) or daily_max_loss_reached(pnl_metrics)
+            if still_in_breach:
+                block_reason = "Daily PnL limit reached — entries paused for today."
+            else:
+                self.db.set_daily_status(
+                    today,
+                    DAILY_STATUS_ACTIVE,
+                    pnl_metrics.current_wallet if pnl_metrics.current_wallet > 0 else current_balance,
+                )
+
+        if block_reason:
+            pass
         elif exchange_open >= Config.MAX_POSITIONS:
             block_reason = (
                 f"Max open positions reached on exchange "

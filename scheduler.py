@@ -172,7 +172,23 @@ class DailyScheduler:
         stats = self.db.get_daily_stats(self.today_str) or stats
 
         if stats.get("status") == DAILY_STATUS_PAUSED:
-            return True, "Daily limit already reached — entries paused for today."
+            still_in_breach = daily_profit_target_reached(
+                metrics
+            ) or daily_max_loss_reached(metrics)
+            if still_in_breach:
+                return True, "Daily limit already reached — entries paused for today."
+            balance = (
+                metrics.current_wallet
+                if metrics.current_wallet > 0
+                else self._get_balance(force_refresh=False)
+            )
+            self.db.set_daily_status(
+                self.today_str, DAILY_STATUS_ACTIVE, balance
+            )
+            system_logger.info(
+                "Daily PAUSED status cleared for %s — profit/loss limits not in breach.",
+                self.today_str,
+            )
 
         now = time.monotonic()
         if now - self._last_limit_check_at < self._limit_check_interval:
@@ -268,7 +284,11 @@ class DailyScheduler:
         self._last_limit_check_at = 0.0
         if self.controller:
             self.controller.clear_daily_limit_override()
-        self._initialize_trading_day(force_balance_refresh=False)
+        self._initialize_trading_day(force_balance_refresh=True)
+        system_logger.info(
+            "UTC day %s reset — daily counters ACTIVE, entries unlocked.",
+            current_day,
+        )
 
         if self.telegram:
             self.telegram.send_message(

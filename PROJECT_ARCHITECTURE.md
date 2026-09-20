@@ -108,7 +108,7 @@ flowchart LR
 | Notifications | `pyTelegramBotAPI` |
 | Concurrency | `threading` (monitor, Telegram, WebSocket, close worker) |
 
-Default `USE_TESTNET=True`. `DRY_RUN=True` (default) scans and validates but never places orders.
+Default `USE_TESTNET=True`. `DRY_RUN=False` on testnet so validated signals place live Testnet orders. Missing `DRY_RUN` on mainnet stays `True` (fail-closed).
 
 ### 1.4 Scan Path Flags
 
@@ -117,7 +117,7 @@ Default `USE_TESTNET=True`. `DRY_RUN=True` (default) scans and validates but nev
 | `ENABLE_EVENT_DRIVEN_SCAN` | `True` | Documented intent; main loop is always event-driven |
 | `USE_UNIFIED_SCAN_PIPELINE` | `False` | Ignored by `main.py` (wrappers remain on `scanner.py` for tests) |
 | `ENABLE_PORTFOLIO_ALLOCATOR` | `True` | Margin/slot budget on the event path |
-| `DRY_RUN` | `True` | Hard stop in `executor.execute_trade` before REST orders |
+| `DRY_RUN` | `False` on testnet | Hard stop in `executor.execute_trade` only when True |
 
 Do not add a fourth scan loop. Ranking lives inside `UniverseBuilder` / `OpportunityTracker`.
 
@@ -140,7 +140,7 @@ Scan, ranking, and sub-scans run under `exchange.scan_context()` which **blocks 
 
 #### Staleness & halt
 
-- Ticker / bookTicker stale: `WS_STALE_SECONDS` (30s). Watchdog force-resets `miniTicker`, `bookTicker`, and `userData`. `/health` is `HEALTHY` only after a live tick.
+- Ticker / bookTicker stale: `WS_STALE_SECONDS` (30s mainnet) / `WS_STALE_SECONDS_TESTNET` (60s). Watchdog force-resets `miniTicker`, `bookTicker`, and `userData`. `/health` is `HEALTHY` only after a live tick. Ping/pong: 15s / 10s. Silent REST ticker poll while sockets reconnect.
 - `-1003` IP ban → `halt_scanning()`; scanner returns empty; monitor continues
 - Startup `futures_ping()` defers REST init if already banned
 
@@ -373,7 +373,7 @@ See `.env.example` for the full list. Critical flags:
 
 ```env
 USE_TESTNET=True
-DRY_RUN=True
+DRY_RUN=False
 ALLOW_MAINNET_FORCE_RESUME=False
 
 ENABLE_EVENT_DRIVEN_SCAN=True
