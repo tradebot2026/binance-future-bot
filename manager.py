@@ -26,7 +26,7 @@ from constants import (
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from exceptions import OrderExecutionError, PositionAlreadyClosedError
-from logger import error_logger, trade_logger
+from logger import error_logger, system_logger, trade_logger
 from core.trade_close_mutex import trade_close_mutex
 from exit_coordinator import (
     claim_exit,
@@ -111,6 +111,19 @@ class TradeManager:
         from core.ops_heartbeat import touch_monitor_loop
 
         touch_monitor_loop(source="manager_init")
+        system_logger.info(
+            "Position monitor started (ws_eval=1s, rest_refresh=%ss).",
+            Config.MONITOR_INTERVAL_SECONDS,
+        )
+
+    @property
+    def stop_event(self) -> threading.Event:
+        return self._monitor_stop
+
+    def stop(self) -> None:
+        """Stop TP/SL, tick, and close-order worker threads."""
+        self._monitor_stop.set()
+        self._tick_event.set()
 
     def _register_open_trade_symbols(self) -> None:
         """Ensure every open DB trade receives miniTicker-driven TP/SL evaluation."""
@@ -165,16 +178,25 @@ class TradeManager:
                     )
 
     def _fast_monitor_loop(self) -> None:
-        """Dedicated 1s TP/SL loop with live price REST fallback when WS ticks stall."""
+        """Single TP/SL loop: WS-only each second, REST mark/position refresh on interval."""
         from core.ops_heartbeat import touch_monitor_loop
 
+        last_rest_refresh = 0.0
         while not self._monitor_stop.wait(1.0):
             try:
-                self._prefetch_live_prices_for_open_trades()
-                self.monitor_open_trades(ws_only=True)
+                now = time.monotonic()
+                rest_due = (now - last_rest_refresh) >= max(
+                    Config.MONITOR_INTERVAL_SECONDS, 1
+                )
+                if rest_due:
+                    self._prefetch_live_prices_for_open_trades()
+                    self.monitor_open_trades(ws_only=False)
+                    last_rest_refresh = now
+                else:
+                    self.monitor_open_trades(ws_only=True)
                 touch_monitor_loop(source="position_monitor")
             except Exception as exc:
-                error_logger.error("Fast TP/SL monitor error: %s", exc, exc_info=True)
+                error_logger.error("Position monitor error: %s", exc, exc_info=True)
                 error_logger.error(traceback.format_exc())
 
     def _trade_quantity_from_db(self, trade: dict[str, Any]) -> float:

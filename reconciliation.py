@@ -391,6 +391,11 @@ def symbol_blocked_for_new_entry(
     """
     symbol = symbol.upper()
 
+    from core.entry_in_flight_mutex import is_symbol_entry_in_flight
+
+    if is_symbol_entry_in_flight(symbol):
+        return True, f"Entry in flight for {symbol}"
+
     if db.get_open_trades_for_symbol(symbol):
         return True, f"Active DB trade exists for {symbol}"
 

@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 
 from config import Config
 from core.types import AllocationResult, SignalCandidate
+from exceptions import DatabaseError
 from reconciliation import symbol_blocked_for_new_entry
 from utils import cap_quantity_to_notional, minimum_order_quantity, safe_float
 
@@ -25,6 +26,15 @@ class PortfolioAllocator:
         "VWAP_PULLBACK": "STRATEGY_BUDGET_VWAP",
         "VOLUME_PROFILE_BREAKOUT": "STRATEGY_BUDGET_VPB",
         "VOL_EXPANSION_MR": "STRATEGY_BUDGET_VEMR",
+        "BREAKOUT_RETEST": "STRATEGY_BUDGET_BREAKOUT_RETEST",
+        "FALSE_BREAKOUT_SFP": "STRATEGY_BUDGET_FALSE_BREAKOUT_SFP",
+        "VOL_SQUEEZE": "STRATEGY_BUDGET_VOL_SQUEEZE",
+        "TREND_MOMENTUM": "STRATEGY_BUDGET_TREND_MOMENTUM",
+        "PRICE_ACTION_REVERSAL": "STRATEGY_BUDGET_PRICE_ACTION_REVERSAL",
+        "MTF_ALIGNMENT": "STRATEGY_BUDGET_MTF_ALIGNMENT",
+        "VP_KEYLEVEL": "STRATEGY_BUDGET_VP_KEYLEVEL",
+        "ORDER_FLOW": "STRATEGY_BUDGET_ORDER_FLOW",
+        "OI_FUNDING": "STRATEGY_BUDGET_OI_FUNDING",
     }
 
     STRATEGY_SLOT_KEYS = {
@@ -35,6 +45,15 @@ class PortfolioAllocator:
         "VWAP_PULLBACK": "MAX_VWAP_POSITIONS",
         "VOLUME_PROFILE_BREAKOUT": "MAX_VPB_POSITIONS",
         "VOL_EXPANSION_MR": "MAX_VEMR_POSITIONS",
+        "BREAKOUT_RETEST": "MAX_BREAKOUT_RETEST_POSITIONS",
+        "FALSE_BREAKOUT_SFP": "MAX_FALSE_BREAKOUT_SFP_POSITIONS",
+        "VOL_SQUEEZE": "MAX_VOL_SQUEEZE_POSITIONS",
+        "TREND_MOMENTUM": "MAX_TREND_MOMENTUM_POSITIONS",
+        "PRICE_ACTION_REVERSAL": "MAX_PRICE_ACTION_REVERSAL_POSITIONS",
+        "MTF_ALIGNMENT": "MAX_MTF_ALIGNMENT_POSITIONS",
+        "VP_KEYLEVEL": "MAX_VP_KEYLEVEL_POSITIONS",
+        "ORDER_FLOW": "MAX_ORDER_FLOW_POSITIONS",
+        "OI_FUNDING": "MAX_OI_FUNDING_POSITIONS",
     }
 
     def __init__(
@@ -67,7 +86,12 @@ class PortfolioAllocator:
         if paused:
             return AllocationResult(False, reason=reason)
 
-        open_for_strategy = self.db.count_active_trades_by_strategy(candidate.strategy)
+        try:
+            open_for_strategy = self.db.count_active_trades_by_strategy(
+                candidate.strategy
+            )
+        except DatabaseError as exc:
+            return AllocationResult(False, reason=f"database_unavailable:{exc}")
         max_slots = self._max_slots(candidate.strategy)
         if open_for_strategy >= max_slots:
             return AllocationResult(

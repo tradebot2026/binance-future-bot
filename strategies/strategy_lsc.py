@@ -7,19 +7,19 @@ from typing import TYPE_CHECKING, Optional, Set
 from config import Config
 from constants import STRATEGY_LIQUIDITY_SWEEP
 from core.directional import pick_directional_candidate
-from core.strategy_base import StrategyModule
+from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, RegimeLabel, SignalCandidate
 from indicators.market_analyzer import MarketAnalyzer
 from logger import signal_logger
-from lsc_engine import evaluate_lsc_setup
+from engines.lsc_engine import evaluate_lsc_setup
 from utils import safe_float
 
 if TYPE_CHECKING:
     from database import DatabaseManager
 
 
-class LiquiditySweepStrategy(StrategyModule):
+class LiquiditySweepStrategy(BaseStrategy):
     tag = STRATEGY_LIQUIDITY_SWEEP
     display_name = "Liquidity Sweep Continuation"
 
@@ -65,7 +65,7 @@ class LiquiditySweepStrategy(StrategyModule):
             return Config.HALF_SIZE_MULTIPLIER
         return 0.0
 
-    def evaluate(self, snapshot: MarketSnapshot) -> Optional[SignalCandidate]:
+    def _evaluate_legacy(self, snapshot: MarketSnapshot) -> Optional[SignalCandidate]:
         df_entry = snapshot.candles.get(self.entry_tf)
         df_confirm = snapshot.candles.get(self.confirm_tf)
         if df_entry is None or df_confirm is None or df_entry.empty:

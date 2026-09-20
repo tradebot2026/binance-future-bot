@@ -7,18 +7,18 @@ from typing import TYPE_CHECKING, Optional, Set
 from config import Config
 from constants import STRATEGY_VP_BREAKOUT
 from core.directional import pick_directional_candidate
-from core.strategy_base import StrategyModule
+from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, RegimeLabel, SignalCandidate
 from indicators.market_analyzer import MarketAnalyzer
 from logger import signal_logger
-from vp_breakout_engine import evaluate_vp_breakout
+from engines.vp_breakout_engine import evaluate_vp_breakout
 
 if TYPE_CHECKING:
     from database import DatabaseManager
 
 
-class VpBreakoutStrategy(StrategyModule):
+class VpBreakoutStrategy(BaseStrategy):
     tag = STRATEGY_VP_BREAKOUT
     display_name = "Volume Profile Breakout"
 
@@ -70,7 +70,7 @@ class VpBreakoutStrategy(StrategyModule):
             return Config.HALF_SIZE_MULTIPLIER
         return 0.0
 
-    def evaluate(self, snapshot: MarketSnapshot) -> Optional[SignalCandidate]:
+    def _evaluate_legacy(self, snapshot: MarketSnapshot) -> Optional[SignalCandidate]:
         if not snapshot.is_top_volume:
             return None
 

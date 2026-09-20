@@ -9,6 +9,7 @@ from config import Config
 from core.bot_health import touch_scan_cycle
 from core.assignment_manager import AssignmentManager
 from core.event_scheduler import EventScheduler
+from core.portfolio_allocator import PortfolioAllocator
 from core.scan_priority_queue import ScanPriorityQueue
 from core.scoring_engine import ScoringEngine
 from core.symbol_conflict_guard import SymbolConflictGuard
@@ -35,14 +36,15 @@ class EventScanOrchestrator:
     ) -> None:
         self.exchange = exchange
         self.db = db
-        self.registry = build_strategy_registry(db=db)
+        self.registry = build_strategy_registry(db=db, exchange=exchange)
         self.universe_builder = UniverseBuilder(exchange, db)
         self.snapshot_factory = SnapshotFactory(exchange)
-        self.scoring_engine = ScoringEngine(self.registry)
+        self.scoring_engine = ScoringEngine(self.registry, exchange=exchange)
         self.assignment_manager = AssignmentManager()
         self.event_scheduler = EventScheduler()
         self.priority_queue = ScanPriorityQueue()
         self.conflict_guard = SymbolConflictGuard(exchange, db)
+        self.portfolio_allocator = PortfolioAllocator(exchange, db)
         self._hub = getattr(exchange, "_market_data", None)
         self._tier1_symbols: list[str] = []
         self._price_map: dict[str, float] = {}
@@ -78,14 +80,15 @@ class EventScanOrchestrator:
         universe = self.universe_builder.build()
         pool_cap = min(len(universe.symbols), Config.TOP_UNIVERSE_POOL_SIZE)
         self._tier1_symbols = universe.symbols[:pool_cap]
-        trigger_scores = {
-            sym: score.normalized_score
-            for sym, score in self.assignment_manager._last_best.items()
-        }
+        trigger_scores = dict(universe.opportunity_scores)
+        for sym, score in self.assignment_manager._last_best.items():
+            trigger_scores.setdefault(sym, score.normalized_score)
         self.priority_queue.update(
             self._tier1_symbols,
             extended_symbols=universe.extended_symbols,
             trigger_scores=trigger_scores,
+            lifecycle=universe.lifecycle,
+            fast_track=universe.hot_symbols,
         )
         self._price_map = universe.price_map
         self._volume_ranks = universe.volume_ranks
@@ -95,12 +98,13 @@ class EventScanOrchestrator:
             self._hub.subscribe_kline_streams(self._tier1_symbols)
 
         scanner_logger.info(
-            "Tier1 watchlist refreshed — pool=%s active_watch=%s background=%s "
-            "evaluated=%s (pool_cap=%s).",
+            "Tier1 watchlist refreshed — pool=%s priority=%s rotating=%s "
+            "evaluated=%s hot_fast_track=%s (pool_cap=%s).",
             len(self._tier1_symbols),
             len(self.priority_queue.hot_symbols),
             len(self.priority_queue.background_symbols),
             self.priority_queue.rotation.evaluated_count,
+            len(universe.hot_symbols),
             Config.TOP_UNIVERSE_POOL_SIZE,
         )
         return self._tier1_symbols
@@ -175,7 +179,9 @@ class EventScanOrchestrator:
 
         self.run_catchup()
         self.conflict_guard.reset_cycle()
-        candidates = self._process_due_event_candidates()
+        candidates = self._dedupe_symbol_candidates(
+            self._process_due_event_candidates()
+        )
         dict_results = [c.to_dict() for c in candidates]
         if dict_results:
             self.db.update_watchlist(dict_results)
@@ -204,10 +210,13 @@ class EventScanOrchestrator:
         self.run_catchup()
         self.conflict_guard.reset_cycle()
 
+        self._fast_track_live_spikes()
+
         candidates: list[SignalCandidate] = []
         candidates.extend(self.process_hot_scan_cycle())
         candidates.extend(self.process_background_scan_cycle())
         candidates.extend(self._process_due_event_candidates())
+        candidates = self._dedupe_symbol_candidates(candidates)
 
         universe_total = len(self.priority_queue.full_universe) or len(
             self._tier1_symbols
@@ -237,8 +246,8 @@ class EventScanOrchestrator:
             return []
 
         open_symbols = self._open_symbols()
-        ticker_map = self.exchange.get_futures_ticker_map()
-        book_map = self.exchange.get_book_ticker_map()
+        ticker_map = self._ws_ticker_map()
+        book_map = self._ws_book_map(ticker_map)
         trigger_tfs = Config.get_scan_trigger_timeframes()
         primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
         candidates: list[SignalCandidate] = []
@@ -279,9 +288,15 @@ class EventScanOrchestrator:
         if not batch:
             return []
 
+        hot_set = {s.upper() for s in self.priority_queue.hot_symbols}
+        batch = [symbol for symbol in batch if symbol.upper() not in hot_set]
+        if not batch:
+            self.priority_queue.mark_last_background_batch_evaluated()
+            return []
+
         open_symbols = self._open_symbols()
-        ticker_map = self.exchange.get_futures_ticker_map()
-        book_map = self.exchange.get_book_ticker_map()
+        ticker_map = self._ws_ticker_map()
+        book_map = self._ws_book_map(ticker_map)
         trigger_tfs = Config.get_scan_trigger_timeframes()
         primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
         candidates: list[SignalCandidate] = []
@@ -320,8 +335,8 @@ class EventScanOrchestrator:
             return []
 
         open_symbols = self._open_symbols()
-        ticker_map = self.exchange.get_futures_ticker_map()
-        book_map = self.exchange.get_book_ticker_map()
+        ticker_map = self._ws_ticker_map()
+        book_map = self._ws_book_map(ticker_map)
         candidates: list[SignalCandidate] = []
 
         with self.exchange.scan_context():
@@ -358,7 +373,10 @@ class EventScanOrchestrator:
         mark_event: Optional[CandleCloseEvent] = None,
     ) -> Optional[SignalCandidate]:
         symbol = symbol.upper()
-        if self.priority_queue.rotation.is_in_evaluated_memory(symbol):
+        if (
+            self.priority_queue.rotation.is_in_evaluated_memory(symbol)
+            and not self.priority_queue.is_priority(symbol)
+        ):
             scanner_logger.debug(
                 "Skip %s — in evaluated memory (rotation cooldown).", symbol
             )
@@ -459,6 +477,27 @@ class EventScanOrchestrator:
             self.conflict_guard.reject_with_log(signal, reason)
             return None
 
+        signal = self._apply_portfolio_allocator(signal)
+        if signal is None:
+            return None
+
+        rec = self.universe_builder.tracker.get(symbol)
+        if rec is not None:
+            meta = dict(signal.structure_metadata or {})
+            meta.update(
+                {
+                    "opportunity_score": rec.score,
+                    "score_velocity": rec.velocity,
+                    "relative_rank": rec.relative_rank,
+                    "lifecycle": rec.lifecycle.value,
+                    "channel_momentum": rec.channels.momentum,
+                    "channel_reversal": rec.channels.reversal,
+                    "channel_structure": rec.channels.structure,
+                    "dominant_channel": rec.channels.dominant,
+                }
+            )
+            signal.structure_metadata = meta
+
         self.db.log_signal(
             {
                 "symbol": signal.symbol,
@@ -472,6 +511,46 @@ class EventScanOrchestrator:
             }
         )
         return signal
+
+    def _apply_portfolio_allocator(
+        self, signal: SignalCandidate
+    ) -> Optional[SignalCandidate]:
+        """Margin/slot budget gate — skipped when ENABLE_PORTFOLIO_ALLOCATOR=False."""
+        if not Config.ENABLE_PORTFOLIO_ALLOCATOR:
+            return signal
+        alloc = self.portfolio_allocator.approve(signal)
+        if not alloc.approved:
+            self.conflict_guard.reject_with_log(
+                signal, alloc.reason, context="allocator"
+            )
+            return None
+        meta = dict(signal.structure_metadata or {})
+        meta["risk_budget_usdt"] = alloc.risk_budget_usdt
+        meta["allocator_size_multiplier"] = alloc.size_multiplier
+        signal.structure_metadata = meta
+        return signal
+
+    @staticmethod
+    def _dedupe_symbol_candidates(
+        candidates: list[SignalCandidate],
+    ) -> list[SignalCandidate]:
+        """Keep one candidate per symbol — first channel wins ties, higher score replaces."""
+        if len(candidates) < 2:
+            return candidates
+        best: dict[str, SignalCandidate] = {}
+        order: list[str] = []
+        for candidate in candidates:
+            key = candidate.symbol.upper()
+            existing = best.get(key)
+            if existing is None:
+                best[key] = candidate
+                order.append(key)
+                continue
+            if candidate.adjusted_score > existing.adjusted_score:
+                best[key] = candidate
+        if len(best) == len(candidates):
+            return candidates
+        return [best[key] for key in order]
 
     def _process_event(
         self,
@@ -490,6 +569,41 @@ class EventScanOrchestrator:
             book_map=book_map,
             mark_event=event,
         )
+
+    def _fast_track_live_spikes(self) -> None:
+        """Promote WS volume/volatility spikes onto the priority queue this cycle."""
+        try:
+            hot = self.universe_builder.observe_live_tickers()
+        except Exception:
+            return
+        if not hot:
+            return
+        promoted = self.priority_queue.fast_track(hot)
+        if not promoted:
+            return
+        cap = max(Config.TIER1_WATCHLIST_SIZE, Config.TOP_UNIVERSE_POOL_SIZE)
+        existing = {s.upper() for s in self._tier1_symbols}
+        for sym in promoted:
+            if sym not in existing and len(self._tier1_symbols) < cap:
+                self._tier1_symbols.append(sym)
+                existing.add(sym)
+        if self._hub:
+            self._hub.subscribe_kline_streams(promoted)
+        scanner_logger.info(
+            "Fast-track priority queue +%s symbols (%s).",
+            len(promoted),
+            ", ".join(promoted[:8]),
+        )
+
+    def _ws_ticker_map(self) -> dict[str, Any]:
+        if self._hub:
+            return self._hub.get_ticker_map() or {}
+        return {}
+
+    def _ws_book_map(self, ticker_map: dict[str, Any]) -> dict[str, Any]:
+        if self._hub and self._hub.has_ws_book_data():
+            return self._hub.get_ws_book_ticker_map()
+        return self.universe_builder._ws_book_map(ticker_map)
 
     def _open_symbols(self) -> set[str]:
         try:

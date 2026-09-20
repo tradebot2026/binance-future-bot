@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import threading
 import time
 import traceback
 from typing import Any, Optional
@@ -18,7 +17,7 @@ from bot_controller import BotController
 from config import Config
 from critical_alerts import CriticalAlertService
 from constants import STRATEGY_SMC_TREND, is_range_strategy
-from smc_engine import effective_smc_min_score
+from engines.smc_engine import effective_smc_min_score
 from core.scoring_engine import ScoringEngine
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
@@ -31,6 +30,7 @@ from reconciliation import reconcile_positions, reconcile_positions_at_startup
 from scheduler import DailyScheduler
 from telegram_bot import TelegramManager
 from utils import safe_float, utc_today_str
+from core.monitor_watchdog import start_monitor_watchdog
 
 try:
     from reporter import ReportGenerator
@@ -114,8 +114,18 @@ def _startup_banner() -> None:
     mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
     system_logger.info("=" * 60)
     system_logger.info("Binance Futures Trading Bot starting (%s)", mode)
+    if Config.DRY_RUN:
+        system_logger.warning("DRY_RUN=True — live orders are disabled.")
+    else:
+        system_logger.warning(
+            "DRY_RUN=False — live orders are enabled. Keep DRY_RUN=True until paper-validated."
+        )
+    if Config.USE_UNIFIED_SCAN_PIPELINE or not Config.ENABLE_EVENT_DRIVEN_SCAN:
+        system_logger.warning(
+            "Unified/legacy scan flags are ignored — main loop is event-driven only."
+        )
     system_logger.info(
-        "Loop interval=%ss | max_positions=%s | scan=%s | reporter=%s",
+        "Loop interval=%ss | max_positions=%s | scan=%s (event-driven) | reporter=%s",
         Config.SCAN_INTERVAL_SECONDS,
         Config.MAX_POSITIONS,
         "ready" if SCANNER_AVAILABLE else "MISSING",
@@ -233,7 +243,23 @@ def _execute_candidates(
     if not candidates:
         return
 
+    from core.risk_engine import RiskEngine
+    from strategies import build_strategy_registry
+
+    risk_engine = RiskEngine(
+        risk,
+        db,
+        executor.exchange,
+        scheduler=scheduler,
+        registry=build_strategy_registry(db, exchange=executor.exchange),
+    )
+
     system_logger.info("Dispatching %s execution candidate(s) to executor.", len(candidates))
+    if Config.DRY_RUN:
+        system_logger.warning(
+            "DRY_RUN — %s candidate(s) will not place live orders.",
+            len(candidates),
+        )
 
     for candidate in candidates:
         if entries_this_cycle >= Config.MAX_ENTRIES_PER_CYCLE:
@@ -262,10 +288,11 @@ def _execute_candidates(
                 log_execution_rejected(symbol, f"entry gate closed — {gate_reason}")
                 break
 
-            allowed, reason = risk.can_open_trade(
+            allowed, reason = risk_engine.approve_entry(
                 symbol,
-                strategy=normalized["strategy"],
-                entry_price=normalized["price"],
+                normalized["strategy"],
+                normalized["price"],
+                score=normalized["score"],
             )
             if not allowed:
                 log_execution_rejected(symbol, reason, strategy=normalized["strategy"])
@@ -354,34 +381,6 @@ def _write_bot_heartbeat(cycle: int) -> None:
     from core.ops_heartbeat import touch_main_loop
 
     touch_main_loop(cycle=cycle)
-
-
-def _start_position_monitor(
-    manager: TradeManager,
-    stop_event: threading.Event,
-) -> threading.Thread:
-    """Run position monitoring in a background thread every MONITOR_INTERVAL_SECONDS."""
-
-    def _monitor_loop() -> None:
-        from core.ops_heartbeat import touch_monitor_loop
-
-        while not stop_event.is_set():
-            try:
-                manager._prefetch_live_prices_for_open_trades()
-                manager.monitor_open_trades()
-                touch_monitor_loop(source="slow_position_monitor")
-            except Exception as exc:
-                error_logger.error("Background monitor error: %s", exc)
-                error_logger.error(traceback.format_exc())
-            stop_event.wait(Config.MONITOR_INTERVAL_SECONDS)
-
-    thread = threading.Thread(target=_monitor_loop, name="position-monitor", daemon=True)
-    thread.start()
-    system_logger.info(
-        "Background position monitor started (interval=%ss).",
-        Config.MONITOR_INTERVAL_SECONDS,
-    )
-    return thread
 
 
 def _handle_loop_error(
@@ -510,7 +509,7 @@ def main(controller: Optional[BotController] = None) -> str:
     risk = RiskManager(exchange, db, controller=controller)
 
     tg: Optional[TelegramManager] = None
-    monitor_stop = threading.Event()
+    manager: Optional[TradeManager] = None
     shutdown_done = False
     try:
         tg = TelegramManager(
@@ -540,7 +539,10 @@ def main(controller: Optional[BotController] = None) -> str:
 
         tg.start_listening()
         mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
-        tg.send_message(f"🚀 <b>Bot started</b> and connected to Binance ({mode}).")
+        dry = " | DRY_RUN (no live orders)" if Config.DRY_RUN else ""
+        tg.send_message(
+            f"🚀 <b>Bot started</b> and connected to Binance ({mode}){dry}."
+        )
 
         if scanner is not None and scanner.orchestrator is not None:
             market_data.register_candle_close_listener(
@@ -563,11 +565,7 @@ def main(controller: Optional[BotController] = None) -> str:
         ):
             _bootstrap_scan_universe_at_startup(scanner, exchange, market_data)
 
-        _start_position_monitor(manager, monitor_stop)
-
-        from core.monitor_watchdog import start_monitor_watchdog
-
-        start_monitor_watchdog(market_data, telegram=tg, stop_event=monitor_stop)
+        start_monitor_watchdog(market_data, telegram=tg, stop_event=manager.stop_event)
 
         system_logger.info("Initialization complete. Entering main trading loop.")
 
@@ -615,7 +613,13 @@ def main(controller: Optional[BotController] = None) -> str:
                 else:
                     allowed, gate_reason = _entries_allowed(scheduler, risk, db)
                     if allowed:
-                        if Config.ENABLE_EVENT_DRIVEN_SCAN and scanner.orchestrator:
+                        if scanner.orchestrator is None:
+                            if cycle == 1:
+                                system_logger.warning(
+                                    "Event-driven orchestrator unavailable — "
+                                    "entries skipped (legacy scan loops removed)."
+                                )
+                        else:
                             if cycle == 1:
                                 scanner.refresh_event_universe()
                             candidates = scanner.process_priority_scan_cycle()
@@ -634,50 +638,6 @@ def main(controller: Optional[BotController] = None) -> str:
                                 critical_alerts=critical_alerts,
                                 manager=manager,
                             )
-                        elif Config.USE_UNIFIED_SCAN_PIPELINE:
-                            unified = scanner.scan_unified()
-                            _execute_candidates(
-                                candidates=unified,
-                                executor=executor,
-                                risk=risk,
-                                scheduler=scheduler,
-                                db=db,
-                                tg=tg,
-                                critical_alerts=critical_alerts,
-                                manager=manager,
-                            )
-                        else:
-                            smc_candidates = scanner.scan_market()
-                            _execute_candidates(
-                                candidates=smc_candidates,
-                                executor=executor,
-                                risk=risk,
-                                scheduler=scheduler,
-                                db=db,
-                                tg=tg,
-                                critical_alerts=critical_alerts,
-                                manager=manager,
-                            )
-
-                            if Config.ENABLE_RANGE_REGIME or Config.ENABLE_STRATEGY_RANGE:
-                                range_candidates = scanner.scan_range_market()
-                                if range_candidates:
-                                    system_logger.info(
-                                        "RANGE scan found %s candidate(s) — SMC has priority; "
-                                        "filling up to %s RANGE slots.",
-                                        len(range_candidates),
-                                        Config.MAX_RANGE_POSITIONS,
-                                    )
-                                _execute_candidates(
-                                    candidates=range_candidates,
-                                    executor=executor,
-                                    risk=risk,
-                                    scheduler=scheduler,
-                                    db=db,
-                                    tg=tg,
-                                    critical_alerts=critical_alerts,
-                                    manager=manager,
-                                )
                     elif gate_reason:
                         system_logger.info("Entries paused: %s", gate_reason)
 
@@ -726,7 +686,8 @@ def main(controller: Optional[BotController] = None) -> str:
 
         # Graceful shutdown
         shutdown_done = True
-        monitor_stop.set()
+        if manager is not None:
+            manager.stop()
         market_data.stop()
         tg.send_message("🛑 <b>Bot stopped</b> — trading loop shut down safely.")
         tg.stop_listening()
@@ -739,7 +700,8 @@ def main(controller: Optional[BotController] = None) -> str:
         return "stop"
     finally:
         if not shutdown_done:
-            monitor_stop.set()
+            if manager is not None:
+                manager.stop()
             market_data.stop()
             if tg is not None:
                 try:

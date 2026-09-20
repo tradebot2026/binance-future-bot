@@ -6,25 +6,46 @@ from typing import Optional
 
 from config import Config
 from constants import (
+    STRATEGY_BREAKOUT_RETEST,
+    STRATEGY_FALSE_BREAKOUT_SFP,
     STRATEGY_LIQUIDITY_SWEEP,
+    STRATEGY_PRICE_ACTION_REVERSAL,
     STRATEGY_RANGE_REVERSION,
     STRATEGY_SMC_TREND,
+    STRATEGY_TREND_MOMENTUM,
     STRATEGY_VOL_EXPANSION,
+    STRATEGY_VOL_SQUEEZE,
     STRATEGY_VP_BREAKOUT,
     STRATEGY_VWAP_PULLBACK,
 )
 from core.candidate_arbitrator import CandidateArbitrator
+from core.confluence_scorer import ConfluenceScorer
+from core.context.institutional_context import InstitutionalContextEvaluator
+from core.strategy_evaluator import StrategyEvaluator
 from core.strategy_registry import StrategyRegistry
 from core.types import MarketSnapshot, SignalCandidate, StrategyScore
 from logger import error_logger
-from smc_engine import effective_smc_min_score
+from engines.smc_engine import effective_smc_min_score
+
+if False:  # TYPE_CHECKING
+    from exchange import BinanceExchangeManager
 
 
 class ScoringEngine:
     """Score one symbol against all enabled strategies (pure WS, no REST)."""
 
-    def __init__(self, registry: StrategyRegistry) -> None:
+    def __init__(
+        self,
+        registry: StrategyRegistry,
+        exchange: "BinanceExchangeManager | None" = None,
+    ) -> None:
         self.registry = registry
+        self.institutional = InstitutionalContextEvaluator(exchange=exchange)
+        self.evaluator = StrategyEvaluator(
+            registry,
+            institutional=self.institutional,
+        )
+        self.confluence = self.evaluator.confluence_scorer
 
     @staticmethod
     def compute_normalized_score(raw_score: float, min_score: float) -> float:
@@ -61,6 +82,31 @@ class ScoringEngine:
             return Config.VPB_MIN_SCORE
         if strategy == STRATEGY_VOL_EXPANSION:
             return Config.VEMR_MIN_SCORE
+        if strategy == STRATEGY_BREAKOUT_RETEST:
+            return Config.BREAKOUT_RETEST_MIN_SCORE
+        if strategy == STRATEGY_FALSE_BREAKOUT_SFP:
+            return Config.FALSE_BREAKOUT_SFP_MIN_SCORE
+        if strategy == STRATEGY_VOL_SQUEEZE:
+            return Config.VOL_SQUEEZE_MIN_SCORE
+        if strategy == STRATEGY_TREND_MOMENTUM:
+            return Config.TREND_MOMENTUM_MIN_SCORE
+        if strategy == STRATEGY_PRICE_ACTION_REVERSAL:
+            return Config.PRICE_ACTION_REVERSAL_MIN_SCORE
+        from constants import (
+            STRATEGY_MTF_ALIGNMENT,
+            STRATEGY_OI_FUNDING,
+            STRATEGY_ORDER_FLOW,
+            STRATEGY_VP_KEYLEVEL,
+        )
+
+        if strategy == STRATEGY_MTF_ALIGNMENT:
+            return Config.MTF_ALIGNMENT_MIN_SCORE
+        if strategy == STRATEGY_VP_KEYLEVEL:
+            return Config.VP_KEYLEVEL_MIN_SCORE
+        if strategy == STRATEGY_ORDER_FLOW:
+            return Config.ORDER_FLOW_MIN_SCORE
+        if strategy == STRATEGY_OI_FUNDING:
+            return Config.OI_FUNDING_MIN_SCORE
         return Config.STRATEGY_MIN_SCORE
 
     @staticmethod
@@ -81,77 +127,24 @@ class ScoringEngine:
         bar_open_ms: int = 0,
         timeframe: str = "",
     ) -> list[StrategyScore]:
-        scores: list[StrategyScore] = []
-        for strategy in self.registry.enabled():
-            if strategy.requires_top_volume() and not snapshot.is_top_volume:
-                continue
-
-            fit = strategy.regime_fit(snapshot)
-            if fit <= 0:
-                continue
-
-            allowed = strategy.allowed_regimes()
-            if allowed and snapshot.regime.value not in allowed:
-                continue
-
-            try:
-                signal = strategy.evaluate(snapshot)
-            except Exception as exc:
-                error_logger.error(
-                    "Strategy %s scoring failed on %s: %s",
-                    strategy.tag,
-                    snapshot.symbol,
-                    exc,
-                )
-                continue
-
-            raw_score = float(signal.score) if signal else 0.0
-            action = signal.action if signal else "NEUTRAL"
-            min_score = self.strategy_min_score(strategy.tag, signal)
-            if signal:
-                signal = CandidateArbitrator.apply_regime_fit(signal, fit)
-                adjusted = float(signal.adjusted_score)
-            else:
-                adjusted = 0.0
-
-            normalized = self.compute_normalized_score(raw_score, min_score)
-
-            scores.append(
-                StrategyScore(
-                    symbol=snapshot.symbol,
-                    strategy=strategy.tag,
-                    score=raw_score,
-                    adjusted_score=adjusted,
-                    min_score=min_score,
-                    normalized_score=normalized,
-                    regime_fit=fit,
-                    priority_weight=strategy.priority_weight(),
-                    action=action,  # type: ignore[arg-type]
-                    bar_open_ms=bar_open_ms,
-                    timeframe=timeframe or Config.ENTRY_TIMEFRAME,
-                )
-            )
-        return scores
+        return self.evaluator.evaluate(
+            snapshot,
+            bar_open_ms=bar_open_ms,
+            timeframe=timeframe,
+        )
 
     @staticmethod
     def pick_best(scores: list[StrategyScore]) -> Optional[StrategyScore]:
-        valid = [s for s in scores if s.normalized_score > 0]
-        if not valid:
-            return None
-        return max(
-            valid,
-            key=lambda s: (
-                s.normalized_score,
-                s.adjusted_score,
-                s.priority_weight,
-                s.score,
-            ),
-        )
+        return ConfluenceScorer.pick_best(scores)
 
     @staticmethod
     def pick_best_for_tier2(scores: list[StrategyScore]) -> Optional[StrategyScore]:
         """Best scoring result for Tier-2 tracking (includes raw scores at/above min)."""
-        valid = [s for s in scores if s.score >= s.min_score and s.score > 0]
+        valid = [
+            s
+            for s in scores
+            if (s.final_score or s.score) >= s.min_score and s.score > 0
+        ]
         if not valid:
             valid = [s for s in scores if s.score > 0]
         if not valid:
@@ -159,6 +152,7 @@ class ScoringEngine:
         return max(
             valid,
             key=lambda s: (
+                s.final_score or s.score,
                 s.normalized_score,
                 s.score,
                 s.adjusted_score,
@@ -174,13 +168,11 @@ class ScoringEngine:
     ) -> bool:
         """
         Tier-2 promotion: normalized performance OR scaled adjusted threshold.
-        Option A: normalized_score >= promote bar (strategy-relative).
-        Option B: raw >= min AND adjusted >= dynamically scaled threshold.
-        Option C: raw score >= TIER2_PROMOTE_SCORE (absolute bar, e.g. 80).
         """
-        if best.score < best.min_score:
+        effective = best.final_score or best.score
+        if effective < best.min_score:
             return False
-        if best.score >= Config.TIER2_PROMOTE_SCORE:
+        if effective >= Config.TIER2_PROMOTE_SCORE:
             return True
         promote = promote_normalized or Config.TIER2_PROMOTE_NORMALIZED
         if best.normalized_score >= promote:

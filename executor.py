@@ -17,8 +17,8 @@ from database import DatabaseManager
 from exchange import BinanceExchangeManager, SymbolRules
 from exceptions import OrderExecutionError
 from logger import error_logger, trade_logger
-from range_engine import RangeMetadata, compute_range_sl_tp
-from smc_engine import (
+from engines.range_engine import RangeMetadata, compute_range_sl_tp
+from engines.smc_engine import (
     StructureMetadata,
     check_opposing_liquidity_rr,
     compute_dynamic_tp_ladder,
@@ -26,6 +26,7 @@ from smc_engine import (
     compute_structural_sl,
     size_multiplier_for_score,
 )
+from core.entry_in_flight_mutex import entry_in_flight_mutex
 from reconciliation import symbol_blocked_for_new_entry
 from utils import (
     amount_to_precision,
@@ -49,6 +50,8 @@ def log_execution_rejected(symbol: str, reason: str, *, strategy: str = "") -> N
         "active db trade",
         "entry gate closed",
         "symbol on cooldown",
+        "entry in flight",
+        "entry already in flight",
         "open position on",
         "exchange rest confirms",
         "entries paused",
@@ -590,6 +593,20 @@ class TradeExecutor:
             log_execution_rejected(symbol, f"invalid action {action}", strategy=strategy)
             return None
 
+        if Config.DRY_RUN:
+            trade_logger.warning(
+                "[DRY_RUN] skipped live order %s %s | strategy=%s | score=%.1f | price=%.6f",
+                symbol,
+                action,
+                strategy,
+                score,
+                current_price,
+            )
+            log_execution_rejected(
+                symbol, "DRY_RUN enabled — order not sent", strategy=strategy
+            )
+            return None
+
         trade_logger.info(
             "[EXECUTION_ATTEMPT] %s %s | strategy=%s | score=%.1f | price=%.6f",
             symbol,
@@ -634,13 +651,44 @@ class TradeExecutor:
             )
             return None
 
-        blocked, block_reason = symbol_blocked_for_new_entry(
-            self.exchange, self.db, symbol
-        )
-        if blocked:
-            log_execution_rejected(symbol, block_reason, strategy=strategy)
-            return None
+        with entry_in_flight_mutex(symbol, blocking=False) as acquired:
+            if not acquired:
+                log_execution_rejected(
+                    symbol,
+                    "entry already in flight for symbol",
+                    strategy=strategy,
+                )
+                return None
 
+            blocked, block_reason = symbol_blocked_for_new_entry(
+                self.exchange, self.db, symbol
+            )
+            if blocked:
+                log_execution_rejected(symbol, block_reason, strategy=strategy)
+                return None
+
+            return self._place_entry_order(
+                symbol,
+                action,
+                atr,
+                current_price,
+                strategy=strategy,
+                score=score,
+                structure_metadata=structure_metadata,
+            )
+
+    def _place_entry_order(
+        self,
+        symbol: str,
+        action: str,
+        atr: float,
+        current_price: float,
+        *,
+        strategy: str = "DEFAULT",
+        score: float = 0.0,
+        structure_metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Place entry order — caller must hold entry_in_flight_mutex for symbol."""
         position_side = action
         rules = self.exchange.get_symbol_rules(symbol)
         structure = structure_metadata or {}

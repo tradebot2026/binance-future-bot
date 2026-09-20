@@ -249,7 +249,11 @@ class DatabaseManager:
     # ---------------- Optimized read helpers ----------------
 
     def get_active_trades_count(self) -> int:
-        """Scalar COUNT(*) for open / partial positions — hot path for main loop."""
+        """Scalar COUNT(*) for open / partial positions — hot path for main loop.
+
+        Fail-closed: SQLite errors raise DatabaseError so callers must block entries
+        instead of treating the count as zero.
+        """
         placeholders = ",".join("?" for _ in ACTIVE_TRADE_STATUSES)
         query = f"SELECT COUNT(*) FROM trades WHERE status IN ({placeholders})"
         try:
@@ -257,8 +261,8 @@ class DatabaseManager:
                 row = conn.execute(query, ACTIVE_TRADE_STATUSES).fetchone()
                 return int(row[0]) if row else 0
         except sqlite3.Error as exc:
-            error_logger.error("Failed to count active trades: %s", exc)
-            return 0
+            error_logger.error("Failed to count active trades (fail-closed): %s", exc)
+            raise DatabaseError("Failed to count active trades") from exc
 
     def count_active_trades_by_strategy(self, strategy: str) -> int:
         placeholders = ",".join("?" for _ in ACTIVE_TRADE_STATUSES)
@@ -270,8 +274,12 @@ class DatabaseManager:
                 row = conn.execute(query, (*ACTIVE_TRADE_STATUSES, strategy)).fetchone()
                 return int(row[0]) if row else 0
         except sqlite3.Error as exc:
-            error_logger.error("Failed to count active trades for %s: %s", strategy, exc)
-            return 0
+            error_logger.error(
+                "Failed to count active trades for %s (fail-closed): %s", strategy, exc
+            )
+            raise DatabaseError(
+                f"Failed to count active trades for {strategy}"
+            ) from exc
 
     def get_strategy_daily_realized_pnl(self, date_str: str, strategy: str) -> float:
         """Sum realized PnL from closed trades for a strategy on a UTC day."""
@@ -314,9 +322,13 @@ class DatabaseManager:
                 ).fetchall()
         except sqlite3.Error as exc:
             error_logger.error(
-                "Failed to count consecutive losses for %s: %s", strategy, exc
+                "Failed to count consecutive losses for %s (fail-closed): %s",
+                strategy,
+                exc,
             )
-            return 0
+            raise DatabaseError(
+                f"Failed to count consecutive losses for {strategy}"
+            ) from exc
 
         consecutive = 0
         for row in rows:
@@ -379,9 +391,12 @@ class DatabaseManager:
         if daily_limit <= 0 and consec_limit <= 0:
             return False, ""
 
-        stats = self.get_daily_stats(date_str) or {}
-        start_balance = safe_float(stats.get("start_balance"))
-        strategy_pnl = self.get_strategy_daily_realized_pnl(date_str, strategy)
+        try:
+            stats = self.get_daily_stats(date_str) or {}
+            start_balance = safe_float(stats.get("start_balance"))
+            strategy_pnl = self.get_strategy_daily_realized_pnl(date_str, strategy)
+        except DatabaseError as exc:
+            return True, f"{strategy} entries blocked — database unavailable ({exc})"
 
         if start_balance > 0 and daily_limit > 0:
             pnl_pct = (strategy_pnl / start_balance) * 100.0
@@ -392,7 +407,10 @@ class DatabaseManager:
                 )
 
         if consec_limit > 0:
-            consec = self.count_consecutive_strategy_losses(strategy, consec_limit)
+            try:
+                consec = self.count_consecutive_strategy_losses(strategy, consec_limit)
+            except DatabaseError as exc:
+                return True, f"{strategy} entries blocked — database unavailable ({exc})"
             if consec >= consec_limit:
                 return True, (
                     f"{strategy} consecutive SL limit ({consec}/{consec_limit})"
@@ -723,6 +741,26 @@ class DatabaseManager:
         except sqlite3.Error as exc:
             error_logger.error("Blacklist check failed for %s: %s", symbol, exc)
             return False
+
+    def get_active_blacklist_symbols(self) -> set[str]:
+        """Bulk-load active blacklist symbols (one query). Fail-open on SQLite errors."""
+        try:
+            with self.connection() as conn:
+                rows = conn.execute(
+                    """
+                    SELECT symbol FROM blacklist
+                    WHERE expires_at IS NULL OR expires_at >= ?
+                    """,
+                    (utc_now().isoformat(),),
+                ).fetchall()
+            return {
+                str(row[0]).upper()
+                for row in rows
+                if row and row[0]
+            }
+        except sqlite3.Error as exc:
+            error_logger.error("Failed to load blacklist symbols: %s", exc)
+            return set()
 
     def remove_from_blacklist(self, symbol: str) -> None:
         with self._write_lock:
@@ -1256,17 +1294,30 @@ class DatabaseManager:
             except sqlite3.Error as exc:
                 error_logger.error("Failed to log critical error: %s", exc)
 
-    def get_recent_critical_errors(self, limit: int = 15) -> list[dict[str, Any]]:
+    def get_recent_critical_errors(
+        self,
+        limit: int = 15,
+        *,
+        max_age_hours: float | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return critical errors recorded within the Telegram report window."""
+        hours = (
+            Config.TELEGRAM_ERROR_LOG_MAX_AGE_HOURS
+            if max_age_hours is None
+            else max_age_hours
+        )
+        cutoff = (utc_now() - timedelta(hours=max(hours, 0.0))).isoformat()
         try:
             with self.connection() as conn:
                 rows = conn.execute(
                     """
                     SELECT category, message, timestamp
                     FROM critical_errors
+                    WHERE timestamp >= ?
                     ORDER BY timestamp DESC
                     LIMIT ?
                     """,
-                    (limit,),
+                    (cutoff, limit),
                 ).fetchall()
                 return [
                     {

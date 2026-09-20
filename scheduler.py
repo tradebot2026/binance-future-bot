@@ -1,7 +1,7 @@
 """
 Daily scheduler module.
 Handles UTC day rollover and realized-PnL-based daily profit/loss circuit breakers.
-Pause state blocks new entries only — open-position monitoring continues in main.py.
+Pause state blocks new entries only — open-position monitoring continues in TradeManager.
 """
 
 from __future__ import annotations
@@ -112,8 +112,19 @@ class DailyScheduler:
     def force_resume_entries(self) -> str:
         """
         Clear manual pause and override daily max-loss / profit-target circuit breaker.
-        Sets daily_stats status back to ACTIVE for manual testnet recovery.
+        Disabled on mainnet unless ALLOW_MAINNET_FORCE_RESUME=True.
         """
+        if not Config.USE_TESTNET and not Config.ALLOW_MAINNET_FORCE_RESUME:
+            trade_logger.warning(
+                "FORCE RESUME blocked — disabled on mainnet "
+                "(set ALLOW_MAINNET_FORCE_RESUME=True to override)."
+            )
+            return (
+                "BLOCKED: /forceresume is disabled on mainnet. "
+                "Use /resume after the daily lock expires, or set "
+                "ALLOW_MAINNET_FORCE_RESUME=True."
+            )
+
         self.ensure_startup_initialized()
         if self.controller:
             self.controller.force_resume_daily_limits()

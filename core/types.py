@@ -37,6 +37,7 @@ class MarketSnapshot:
     timestamp_ms: int
     volume_rank: int = 0
     is_top_volume: bool = False
+    derivatives: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -130,6 +131,64 @@ class CandleCloseEvent:
 
 
 @dataclass
+class StrategyResult:
+    """
+    Standard output from BaseStrategy.scan().
+    direction NEUTRAL means no actionable setup.
+    """
+
+    symbol: str
+    strategy: str
+    direction: Action = "NEUTRAL"
+    score: float = 0.0
+    confidence: float = 0.0
+    atr: float = 0.0
+    timeframe: str = ""
+    key_levels: list[float] = field(default_factory=list)
+    level_tags: list[str] = field(default_factory=list)
+    confluence: str = ""
+    macro_trend: str = "NEUTRAL"
+    structure_metadata: dict[str, Any] = field(default_factory=dict)
+    correlated_with: list[str] = field(default_factory=list)
+
+    @property
+    def is_actionable(self) -> bool:
+        return self.direction in ("LONG", "SHORT") and self.score > 0
+
+    @classmethod
+    def neutral(cls, symbol: str, strategy: str) -> "StrategyResult":
+        return cls(symbol=symbol.upper(), strategy=strategy, direction="NEUTRAL")
+
+    @classmethod
+    def from_signal(cls, signal: "SignalCandidate") -> "StrategyResult":
+        return cls(
+            symbol=signal.symbol,
+            strategy=signal.strategy,
+            direction=signal.action,
+            score=float(signal.score),
+            confidence=min(max(float(signal.score) / 100.0, 0.0), 1.0),
+            atr=float(signal.atr),
+            timeframe=signal.timeframe,
+            key_levels=list(
+                safe_float_level(v)
+                for v in (signal.structure_metadata or {}).get("key_levels", [])
+                if safe_float_level(v) > 0
+            ),
+            level_tags=list((signal.structure_metadata or {}).get("level_tags", [])),
+            confluence=signal.confluence,
+            macro_trend=signal.macro_trend,
+            structure_metadata=dict(signal.structure_metadata or {}),
+        )
+
+
+def safe_float_level(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+@dataclass
 class StrategyScore:
     """Normalized strategy evaluation for one symbol."""
 
@@ -144,6 +203,10 @@ class StrategyScore:
     action: Action = "NEUTRAL"
     bar_open_ms: int = 0
     timeframe: str = ""
+    confluence_bonus: float = 0.0
+    context_bonus: float = 0.0
+    context_multiplier: float = 1.0
+    final_score: float = 0.0
 
 
 @dataclass
@@ -159,3 +222,54 @@ class CoinAssignment:
     assigned_bar_open_ms: int = 0
     assigned_at_ms: int = 0
     frozen: bool = False
+
+
+class CoinLifecycle(str, Enum):
+    """Dynamic universe membership — scores decay; DORMANT is not a blacklist."""
+
+    UNSEEN = "UNSEEN"
+    DISCOVERED = "DISCOVERED"
+    CANDIDATE = "CANDIDATE"
+    WATCH = "WATCH"
+    ACTIVE = "ACTIVE"
+    HOT = "HOT"
+    OPPORTUNITY = "OPPORTUNITY"
+    WEAKENED = "WEAKENED"
+    DORMANT = "DORMANT"
+
+
+@dataclass(frozen=True)
+class ChannelScores:
+    """Three opportunity channels, each 0–100."""
+
+    momentum: float = 0.0
+    reversal: float = 0.0
+    structure: float = 0.0
+
+    @property
+    def dominant(self) -> str:
+        ranking = (
+            ("momentum", self.momentum),
+            ("reversal", self.reversal),
+            ("structure", self.structure),
+        )
+        return max(ranking, key=lambda item: item[1])[0]
+
+
+@dataclass
+class CoinOpportunity:
+    """WS-only coin ranking snapshot used by universe rotation."""
+
+    symbol: str
+    score: float = 0.0
+    previous_score: float = 0.0
+    velocity: float = 0.0
+    relative_rank: int = 0
+    channels: ChannelScores = field(default_factory=ChannelScores)
+    lifecycle: CoinLifecycle = CoinLifecycle.UNSEEN
+    peak_score: float = 0.0
+    last_price: float = 0.0
+    volume_24h: float = 0.0
+    range_pct: float = 0.0
+    updated_at: float = 0.0
+    first_seen_at: float = 0.0

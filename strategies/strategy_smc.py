@@ -7,12 +7,12 @@ from typing import TYPE_CHECKING, Optional, Set
 from config import Config
 from constants import STRATEGY_SMC_TREND
 from core.directional import pick_directional_candidate
-from core.strategy_base import StrategyModule
+from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, RegimeLabel, SignalCandidate
 from indicators.market_analyzer import MarketAnalyzer
 from logger import signal_logger
-from smc_engine import (
+from engines.smc_engine import (
     effective_smc_min_score,
     evaluate_confluence_gate,
     score_setup,
@@ -24,7 +24,7 @@ if TYPE_CHECKING:
     from database import DatabaseManager
 
 
-class SMCStrategy(StrategyModule):
+class SMCStrategy(BaseStrategy):
     tag = STRATEGY_SMC_TREND
     display_name = "SMC Trend"
 
@@ -72,7 +72,7 @@ class SMCStrategy(StrategyModule):
             return Config.HALF_SIZE_MULTIPLIER
         return 0.0
 
-    def evaluate(self, snapshot: MarketSnapshot) -> Optional[SignalCandidate]:
+    def _evaluate_legacy(self, snapshot: MarketSnapshot) -> Optional[SignalCandidate]:
         df_entry = snapshot.candles.get(self.entry_tf)
         df_confirm = snapshot.candles.get(self.confirm_tf)
         df_trend = snapshot.candles.get(self.trend_tf)

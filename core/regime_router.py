@@ -5,6 +5,24 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from config import Config
+from constants import (
+    STRATEGY_BREAKOUT_RETEST,
+    STRATEGY_FALSE_BREAKOUT_SFP,
+    STRATEGY_LIQUIDITY_SWEEP,
+    STRATEGY_MTF_ALIGNMENT,
+    STRATEGY_OI_FUNDING,
+    STRATEGY_ORDER_FLOW,
+    STRATEGY_PRICE_ACTION_REVERSAL,
+    STRATEGY_RANGE_REVERSION,
+    STRATEGY_SMC_LEGACY,
+    STRATEGY_SMC_TREND,
+    STRATEGY_TREND_MOMENTUM,
+    STRATEGY_VOL_EXPANSION,
+    STRATEGY_VOL_SQUEEZE,
+    STRATEGY_VP_BREAKOUT,
+    STRATEGY_VP_KEYLEVEL,
+    STRATEGY_VWAP_PULLBACK,
+)
 from core.types import MarketSnapshot, RegimeLabel
 from utils import safe_float
 
@@ -18,6 +36,76 @@ class RegimeRouter:
     STRONG_TREND_ADX = 25.0
     RANGE_MAX_ADX = 22.0
     SPIKE_ATR_PERCENTILE = 80.0
+
+    _REGIME_STRATEGIES: dict[RegimeLabel, frozenset[str]] = {
+        RegimeLabel.STRONG_TREND: frozenset(
+            {
+                STRATEGY_SMC_TREND,
+                STRATEGY_SMC_LEGACY,
+                STRATEGY_LIQUIDITY_SWEEP,
+                STRATEGY_VWAP_PULLBACK,
+                STRATEGY_VP_BREAKOUT,
+                STRATEGY_BREAKOUT_RETEST,
+                STRATEGY_TREND_MOMENTUM,
+                STRATEGY_ORDER_FLOW,
+                STRATEGY_OI_FUNDING,
+                STRATEGY_MTF_ALIGNMENT,
+                STRATEGY_PRICE_ACTION_REVERSAL,
+            }
+        ),
+        RegimeLabel.RANGE_CHOP: frozenset(
+            {
+                STRATEGY_RANGE_REVERSION,
+                STRATEGY_VOL_EXPANSION,
+                STRATEGY_FALSE_BREAKOUT_SFP,
+                STRATEGY_PRICE_ACTION_REVERSAL,
+                STRATEGY_VP_KEYLEVEL,
+            }
+        ),
+        RegimeLabel.COMPRESSION: frozenset(
+            {
+                STRATEGY_SMC_TREND,
+                STRATEGY_SMC_LEGACY,
+                STRATEGY_VP_BREAKOUT,
+                STRATEGY_BREAKOUT_RETEST,
+                STRATEGY_VOL_SQUEEZE,
+                STRATEGY_FALSE_BREAKOUT_SFP,
+                STRATEGY_MTF_ALIGNMENT,
+                STRATEGY_VP_KEYLEVEL,
+            }
+        ),
+        RegimeLabel.EXPANSION_SPIKE: frozenset(
+            {
+                STRATEGY_LIQUIDITY_SWEEP,
+                STRATEGY_VOL_EXPANSION,
+                STRATEGY_BREAKOUT_RETEST,
+                STRATEGY_VOL_SQUEEZE,
+                STRATEGY_TREND_MOMENTUM,
+                STRATEGY_ORDER_FLOW,
+                STRATEGY_OI_FUNDING,
+            }
+        ),
+        RegimeLabel.UNCLEAR: frozenset(
+            {
+                STRATEGY_SMC_TREND,
+                STRATEGY_SMC_LEGACY,
+                STRATEGY_RANGE_REVERSION,
+                STRATEGY_LIQUIDITY_SWEEP,
+                STRATEGY_VWAP_PULLBACK,
+                STRATEGY_VP_BREAKOUT,
+                STRATEGY_VOL_EXPANSION,
+                STRATEGY_BREAKOUT_RETEST,
+                STRATEGY_FALSE_BREAKOUT_SFP,
+                STRATEGY_VOL_SQUEEZE,
+                STRATEGY_TREND_MOMENTUM,
+                STRATEGY_PRICE_ACTION_REVERSAL,
+                STRATEGY_MTF_ALIGNMENT,
+                STRATEGY_VP_KEYLEVEL,
+                STRATEGY_ORDER_FLOW,
+                STRATEGY_OI_FUNDING,
+            }
+        ),
+    }
 
     @classmethod
     def classify(cls, snapshot: MarketSnapshot) -> RegimeLabel:
@@ -112,12 +200,5 @@ class RegimeRouter:
 
     @classmethod
     def strategies_for_regime(cls, regime: RegimeLabel) -> set[str]:
-        """Default strategy tags active per regime (Phase 1: SMC + Range only)."""
-        mapping: dict[RegimeLabel, set[str]] = {
-            RegimeLabel.STRONG_TREND: {"SMC_TREND"},
-            RegimeLabel.RANGE_CHOP: {"RANGE_REVERSION"},
-            RegimeLabel.COMPRESSION: set(),
-            RegimeLabel.EXPANSION_SPIKE: set(),
-            RegimeLabel.UNCLEAR: {"SMC_TREND", "RANGE_REVERSION"},
-        }
-        return mapping.get(regime, set())
+        """Return strategy tags allowed for this regime (matches each module's allowed_regimes)."""
+        return set(cls._REGIME_STRATEGIES.get(regime, cls._REGIME_STRATEGIES[RegimeLabel.UNCLEAR]))

@@ -19,6 +19,7 @@ from constants import (
 )
 from core.daily_balance_manager import fetch_daily_wallet_baseline
 from database import DatabaseManager
+from exceptions import DatabaseError
 from exchange import BinanceExchangeManager
 from logger import performance_logger, system_logger, trade_logger
 from utils import minimum_order_quantity, safe_float, utc_now, utc_today_str
@@ -213,7 +214,12 @@ class RiskManager:
             if paused:
                 return False, pause_reason
 
-            range_open = self.db.count_active_trades_by_strategy(STRATEGY_RANGE_REVERSION)
+            try:
+                range_open = self.db.count_active_trades_by_strategy(
+                    STRATEGY_RANGE_REVERSION
+                )
+            except DatabaseError as exc:
+                return False, f"RANGE slot check unavailable ({exc})"
             if range_open >= Config.MAX_RANGE_POSITIONS:
                 return False, (
                     f"Max RANGE positions reached ({range_open}/{Config.MAX_RANGE_POSITIONS})"
@@ -228,7 +234,10 @@ class RiskManager:
                 )
                 if paused:
                     return False, pause_reason
-                smc_open = self.db.count_active_trades_by_strategy(strategy)
+                try:
+                    smc_open = self.db.count_active_trades_by_strategy(strategy)
+                except DatabaseError as exc:
+                    return False, f"SMC slot check unavailable ({exc})"
                 if smc_open >= Config.MAX_SMC_POSITIONS:
                     return False, (
                         f"Max SMC positions reached ({smc_open}/{Config.MAX_SMC_POSITIONS})"
@@ -336,7 +345,24 @@ class RiskManager:
     def get_risk_snapshot(self) -> RiskSnapshot:
         """Compute current risk metrics and whether entries are allowed."""
         exchange_open = self.get_exchange_open_positions_count()
-        db_open = self.db.get_active_trades_count()
+        try:
+            db_open = self.db.get_active_trades_count()
+        except DatabaseError as exc:
+            trade_logger.error("Entry blocked | database unavailable: %s", exc)
+            return RiskSnapshot(
+                open_positions=max(exchange_open, Config.MAX_POSITIONS),
+                exchange_open_positions=exchange_open,
+                daily_entries=0,
+                daily_trades=0,
+                consecutive_losses=Config.MAX_CONSECUTIVE_LOSSES,
+                drawdown_percent=0.0,
+                current_balance=0.0,
+                daily_realized_pnl=0.0,
+                daily_realized_pnl_percent=0.0,
+                unrealized_pnl=0.0,
+                entries_allowed=False,
+                block_reason=f"Database unavailable — entries blocked ({exc})",
+            )
         open_positions = max(exchange_open, db_open)
 
         today = utc_today_str()
@@ -492,7 +518,7 @@ class RiskManager:
                     ),
                 ).fetchall()
         except Exception:
-            return 0
+            return lookback
 
         consecutive = 0
         for row in rows:
@@ -517,4 +543,4 @@ class RiskManager:
                 ).fetchone()
                 return row is not None
         except Exception:
-            return False
+            return True

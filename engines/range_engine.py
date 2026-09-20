@@ -12,7 +12,7 @@ import pandas as pd
 
 from config import Config
 from constants import STRATEGY_RANGE_REVERSION
-from smc_engine import (
+from .smc_engine import (
     StructureMetadata,
     check_bearish_expansion_veto,
     check_momentum_crash_veto,

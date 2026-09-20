@@ -7,18 +7,18 @@ from typing import TYPE_CHECKING, Optional, Set
 from config import Config
 from constants import STRATEGY_VOL_EXPANSION
 from core.directional import pick_directional_candidate
-from core.strategy_base import StrategyModule
+from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, RegimeLabel, SignalCandidate
 from indicators.market_analyzer import MarketAnalyzer
 from logger import signal_logger
-from vol_expansion_engine import evaluate_vol_expansion_mr
+from engines.vol_expansion_engine import evaluate_vol_expansion_mr
 
 if TYPE_CHECKING:
     from database import DatabaseManager
 
 
-class VolExpansionStrategy(StrategyModule):
+class VolExpansionStrategy(BaseStrategy):
     tag = STRATEGY_VOL_EXPANSION
     display_name = "Vol Expansion Mean Reversion"
 
@@ -64,7 +64,7 @@ class VolExpansionStrategy(StrategyModule):
             return Config.HALF_SIZE_MULTIPLIER
         return 0.0
 
-    def evaluate(self, snapshot: MarketSnapshot) -> Optional[SignalCandidate]:
+    def _evaluate_legacy(self, snapshot: MarketSnapshot) -> Optional[SignalCandidate]:
         df_entry = snapshot.candles.get(self.entry_tf)
         df_confirm = snapshot.candles.get(self.confirm_tf)
         if df_entry is None or df_confirm is None or df_entry.empty:

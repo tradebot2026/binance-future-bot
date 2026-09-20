@@ -17,7 +17,7 @@ import telebot
 from config import Config
 from constants import TP1_PORTION, TP2_PORTION, TP3_PORTION, strategy_display_label
 from database import DatabaseManager
-from logger import error_logger, system_logger
+from logger import error_logger, read_recent_error_log_lines, system_logger
 from reporter import format_bot_health_message
 from telegram_alerts import (
     format_active_positions_message,
@@ -303,7 +303,7 @@ class TelegramManager:
         btc_symbol = f"BTC{Config.QUOTE_ASSET}"
         try:
             from scanner import MarketAnalyzer
-            from smc_engine import compute_premium_discount, resolve_macro_trend, resolve_confirm_trend
+            from engines.smc_engine import compute_premium_discount, resolve_macro_trend, resolve_confirm_trend
 
             df_trend = self.exchange.fetch_historical_candles(
                 btc_symbol, Config.TREND_TIMEFRAME, limit=Config.CANDLE_FETCH_LIMIT, allow_rest=False
@@ -361,8 +361,12 @@ class TelegramManager:
             return f"⚠️ Market snapshot error: {escape_html(str(exc))}"
 
     def _format_recent_errors(self, limit: int = 12) -> str:
-        lines = ["🚨 <b>Recent Critical Errors</b>\n"]
-        db_errors = self.db.get_recent_critical_errors(limit=limit)
+        hours = max(int(Config.TELEGRAM_ERROR_LOG_MAX_AGE_HOURS), 1)
+        lines = [f"🚨 <b>Critical Errors (last {hours}h)</b>\n"]
+        db_errors = self.db.get_recent_critical_errors(
+            limit=limit,
+            max_age_hours=Config.TELEGRAM_ERROR_LOG_MAX_AGE_HOURS,
+        )
 
         if db_errors:
             for item in db_errors:
@@ -371,19 +375,21 @@ class TelegramManager:
                 msg = escape_html(str(item.get("message", ""))[:180])
                 lines.append(f"• [{ts}] <b>{cat}</b>\n  {msg}")
         else:
-            lines.append("<i>No critical errors recorded in database.</i>")
+            lines.append(
+                f"<i>No critical errors recorded in the last {hours} hours.</i>"
+            )
 
-        log_path = os.path.join(Config.LOGS_DIR, "errors.log")
-        if os.path.isfile(log_path):
-            try:
-                with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
-                    tail = handle.readlines()[-8:]
-                if tail:
-                    lines.append("\n📄 <b>errors.log (tail)</b>")
-                    for raw in tail:
-                        lines.append(escape_html(raw.rstrip())[:200])
-            except OSError as exc:
-                lines.append(f"\n⚠️ Could not read errors.log: {escape_html(str(exc))}")
+        try:
+            tail = read_recent_error_log_lines(
+                max_age_hours=Config.TELEGRAM_ERROR_LOG_MAX_AGE_HOURS,
+                limit=8,
+            )
+            if tail:
+                lines.append(f"\n📄 <b>errors.log (last {hours}h)</b>")
+                for raw in tail:
+                    lines.append(escape_html(raw.rstrip())[:200])
+        except OSError as exc:
+            lines.append(f"\n⚠️ Could not read errors.log: {escape_html(str(exc))}")
 
         return "\n".join(lines)
 
@@ -416,9 +422,11 @@ class TelegramManager:
         @authorized
         def ping_handler(message: telebot.types.Message) -> None:
             mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
+            dry = " | DRY_RUN" if Config.DRY_RUN else ""
             self.bot.reply_to(
                 message,
-                f"🟢 <b>Bot online</b> — actively monitoring markets ({escape_html(mode)}).",
+                f"🟢 <b>Bot online</b> — actively monitoring markets "
+                f"({escape_html(mode)}{dry}).",
             )
 
         @self.bot.message_handler(commands=["health", "pulse"])
@@ -577,6 +585,10 @@ class TelegramManager:
                 return
 
             note = self.scheduler.force_resume_entries()
+            if note.startswith("BLOCKED"):
+                self.bot.reply_to(message, f"🚫 {escape_html(note)}")
+                return
+
             if self.risk_manager:
                 self.risk_manager.reset_consecutive_loss_block()
                 snap = self.risk_manager.get_risk_snapshot()
@@ -727,10 +739,12 @@ class TelegramManager:
                 "/market — BTC macro trend & volatility\n"
                 "/pause — pause new entries\n"
                 "/resume — resume new entries\n"
+                "/forceresume — clear daily stop (testnet only)\n"
                 "/closeall — close all open positions\n"
                 "/stop — safe bot shutdown\n"
                 "/restart — graceful bot restart\n"
-                "/errors — recent critical errors\n"
+                f"/errors — critical errors from the last "
+                f"{int(Config.TELEGRAM_ERROR_LOG_MAX_AGE_HOURS)} hours\n"
                 "/balance — live futures balance\n"
                 "/active — open positions (DB + Binance REST)\n"
                 "/watchlist — Tier 1 hot scan + Tier 2 candidates\n"

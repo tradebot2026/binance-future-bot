@@ -12,7 +12,23 @@ load_dotenv()
 
 
 def _env_bool(key: str, default: bool) -> bool:
-    return os.getenv(key, str(default)).lower() in ("true", "1", "t", "yes")
+    raw = os.getenv(key)
+    if raw is None or not str(raw).strip():
+        return default
+    return str(raw).strip().lower() in ("true", "1", "t", "yes")
+
+
+def _env_dry_run() -> bool:
+    """Fail-safe: missing, empty, or unrecognized DRY_RUN stays True (no live orders)."""
+    raw = os.getenv("DRY_RUN")
+    if raw is None or not str(raw).strip():
+        return True
+    value = str(raw).strip().lower()
+    if value in ("false", "0", "f", "no"):
+        return False
+    if value in ("true", "1", "t", "yes"):
+        return True
+    return True
 
 
 def _env_int(key: str, default: int) -> int:
@@ -37,6 +53,10 @@ class Config:
     BINANCE_API_KEY: str = os.getenv("BINANCE_API_KEY", "")
     BINANCE_API_SECRET: str = os.getenv("BINANCE_API_SECRET", "")
     USE_TESTNET: bool = _env_bool("USE_TESTNET", True)
+    DRY_RUN: bool = _env_dry_run()
+    ALLOW_MAINNET_FORCE_RESUME: bool = _env_bool(
+        "ALLOW_MAINNET_FORCE_RESUME", False
+    )
     REQUEST_TIMEOUT: int = _env_int("REQUEST_TIMEOUT", 15)
     MAX_RETRIES: int = _env_int("MAX_RETRIES", 5)
     MIN_REQUEST_INTERVAL_MS: int = _env_int("MIN_REQUEST_INTERVAL_MS", 1000)
@@ -45,7 +65,7 @@ class Config:
     )
     INIT_REST_DELAY_SECONDS: float = _env_float("INIT_REST_DELAY_SECONDS", 0.5)
     ENABLE_WEBSOCKET_STREAMS: bool = _env_bool("ENABLE_WEBSOCKET_STREAMS", True)
-    WS_STALE_SECONDS: int = _env_int("WS_STALE_SECONDS", 120)
+    WS_STALE_SECONDS: int = _env_int("WS_STALE_SECONDS", 30)
     WS_STALE_SECONDS_TESTNET: int = _env_int("WS_STALE_SECONDS_TESTNET", 60)
     WS_PING_INTERVAL_SECONDS: float = _env_float("WS_PING_INTERVAL_SECONDS", 15.0)
     WS_USER_STALE_SECONDS: int = _env_int("WS_USER_STALE_SECONDS", 120)
@@ -105,6 +125,9 @@ class Config:
     # ---------------- Telegram ----------------
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+    TELEGRAM_ERROR_LOG_MAX_AGE_HOURS: float = _env_float(
+        "TELEGRAM_ERROR_LOG_MAX_AGE_HOURS", 48.0
+    )
 
     # ---------------- Trading ----------------
     QUOTE_ASSET: str = os.getenv("QUOTE_ASSET", "USDT")
@@ -277,6 +300,7 @@ class Config:
     MIN_SL_ATR_NOISE: float = _env_float("MIN_SL_ATR_NOISE", 0.35)
     SYMBOL_COOLDOWN_MINUTES: int = _env_int("SYMBOL_COOLDOWN_MINUTES", 60)
     POST_TRADE_COOLDOWN_MINUTES: int = _env_int("POST_TRADE_COOLDOWN_MINUTES", 60)
+    ENTRY_IN_FLIGHT_TTL_SECONDS: float = _env_float("ENTRY_IN_FLIGHT_TTL_SECONDS", 60.0)
 
     # ---------------- Range regime ----------------
     ENABLE_RANGE_REGIME: bool = _env_bool("ENABLE_RANGE_REGIME", True)
@@ -296,6 +320,13 @@ class Config:
     VWAP_MIN_SCORE: float = _env_float("VWAP_MIN_SCORE", 70.0)
     VPB_MIN_SCORE: float = _env_float("VPB_MIN_SCORE", 72.0)
     VEMR_MIN_SCORE: float = _env_float("VEMR_MIN_SCORE", 65.0)
+    BREAKOUT_RETEST_MIN_SCORE: float = _env_float("BREAKOUT_RETEST_MIN_SCORE", 70.0)
+    FALSE_BREAKOUT_SFP_MIN_SCORE: float = _env_float("FALSE_BREAKOUT_SFP_MIN_SCORE", 72.0)
+    VOL_SQUEEZE_MIN_SCORE: float = _env_float("VOL_SQUEEZE_MIN_SCORE", 70.0)
+    TREND_MOMENTUM_MIN_SCORE: float = _env_float("TREND_MOMENTUM_MIN_SCORE", 70.0)
+    PRICE_ACTION_REVERSAL_MIN_SCORE: float = _env_float(
+        "PRICE_ACTION_REVERSAL_MIN_SCORE", 68.0
+    )
 
     # ---------------- Multi-strategy modular system ----------------
     ENABLE_STRATEGY_SMC: bool = _env_bool("ENABLE_STRATEGY_SMC", True)
@@ -310,6 +341,95 @@ class Config:
     ENABLE_STRATEGY_VOL_EXPANSION: bool = _env_bool(
         "ENABLE_STRATEGY_VOL_EXPANSION", True
     )
+    # Extension strategies (disabled until engine logic is implemented)
+    ENABLE_STRATEGY_BREAKOUT_RETEST: bool = _env_bool(
+        "ENABLE_STRATEGY_BREAKOUT_RETEST", False
+    )
+    ENABLE_STRATEGY_TREND_MOMENTUM: bool = _env_bool(
+        "ENABLE_STRATEGY_TREND_MOMENTUM", False
+    )
+    ENABLE_STRATEGY_VOL_SQUEEZE: bool = _env_bool("ENABLE_STRATEGY_VOL_SQUEEZE", False)
+    ENABLE_STRATEGY_ORDER_FLOW: bool = _env_bool("ENABLE_STRATEGY_ORDER_FLOW", False)
+    ENABLE_STRATEGY_OI_FUNDING: bool = _env_bool("ENABLE_STRATEGY_OI_FUNDING", False)
+    ENABLE_STRATEGY_VWAP_MR: bool = _env_bool("ENABLE_STRATEGY_VWAP_MR", False)
+    ENABLE_STRATEGY_VP_KEYLEVEL: bool = _env_bool("ENABLE_STRATEGY_VP_KEYLEVEL", False)
+    ENABLE_STRATEGY_MTF_ALIGNMENT: bool = _env_bool(
+        "ENABLE_STRATEGY_MTF_ALIGNMENT", False
+    )
+    ENABLE_STRATEGY_FALSE_BREAKOUT_SFP: bool = _env_bool(
+        "ENABLE_STRATEGY_FALSE_BREAKOUT_SFP", False
+    )
+    ENABLE_STRATEGY_PRICE_ACTION_REVERSAL: bool = _env_bool(
+        "ENABLE_STRATEGY_PRICE_ACTION_REVERSAL", False
+    )
+    # Confluence / correlation scoring
+    ENABLE_CONFLUENCE_SCORING: bool = _env_bool("ENABLE_CONFLUENCE_SCORING", True)
+    ENABLE_ASYNC_STRATEGY_SCAN: bool = _env_bool("ENABLE_ASYNC_STRATEGY_SCAN", False)
+    CONFLUENCE_BONUS_MAX: float = _env_float("CONFLUENCE_BONUS_MAX", 8.0)
+    CONFLUENCE_BONUS_PER_STRATEGY: float = _env_float(
+        "CONFLUENCE_BONUS_PER_STRATEGY", 3.0
+    )
+    CORRELATION_LEVEL_TOLERANCE_ATR: float = _env_float(
+        "CORRELATION_LEVEL_TOLERANCE_ATR", 0.35
+    )
+    CORRELATION_BONUS_PENALTY: float = _env_float("CORRELATION_BONUS_PENALTY", 0.25)
+    # Institutional context & microstructure (Phase 3)
+    ENABLE_INSTITUTIONAL_CONTEXT: bool = _env_bool("ENABLE_INSTITUTIONAL_CONTEXT", True)
+    ENABLE_ASYNC_CONTEXT_EVAL: bool = _env_bool("ENABLE_ASYNC_CONTEXT_EVAL", True)
+    ENABLE_CONTEXT_MTF: bool = _env_bool("ENABLE_CONTEXT_MTF", True)
+    ENABLE_CONTEXT_VP: bool = _env_bool("ENABLE_CONTEXT_VP", True)
+    ENABLE_CONTEXT_ORDER_FLOW: bool = _env_bool("ENABLE_CONTEXT_ORDER_FLOW", True)
+    ENABLE_CONTEXT_OI_FUNDING: bool = _env_bool("ENABLE_CONTEXT_OI_FUNDING", True)
+    INSTITUTIONAL_CONTEXT_BONUS_MAX: float = _env_float(
+        "INSTITUTIONAL_CONTEXT_BONUS_MAX", 12.0
+    )
+    INSTITUTIONAL_CONTEXT_BONUS_PER_MODULE: float = _env_float(
+        "INSTITUTIONAL_CONTEXT_BONUS_PER_MODULE", 3.5
+    )
+    INSTITUTIONAL_CONTEXT_MULT_MAX: float = _env_float(
+        "INSTITUTIONAL_CONTEXT_MULT_MAX", 1.12
+    )
+    INSTITUTIONAL_CONTEXT_MULT_MIN: float = _env_float(
+        "INSTITUTIONAL_CONTEXT_MULT_MIN", 0.88
+    )
+    INSTITUTIONAL_CONTEXT_MULT_BOOST: float = _env_float(
+        "INSTITUTIONAL_CONTEXT_MULT_BOOST", 0.06
+    )
+    INSTITUTIONAL_CONTEXT_CONFLICT_PENALTY: float = _env_float(
+        "INSTITUTIONAL_CONTEXT_CONFLICT_PENALTY", 0.06
+    )
+    CONTEXT_MODULE_MIN_SCORE: float = _env_float("CONTEXT_MODULE_MIN_SCORE", 55.0)
+    MTF_ALIGNMENT_MIN_SCORE: float = _env_float("MTF_ALIGNMENT_MIN_SCORE", 68.0)
+    VP_KEYLEVEL_MIN_SCORE: float = _env_float("VP_KEYLEVEL_MIN_SCORE", 65.0)
+    ORDER_FLOW_MIN_SCORE: float = _env_float("ORDER_FLOW_MIN_SCORE", 68.0)
+    OI_FUNDING_MIN_SCORE: float = _env_float("OI_FUNDING_MIN_SCORE", 65.0)
+    VP_CONTEXT_BINS: int = _env_int("VP_CONTEXT_BINS", 24)
+    VP_CONTEXT_LOOKBACK_BARS: int = _env_int("VP_CONTEXT_LOOKBACK_BARS", 96)
+    VP_HVN_STD_MULT: float = _env_float("VP_HVN_STD_MULT", 1.0)
+    VP_LVN_STD_MULT: float = _env_float("VP_LVN_STD_MULT", 0.5)
+    VP_KEYLEVEL_ATR_TOLERANCE: float = _env_float("VP_KEYLEVEL_ATR_TOLERANCE", 0.35)
+    ORDER_FLOW_LOOKBACK_BARS: int = _env_int("ORDER_FLOW_LOOKBACK_BARS", 20)
+    ORDER_FLOW_DELTA_THRESHOLD: float = _env_float("ORDER_FLOW_DELTA_THRESHOLD", 0.12)
+    ORDER_FLOW_VOL_SPIKE_MULT: float = _env_float("ORDER_FLOW_VOL_SPIKE_MULT", 1.8)
+    ORDER_FLOW_AGGRESSIVE_BODY_PCT: float = _env_float(
+        "ORDER_FLOW_AGGRESSIVE_BODY_PCT", 0.55
+    )
+    ORDER_FLOW_ABSORPTION_RANGE_ATR: float = _env_float(
+        "ORDER_FLOW_ABSORPTION_RANGE_ATR", 0.45
+    )
+    OI_FUNDING_EXTREME_POSITIVE: float = _env_float("OI_FUNDING_EXTREME_POSITIVE", 0.0003)
+    OI_FUNDING_EXTREME_NEGATIVE: float = _env_float("OI_FUNDING_EXTREME_NEGATIVE", -0.0003)
+    OI_FUNDING_MODERATE: float = _env_float("OI_FUNDING_MODERATE", 0.0001)
+    OI_BUILDUP_MIN_PCT: float = _env_float("OI_BUILDUP_MIN_PCT", 2.5)
+    DERIVATIVES_CACHE_TTL_SECONDS: int = _env_int("DERIVATIVES_CACHE_TTL_SECONDS", 90)
+    MAX_MTF_ALIGNMENT_POSITIONS: int = _env_int("MAX_MTF_ALIGNMENT_POSITIONS", 2)
+    MAX_VP_KEYLEVEL_POSITIONS: int = _env_int("MAX_VP_KEYLEVEL_POSITIONS", 2)
+    MAX_ORDER_FLOW_POSITIONS: int = _env_int("MAX_ORDER_FLOW_POSITIONS", 2)
+    MAX_OI_FUNDING_POSITIONS: int = _env_int("MAX_OI_FUNDING_POSITIONS", 2)
+    STRATEGY_PRIORITY_MTF_ALIGNMENT: float = _env_float("STRATEGY_PRIORITY_MTF_ALIGNMENT", 1.05)
+    STRATEGY_PRIORITY_VP_KEYLEVEL: float = _env_float("STRATEGY_PRIORITY_VP_KEYLEVEL", 1.0)
+    STRATEGY_PRIORITY_ORDER_FLOW: float = _env_float("STRATEGY_PRIORITY_ORDER_FLOW", 1.08)
+    STRATEGY_PRIORITY_OI_FUNDING: float = _env_float("STRATEGY_PRIORITY_OI_FUNDING", 1.05)
     ALLOW_CROSS_STRATEGY_SCALE_IN: bool = _env_bool(
         "ALLOW_CROSS_STRATEGY_SCALE_IN", False
     )
@@ -325,7 +445,7 @@ class Config:
     TIER1_WATCHLIST_SIZE: int = _env_int("TIER1_WATCHLIST_SIZE", 100)
     HOT_SCAN_SIZE: int = _env_int("HOT_SCAN_SIZE", 15)
     HOT_SCAN_INTERVAL_SECONDS: float = _env_float("HOT_SCAN_INTERVAL_SECONDS", 20.0)
-    BACKGROUND_SCAN_BATCH_SIZE: int = _env_int("BACKGROUND_SCAN_BATCH_SIZE", 8)
+    BACKGROUND_SCAN_BATCH_SIZE: int = _env_int("BACKGROUND_SCAN_BATCH_SIZE", 16)
     BACKGROUND_SCAN_BATCH_DELAY_SECONDS: float = _env_float(
         "BACKGROUND_SCAN_BATCH_DELAY_SECONDS", 1.0
     )
@@ -350,8 +470,16 @@ class Config:
     MAX_SMC_POSITIONS: int = _env_int("MAX_SMC_POSITIONS", 8)
     MAX_LSC_POSITIONS: int = _env_int("MAX_LSC_POSITIONS", 3)
     MAX_VWAP_POSITIONS: int = _env_int("MAX_VWAP_POSITIONS", 4)
+    MAX_BREAKOUT_RETEST_POSITIONS: int = _env_int("MAX_BREAKOUT_RETEST_POSITIONS", 3)
+    MAX_FALSE_BREAKOUT_SFP_POSITIONS: int = _env_int("MAX_FALSE_BREAKOUT_SFP_POSITIONS", 3)
+    MAX_VOL_SQUEEZE_POSITIONS: int = _env_int("MAX_VOL_SQUEEZE_POSITIONS", 3)
+    MAX_TREND_MOMENTUM_POSITIONS: int = _env_int("MAX_TREND_MOMENTUM_POSITIONS", 4)
+    MAX_PRICE_ACTION_REVERSAL_POSITIONS: int = _env_int(
+        "MAX_PRICE_ACTION_REVERSAL_POSITIONS", 3
+    )
     MAX_VPB_POSITIONS: int = _env_int("MAX_VPB_POSITIONS", 3)
     MAX_VEMR_POSITIONS: int = _env_int("MAX_VEMR_POSITIONS", 2)
+    MAX_VWAP_MR_POSITIONS: int = _env_int("MAX_VWAP_MR_POSITIONS", 2)
 
     STRATEGY_PRIORITY_SMC: float = _env_float("STRATEGY_PRIORITY_SMC", 1.0)
     STRATEGY_PRIORITY_RANGE: float = _env_float("STRATEGY_PRIORITY_RANGE", 0.8)
@@ -359,6 +487,32 @@ class Config:
     STRATEGY_PRIORITY_VWAP: float = _env_float("STRATEGY_PRIORITY_VWAP", 0.9)
     STRATEGY_PRIORITY_VPB: float = _env_float("STRATEGY_PRIORITY_VPB", 0.85)
     STRATEGY_PRIORITY_VEMR: float = _env_float("STRATEGY_PRIORITY_VEMR", 0.7)
+    STRATEGY_PRIORITY_BREAKOUT_RETEST: float = _env_float(
+        "STRATEGY_PRIORITY_BREAKOUT_RETEST", 0.88
+    )
+    STRATEGY_PRIORITY_FALSE_BREAKOUT_SFP: float = _env_float(
+        "STRATEGY_PRIORITY_FALSE_BREAKOUT_SFP", 0.86
+    )
+    STRATEGY_PRIORITY_VOL_SQUEEZE: float = _env_float("STRATEGY_PRIORITY_VOL_SQUEEZE", 0.84)
+    STRATEGY_PRIORITY_TREND_MOMENTUM: float = _env_float(
+        "STRATEGY_PRIORITY_TREND_MOMENTUM", 0.92
+    )
+    STRATEGY_PRIORITY_PRICE_ACTION_REVERSAL: float = _env_float(
+        "STRATEGY_PRIORITY_PRICE_ACTION_REVERSAL", 0.82
+    )
+    STRATEGY_BUDGET_BREAKOUT_RETEST: float = _env_float(
+        "STRATEGY_BUDGET_BREAKOUT_RETEST", 0.12
+    )
+    STRATEGY_BUDGET_FALSE_BREAKOUT_SFP: float = _env_float(
+        "STRATEGY_BUDGET_FALSE_BREAKOUT_SFP", 0.10
+    )
+    STRATEGY_BUDGET_VOL_SQUEEZE: float = _env_float("STRATEGY_BUDGET_VOL_SQUEEZE", 0.10)
+    STRATEGY_BUDGET_TREND_MOMENTUM: float = _env_float(
+        "STRATEGY_BUDGET_TREND_MOMENTUM", 0.14
+    )
+    STRATEGY_BUDGET_PRICE_ACTION_REVERSAL: float = _env_float(
+        "STRATEGY_BUDGET_PRICE_ACTION_REVERSAL", 0.10
+    )
 
     STRATEGY_BUDGET_SMC: float = _env_float("STRATEGY_BUDGET_SMC", 0.35)
     STRATEGY_BUDGET_RANGE: float = _env_float("STRATEGY_BUDGET_RANGE", 0.10)
@@ -366,6 +520,15 @@ class Config:
     STRATEGY_BUDGET_VWAP: float = _env_float("STRATEGY_BUDGET_VWAP", 0.20)
     STRATEGY_BUDGET_VPB: float = _env_float("STRATEGY_BUDGET_VPB", 0.15)
     STRATEGY_BUDGET_VEMR: float = _env_float("STRATEGY_BUDGET_VEMR", 0.05)
+    STRATEGY_BUDGET_MTF_ALIGNMENT: float = _env_float(
+        "STRATEGY_BUDGET_MTF_ALIGNMENT", 0.08
+    )
+    STRATEGY_BUDGET_VP_KEYLEVEL: float = _env_float(
+        "STRATEGY_BUDGET_VP_KEYLEVEL", 0.08
+    )
+    STRATEGY_BUDGET_ORDER_FLOW: float = _env_float("STRATEGY_BUDGET_ORDER_FLOW", 0.08)
+    STRATEGY_BUDGET_OI_FUNDING: float = _env_float("STRATEGY_BUDGET_OI_FUNDING", 0.08)
+    STRATEGY_BUDGET_VWAP_MR: float = _env_float("STRATEGY_BUDGET_VWAP_MR", 0.05)
 
     MAX_ACCOUNT_MARGIN_UTILIZATION: float = _env_float(
         "MAX_ACCOUNT_MARGIN_UTILIZATION", 0.65
@@ -383,6 +546,7 @@ class Config:
         "DEFAULT_MEGA_CAP_BLACKLIST",
         ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"],
     )
+    BLACKLIST_CACHE_SECONDS: float = _env_float("BLACKLIST_CACHE_SECONDS", 60.0)
     TOP_UNIVERSE_POOL_SIZE: int = _env_int("TOP_UNIVERSE_POOL_SIZE", 60)
     ROTATION_EXTENDED_POOL_SIZE: int = _env_int("ROTATION_EXTENDED_POOL_SIZE", 60)
     ROTATION_EVALUATED_MEMORY_MIN_MINUTES: int = _env_int(
@@ -398,6 +562,32 @@ class Config:
     UNIVERSE_RANK_VOLUME_WEIGHT: float = _env_float("UNIVERSE_RANK_VOLUME_WEIGHT", 0.40)
     UNIVERSE_RANK_RANGE_WEIGHT: float = _env_float("UNIVERSE_RANK_RANGE_WEIGHT", 0.35)
     UNIVERSE_RANK_ATR_WEIGHT: float = _env_float("UNIVERSE_RANK_ATR_WEIGHT", 0.25)
+    OPPORTUNITY_MOMENTUM_WEIGHT: float = _env_float(
+        "OPPORTUNITY_MOMENTUM_WEIGHT", 0.40
+    )
+    OPPORTUNITY_REVERSAL_WEIGHT: float = _env_float(
+        "OPPORTUNITY_REVERSAL_WEIGHT", 0.30
+    )
+    OPPORTUNITY_STRUCTURE_WEIGHT: float = _env_float(
+        "OPPORTUNITY_STRUCTURE_WEIGHT", 0.30
+    )
+    OPPORTUNITY_CANDIDATE_MIN: float = _env_float("OPPORTUNITY_CANDIDATE_MIN", 35.0)
+    OPPORTUNITY_WATCH_MIN: float = _env_float("OPPORTUNITY_WATCH_MIN", 50.0)
+    OPPORTUNITY_ACTIVE_MIN: float = _env_float("OPPORTUNITY_ACTIVE_MIN", 60.0)
+    OPPORTUNITY_HOT_MIN: float = _env_float("OPPORTUNITY_HOT_MIN", 72.0)
+    OPPORTUNITY_SETUP_MIN: float = _env_float("OPPORTUNITY_SETUP_MIN", 78.0)
+    OPPORTUNITY_DORMANT_MAX: float = _env_float("OPPORTUNITY_DORMANT_MAX", 22.0)
+    OPPORTUNITY_WEAKEN_DROP: float = _env_float("OPPORTUNITY_WEAKEN_DROP", 15.0)
+    OPPORTUNITY_SCORE_HALF_LIFE_MINUTES: float = _env_float(
+        "OPPORTUNITY_SCORE_HALF_LIFE_MINUTES", 20.0
+    )
+    OPPORTUNITY_STALE_SECONDS: float = _env_float("OPPORTUNITY_STALE_SECONDS", 2700.0)
+    HOT_SCORE_VELOCITY: float = _env_float("HOT_SCORE_VELOCITY", 12.0)
+    HOT_PRICE_MOVE_PCT: float = _env_float("HOT_PRICE_MOVE_PCT", 0.85)
+    HOT_VOLUME_RATIO: float = _env_float("HOT_VOLUME_RATIO", 1.18)
+    HOT_RANGE_EXPANSION_PCT: float = _env_float("HOT_RANGE_EXPANSION_PCT", 0.35)
+    HOT_FAST_TRACK_MAX_PER_CYCLE: int = _env_int("HOT_FAST_TRACK_MAX_PER_CYCLE", 8)
+    ROTATING_SCAN_BATCH_SIZE: int = _env_int("ROTATING_SCAN_BATCH_SIZE", 16)
     MIN_24H_VOLUME_USDT: float = _env_float("MIN_24H_VOLUME_USDT", 10_000_000.0)
     MAX_SPREAD_PERCENT: float = _env_float("MAX_SPREAD_PERCENT", 0.08)
     MIN_SCAN_UNIVERSE: int = _env_int("MIN_SCAN_UNIVERSE", 50)

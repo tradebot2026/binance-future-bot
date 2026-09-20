@@ -120,6 +120,30 @@ class AccountRestCache:
         ) < Config.BALANCE_CACHE_TTL_SECONDS
 
 
+@dataclass
+class DerivativesCacheEntry:
+    """Per-symbol funding + open interest snapshot."""
+
+    funding_rate: float = 0.0
+    open_interest: float = 0.0
+    oi_change_pct: float = 0.0
+    mark_price: float = 0.0
+    updated_at: float = 0.0
+
+    def is_valid(self) -> bool:
+        return self.updated_at > 0 and (
+            time.monotonic() - self.updated_at
+        ) < Config.DERIVATIVES_CACHE_TTL_SECONDS
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "funding_rate": self.funding_rate,
+            "open_interest": self.open_interest,
+            "oi_change_pct": self.oi_change_pct,
+            "mark_price": self.mark_price,
+        }
+
+
 ACCOUNT_REST_ENDPOINTS = frozenset(
     {"futures_account", "futures_position_information", "futures_account_balance"}
 )
@@ -210,6 +234,8 @@ class BinanceExchangeManager:
         self._symbol_position_rest_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
         self._all_positions_rest_at: float = 0.0
         self._all_positions_rest_data: Optional[list[dict[str, Any]]] = None
+        self._derivatives_cache: dict[str, DerivativesCacheEntry] = {}
+        self._derivatives_lock = threading.Lock()
         self._critical_alerts: Any = None
         self._market_data: Any = None
         self._full_init_done = False
@@ -1233,6 +1259,83 @@ class BinanceExchangeManager:
     def ensure_positions_cached(self, force: bool = False) -> None:
         """Warm position cache once per monitor/risk cycle."""
         self._refresh_positions_cache(force=force)
+
+    def fetch_derivatives_context(self, symbol: str) -> dict[str, Any]:
+        """
+        Cached funding rate + open interest for institutional context modules.
+        Non-blocking when cache is warm; skips REST during scan WS-only mode.
+        """
+        sym = str(symbol).upper()
+        with self._derivatives_lock:
+            cached = self._derivatives_cache.get(sym)
+            if cached and cached.is_valid():
+                return cached.as_dict()
+
+        if self.in_scan_mode and Config.SCAN_WS_ONLY:
+            if cached:
+                return cached.as_dict()
+            return {}
+
+        if self._market_data and self._market_data.is_rest_blocked()[0]:
+            if cached:
+                return cached.as_dict()
+            return {}
+
+        try:
+            premium = self._throttled_call(
+                self.client.futures_mark_price,
+                symbol=sym,
+                **self.recv_window_param,
+            )
+            funding = safe_float(premium.get("lastFundingRate"))
+            mark_price = safe_float(premium.get("markPrice"))
+
+            oi_raw = self._throttled_call(
+                self.client.futures_open_interest,
+                symbol=sym,
+                **self.recv_window_param,
+            )
+            oi = safe_float(oi_raw.get("openInterest"))
+
+            oi_change_pct = 0.0
+            try:
+                hist = self._throttled_call(
+                    self.client.futures_open_interest_hist,
+                    symbol=sym,
+                    period="5m",
+                    limit=2,
+                    **self.recv_window_param,
+                )
+                if isinstance(hist, list) and len(hist) >= 2:
+                    prev_oi = safe_float(hist[-2].get("sumOpenInterest"))
+                    last_oi = safe_float(hist[-1].get("sumOpenInterest"))
+                    if prev_oi > 0:
+                        oi_change_pct = (last_oi - prev_oi) / prev_oi * 100.0
+                    if oi <= 0:
+                        oi = last_oi
+            except Exception:
+                pass
+
+            entry = DerivativesCacheEntry(
+                funding_rate=funding,
+                open_interest=oi,
+                oi_change_pct=oi_change_pct,
+                mark_price=mark_price,
+                updated_at=time.monotonic(),
+            )
+            with self._derivatives_lock:
+                self._derivatives_cache[sym] = entry
+            return entry.as_dict()
+        except ExchangeRateLimitError:
+            if cached:
+                return cached.as_dict()
+            return {}
+        except Exception as exc:
+            if self._rest_block_log.should_log(f"derivatives_{sym}"):
+                error_logger.debug("Derivatives context fetch failed for %s: %s", sym, exc)
+            if cached:
+                return cached.as_dict()
+            return {}
 
     def fetch_futures_ticker_map_rest(self) -> dict[str, dict[str, Any]]:
         """

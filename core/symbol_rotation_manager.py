@@ -1,4 +1,4 @@
-"""Dynamic symbol rotation — active watch, evaluated memory, and pool refresh."""
+"""Dynamic symbol rotation — lifecycle-aware dual queues and evaluated memory."""
 
 from __future__ import annotations
 
@@ -7,16 +7,17 @@ import time
 from typing import Optional
 
 from config import Config
+from core.opportunity_tracker import PRIORITY_STATES, SCANNABLE_STATES
+from core.types import CoinLifecycle
 from logger import scanner_logger
 
 
 class SymbolRotationManager:
     """
-    Manages Top-60 pool rotation:
-    - active_watch: top N symbols closest to trigger (hot scan)
-    - background: next batch excluding evaluated memory
-    - evaluated memory: recently scanned non-trigger symbols (45–60 min TTL)
-    - full purge every ROTATION_MEMORY_PURGE_HOURS
+    Dual queue:
+    - priority (hot): HOT / OPPORTUNITY plus fast-tracked spikes
+    - rotating: ACTIVE / WATCH / CANDIDATE in batches; DORMANT excluded
+    Evaluated memory skips rotating symbols only (never blocks priority).
     """
 
     def __init__(self) -> None:
@@ -64,7 +65,7 @@ class SymbolRotationManager:
         return symbol.upper() in self._evaluated
 
     def mark_evaluated(self, symbols: list[str]) -> None:
-        """Add symbols to evaluated memory after a background scan batch."""
+        """Add symbols to evaluated memory after a rotating-batch scan."""
         if not Config.ENABLE_DYNAMIC_SYMBOL_ROTATION or not symbols:
             return
         self.cleanup_expired()
@@ -83,61 +84,122 @@ class SymbolRotationManager:
             max_m,
         )
 
+    def clear_evaluated(self, symbols: list[str]) -> None:
+        """Allow fast-tracked coins to be scanned immediately."""
+        for symbol in symbols:
+            self._evaluated.pop(symbol.upper(), None)
+
     def build_scan_slices(
         self,
         primary_pool: list[str],
         extended_pool: list[str],
         trigger_scores: Optional[dict[str, float]] = None,
+        *,
+        lifecycle: Optional[dict[str, str]] = None,
+        fast_track: Optional[list[str]] = None,
     ) -> tuple[list[str], list[str]]:
         """
-        Split pools into active_watch (hot) and background scan queues.
-        Returns (active_watch, background).
+        Split pools into priority (hot) and rotating background queues.
+        Returns (priority, rotating).
         """
+        scores = {k.upper(): float(v) for k, v in (trigger_scores or {}).items()}
+        life = {
+            str(k).upper(): str(v).upper()
+            for k, v in (lifecycle or {}).items()
+        }
+        hot_size = max(Config.HOT_SCAN_SIZE, 1)
+
         if not Config.ENABLE_DYNAMIC_SYMBOL_ROTATION:
             ranked = [s.upper() for s in primary_pool if s]
-            hot_size = max(Config.HOT_SCAN_SIZE, 1)
+            ranked.sort(key=lambda sym: scores.get(sym, 0.0), reverse=True)
             return ranked[:hot_size], ranked[hot_size:]
 
         self.maybe_full_purge()
         self.cleanup_expired()
 
-        scores = {k.upper(): float(v) for k, v in (trigger_scores or {}).items()}
-        hot_size = max(Config.HOT_SCAN_SIZE, 1)
-        bg_target = max(Config.TOP_UNIVERSE_POOL_SIZE - hot_size, 1)
-
         primary = [s.upper() for s in primary_pool if s]
         extended = [s.upper() for s in extended_pool if s and s.upper() not in primary]
+        universe = primary + [s for s in extended if s not in primary]
+        primary_set = set(primary)
 
         def rank_key(sym: str) -> tuple[float, float]:
             return (scores.get(sym, 0.0), -primary.index(sym) if sym in primary else 0.0)
 
-        ranked_primary = sorted(primary, key=rank_key, reverse=True)
-        active_watch = ranked_primary[:hot_size]
+        fast = [s.upper() for s in (fast_track or []) if s]
+        self.clear_evaluated(fast)
 
-        blocked = set(self._evaluated.keys()) | set(active_watch)
-        background: list[str] = []
+        priority: list[str] = []
+        seen: set[str] = set()
 
-        for sym in ranked_primary[hot_size:]:
-            if sym in blocked:
-                continue
-            background.append(sym)
-            if len(background) >= bg_target:
+        def _push(sym: str) -> None:
+            if not sym or sym in seen:
+                return
+            state = life.get(sym, "")
+            if state == CoinLifecycle.DORMANT.value:
+                return
+            seen.add(sym)
+            priority.append(sym)
+
+        for sym in fast:
+            _push(sym)
+        for sym in sorted(universe, key=rank_key, reverse=True):
+            state = life.get(sym, "")
+            if state in {item.value for item in PRIORITY_STATES} or (
+                scores.get(sym, 0.0) >= Config.OPPORTUNITY_HOT_MIN and sym in primary_set
+            ):
+                _push(sym)
+            if len(priority) >= hot_size:
                 break
 
-        if len(background) < bg_target:
-            for sym in extended:
-                if sym in blocked or sym in background:
-                    continue
-                background.append(sym)
-                if len(background) >= bg_target:
+        if len(priority) < hot_size:
+            for sym in sorted(primary, key=rank_key, reverse=True):
+                _push(sym)
+                if len(priority) >= hot_size:
                     break
 
-        if background:
+        priority = priority[:hot_size]
+        blocked = set(self._evaluated.keys()) | set(priority)
+        rotating: list[str] = []
+        scannable = {item.value for item in SCANNABLE_STATES}
+
+        def _accept_rotating(sym: str) -> bool:
+            if sym in blocked or sym in rotating:
+                return False
+            state = life.get(sym, CoinLifecycle.ACTIVE.value)
+            if state == CoinLifecycle.DORMANT.value:
+                return False
+            if life and state not in scannable:
+                return False
+            return True
+
+        weakened: list[str] = []
+        bg_target = max(Config.TOP_UNIVERSE_POOL_SIZE - len(priority), 1)
+        for pool in (primary[len(priority) :], extended, primary):
+            for sym in pool:
+                if not _accept_rotating(sym):
+                    continue
+                if life.get(sym) == CoinLifecycle.WEAKENED.value:
+                    weakened.append(sym)
+                    continue
+                rotating.append(sym)
+                if len(rotating) >= bg_target:
+                    break
+            if len(rotating) >= bg_target:
+                break
+
+        if len(rotating) < bg_target:
+            for sym in weakened:
+                if _accept_rotating(sym):
+                    rotating.append(sym)
+                if len(rotating) >= bg_target:
+                    break
+
+        if rotating or priority:
             scanner_logger.debug(
-                "Rotation slices — active_watch=%s background=%s evaluated=%s cycle=%s.",
-                len(active_watch),
-                len(background),
+                "Rotation slices — priority=%s rotating=%s evaluated=%s cycle=%s.",
+                len(priority),
+                len(rotating),
                 len(self._evaluated),
                 self._rotation_cycle,
             )
-        return active_watch, background
+        return priority, rotating

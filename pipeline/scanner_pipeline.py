@@ -9,8 +9,10 @@ from typing import Iterable, Optional
 from config import Config
 from constants import STRATEGY_RANGE_REVERSION, STRATEGY_SMC_TREND
 from core.candidate_arbitrator import CandidateArbitrator
+from core.context.institutional_context import InstitutionalContextEvaluator
 from core.portfolio_allocator import PortfolioAllocator
 from core.regime_router import RegimeRouter
+from core.strategy_evaluator import StrategyEvaluator
 from core.strategy_registry import StrategyRegistry
 from core.symbol_conflict_guard import SymbolConflictGuard
 from core.types import SignalCandidate
@@ -19,7 +21,7 @@ from exchange import BinanceExchangeManager
 from logger import error_logger, scanner_logger, signal_logger
 from pipeline.snapshot_factory import SnapshotFactory
 from pipeline.universe_builder import UniverseBuilder
-from smc_engine import effective_smc_min_score
+from engines.smc_engine import effective_smc_min_score
 from strategies import build_strategy_registry
 from utils import safe_float
 
@@ -38,7 +40,11 @@ class StrategyScannerPipeline:
     ) -> None:
         self.exchange = exchange
         self.db = db
-        self.registry = registry or build_strategy_registry(db=db)
+        self.registry = registry or build_strategy_registry(db=db, exchange=exchange)
+        self.evaluator = StrategyEvaluator(
+            self.registry,
+            institutional=InstitutionalContextEvaluator(exchange=exchange),
+        )
         self.universe_builder = UniverseBuilder(exchange, db)
         self.snapshot_factory = SnapshotFactory(exchange)
         self.conflict_guard = SymbolConflictGuard(exchange, db)
@@ -105,8 +111,8 @@ class StrategyScannerPipeline:
             return []
 
         self._subscribe_klines(symbols)
-        ticker_map = self.exchange.get_futures_ticker_map()
-        book_map = self.exchange.get_book_ticker_map()
+        ticker_map = self.universe_builder._ws_ticker_map()
+        book_map = self.universe_builder._ws_book_map(ticker_map)
 
         winners: list[SignalCandidate] = []
         rejection_stats: Counter[str] = Counter()
@@ -143,42 +149,13 @@ class StrategyScannerPipeline:
                     continue
 
                 regime = snapshot.regime
-                symbol_candidates: list[SignalCandidate] = []
-
-                for strategy in strategies:
-                    if use_regime_filter:
-                        allowed = strategy.allowed_regimes()
-                        if allowed and regime.value not in allowed:
-                            continue
-                        regime_tags = RegimeRouter.strategies_for_regime(regime)
-                        if regime_tags and strategy.tag not in regime_tags:
-                            if not self._legacy_single_strategy_mode(strategy_tags):
-                                continue
-
-                    if strategy.requires_top_volume() and not snapshot.is_top_volume:
-                        continue
-
-                    fit = strategy.regime_fit(snapshot)
-                    if fit <= 0:
-                        continue
-
-                    try:
-                        signal = strategy.evaluate(snapshot)
-                    except Exception as exc:
-                        error_logger.error(
-                            "Strategy %s failed on %s: %s", strategy.tag, symbol, exc
-                        )
-                        continue
-
-                    if signal is None:
-                        continue
-
-                    signal = CandidateArbitrator.apply_regime_fit(signal, fit)
-                    if not self._passes_min_score(signal):
-                        rejection_stats["below_min_score"] += 1
-                        continue
-
-                    symbol_candidates.append(signal)
+                symbol_candidates = self._collect_symbol_candidates(
+                    snapshot,
+                    strategies,
+                    regime=regime,
+                    use_regime_filter=use_regime_filter,
+                    rejection_stats=rejection_stats,
+                )
 
                 winner, losers = CandidateArbitrator.pick_symbol_winner(
                     symbol, symbol_candidates
@@ -244,6 +221,127 @@ class StrategyScannerPipeline:
         self._finalize_scan_priority()
         scanner_logger.info("Pipeline scan finished in %.2fs.", time.time() - started)
         return dict_results
+
+    def _collect_symbol_candidates(
+        self,
+        snapshot,
+        strategies,
+        *,
+        regime,
+        use_regime_filter: bool,
+        rejection_stats: Counter,
+    ) -> list[SignalCandidate]:
+        """Evaluate strategies via confluence engine or legacy per-strategy loop."""
+        if Config.ENABLE_CONFLUENCE_SCORING:
+            return self._collect_via_evaluator(
+                snapshot,
+                strategies,
+                regime=regime,
+                use_regime_filter=use_regime_filter,
+                rejection_stats=rejection_stats,
+            )
+        return self._collect_legacy(
+            snapshot,
+            strategies,
+            regime=regime,
+            use_regime_filter=use_regime_filter,
+            rejection_stats=rejection_stats,
+        )
+
+    def _collect_via_evaluator(
+        self,
+        snapshot,
+        strategies,
+        *,
+        regime,
+        use_regime_filter: bool,
+        rejection_stats: Counter,
+    ) -> list[SignalCandidate]:
+        allowed_tags = {s.tag for s in strategies}
+        scores = self.evaluator.evaluate(snapshot)
+        symbol_candidates: list[SignalCandidate] = []
+
+        for score in scores:
+            if score.strategy not in allowed_tags:
+                continue
+            if use_regime_filter:
+                regime_tags = RegimeRouter.strategies_for_regime(regime)
+                if regime_tags and score.strategy not in regime_tags:
+                    if not self._legacy_single_strategy_mode(regime_tags):
+                        continue
+
+            effective = score.final_score or score.score
+            if effective < score.min_score and score.normalized_score <= 0:
+                rejection_stats["below_min_score"] += 1
+                continue
+
+            strategy = self.registry.get(score.strategy)
+            if strategy is None:
+                continue
+            try:
+                signal = strategy.evaluate(snapshot)
+            except Exception as exc:
+                error_logger.error(
+                    "Strategy %s failed on %s: %s",
+                    score.strategy,
+                    snapshot.symbol,
+                    exc,
+                )
+                continue
+            if signal is None:
+                continue
+            signal = CandidateArbitrator.apply_regime_fit(signal, score.regime_fit)
+            if not self._passes_min_score(signal):
+                rejection_stats["below_min_score"] += 1
+                continue
+            symbol_candidates.append(signal)
+        return symbol_candidates
+
+    def _collect_legacy(
+        self,
+        snapshot,
+        strategies,
+        *,
+        regime,
+        use_regime_filter: bool,
+        rejection_stats: Counter,
+    ) -> list[SignalCandidate]:
+        symbol_candidates: list[SignalCandidate] = []
+        for strategy in strategies:
+            if use_regime_filter:
+                allowed = strategy.allowed_regimes()
+                if allowed and regime.value not in allowed:
+                    continue
+                regime_tags = RegimeRouter.strategies_for_regime(regime)
+                if regime_tags and strategy.tag not in regime_tags:
+                    if not self._legacy_single_strategy_mode(regime_tags):
+                        continue
+
+            if strategy.requires_top_volume() and not snapshot.is_top_volume:
+                continue
+
+            fit = strategy.regime_fit(snapshot)
+            if fit <= 0:
+                continue
+
+            try:
+                signal = strategy.evaluate(snapshot)
+            except Exception as exc:
+                error_logger.error(
+                    "Strategy %s failed on %s: %s", strategy.tag, snapshot.symbol, exc
+                )
+                continue
+
+            if signal is None:
+                continue
+
+            signal = CandidateArbitrator.apply_regime_fit(signal, fit)
+            if not self._passes_min_score(signal):
+                rejection_stats["below_min_score"] += 1
+                continue
+
+            symbol_candidates.append(signal)
+        return symbol_candidates
 
     @staticmethod
     def _legacy_single_strategy_mode(strategy_tags: Optional[Iterable[str]]) -> bool:

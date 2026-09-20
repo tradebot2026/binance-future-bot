@@ -1,4 +1,4 @@
-"""Tiered scan priority — hot watchlist vs background rotation queue."""
+"""Tiered scan priority — instant HOT queue vs rotating background batches."""
 
 from __future__ import annotations
 
@@ -11,8 +11,8 @@ from core.symbol_rotation_manager import SymbolRotationManager
 
 class ScanPriorityQueue:
     """
-    Tier 1 (hot): top N high-activity symbols scanned frequently (WS-only).
-    Tier 2 (background): remaining symbols rotated in small batches.
+    Priority (hot): HOT / OPPORTUNITY / spikes — scanned frequently, skip evaluated memory.
+    Rotating (background): remaining scannable symbols in 15–20 coin batches.
     """
 
     def __init__(self) -> None:
@@ -24,6 +24,7 @@ class ScanPriorityQueue:
         self._last_background_batch_at: float = 0.0
         self.rotation = SymbolRotationManager()
         self._last_batch: list[str] = []
+        self._pending_fast_track: list[str] = []
 
     @property
     def hot_symbols(self) -> list[str]:
@@ -37,21 +38,68 @@ class ScanPriorityQueue:
     def full_universe(self) -> list[str]:
         return self._hot + self._background
 
+    def is_priority(self, symbol: str) -> bool:
+        return symbol.upper() in {s.upper() for s in self._hot}
+
     def update(
         self,
         ranked_symbols: list[str],
         *,
         extended_symbols: Optional[list[str]] = None,
         trigger_scores: Optional[dict[str, float]] = None,
+        lifecycle: Optional[dict[str, str]] = None,
+        fast_track: Optional[list[str]] = None,
     ) -> None:
-        """Split ranked universe into active_watch (hot) and background rotation queue."""
+        """Split ranked universe into priority and rotating queues."""
+        pending = list(self._pending_fast_track)
+        self._pending_fast_track = []
+        merged_fast = []
+        seen: set[str] = set()
+        for sym in list(fast_track or []) + pending:
+            key = sym.upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            merged_fast.append(key)
+
         self._hot, self._background = self.rotation.build_scan_slices(
             ranked_symbols,
             extended_symbols or [],
             trigger_scores,
+            lifecycle=lifecycle,
+            fast_track=merged_fast,
         )
         if self._background_index >= len(self._background):
             self._background_index = 0
+
+    def fast_track(self, symbols: list[str]) -> list[str]:
+        """Instantly promote spike symbols onto the priority queue."""
+        if not symbols:
+            return []
+        added: list[str] = []
+        hot_set = {s.upper() for s in self._hot}
+        for raw in symbols:
+            sym = raw.upper()
+            if not sym or sym in hot_set:
+                continue
+            self.rotation.clear_evaluated([sym])
+            self._background = [s for s in self._background if s.upper() != sym]
+            self._hot.insert(0, sym)
+            hot_set.add(sym)
+            added.append(sym)
+        cap = max(Config.HOT_SCAN_SIZE, 1)
+        overflow = self._hot[cap:]
+        self._hot = self._hot[:cap]
+        if overflow:
+            existing = {s.upper() for s in self._background}
+            for sym in overflow:
+                if sym.upper() not in existing:
+                    self._background.insert(0, sym)
+                    existing.add(sym.upper())
+        if added:
+            self._last_hot_scan_at = 0.0
+            self._pending_fast_track.extend(added)
+        return added
 
     def should_run_hot_scan(self) -> bool:
         if not self._hot:
@@ -73,7 +121,11 @@ class ScanPriorityQueue:
         if not self._background:
             return []
 
-        batch_size = max(Config.BACKGROUND_SCAN_BATCH_SIZE, 1)
+        batch_size = max(
+            Config.ROTATING_SCAN_BATCH_SIZE,
+            Config.BACKGROUND_SCAN_BATCH_SIZE,
+            1,
+        )
         seen: set[str] = set()
         batch: list[str] = []
         pool_len = len(self._background)
@@ -91,9 +143,12 @@ class ScanPriorityQueue:
         return batch
 
     def mark_last_background_batch_evaluated(self) -> None:
-        """Move the last background batch into evaluated memory (45–60 min skip)."""
+        """Move the last rotating batch into evaluated memory (skip unless fast-tracked)."""
         if self._last_batch:
-            self.rotation.mark_evaluated(self._last_batch)
+            remaining = [
+                sym for sym in self._last_batch if not self.is_priority(sym)
+            ]
+            self.rotation.mark_evaluated(remaining)
             self._last_batch = []
 
     def next_background_bootstrap_symbols(self, count: int | None = None) -> list[str]:

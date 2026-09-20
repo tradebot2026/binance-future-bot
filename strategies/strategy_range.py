@@ -7,19 +7,19 @@ from typing import TYPE_CHECKING, Optional, Set
 from config import Config
 from constants import STRATEGY_RANGE_REVERSION
 from core.directional import pick_directional_candidate
-from core.strategy_base import StrategyModule
+from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, RegimeLabel, SignalCandidate
 from indicators.market_analyzer import MarketAnalyzer
 from logger import signal_logger
-from range_engine import evaluate_range_setup
+from engines.range_engine import evaluate_range_setup
 from utils import safe_float
 
 if TYPE_CHECKING:
     from database import DatabaseManager
 
 
-class RangeStrategy(StrategyModule):
+class RangeStrategy(BaseStrategy):
     tag = STRATEGY_RANGE_REVERSION
     display_name = "Range Reversion"
 
@@ -58,7 +58,7 @@ class RangeStrategy(StrategyModule):
     def size_multiplier(self, score: float) -> float:
         return Config.RANGE_SIZE_MULTIPLIER if score >= Config.RANGE_MIN_SCORE else 0.0
 
-    def evaluate(self, snapshot: MarketSnapshot) -> Optional[SignalCandidate]:
+    def _evaluate_legacy(self, snapshot: MarketSnapshot) -> Optional[SignalCandidate]:
         df_entry = snapshot.candles.get(self.entry_tf)
         df_confirm = snapshot.candles.get(self.confirm_tf)
         df_trend = snapshot.candles.get(self.trend_tf)

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-import numpy as np
 import pandas as pd
 
 from config import Config
@@ -22,45 +21,9 @@ class VpBreakoutResult:
 
 
 def _volume_profile_levels(df: pd.DataFrame, bins: int = 24) -> tuple[float, float, float]:
-    if len(df) < 20:
-        return 0.0, 0.0, 0.0
-    low = float(df["low"].min())
-    high = float(df["high"].max())
-    if high <= low:
-        return 0.0, 0.0, 0.0
+    from core.context.volume_profile_engine import volume_profile_levels
 
-    edges = np.linspace(low, high, bins + 1)
-    vol_at_price = np.zeros(bins)
-    typical = (df["high"] + df["low"] + df["close"]) / 3.0
-    for tp, vol in zip(typical, df["volume"]):
-        idx = int((float(tp) - low) / (high - low) * (bins - 1))
-        idx = max(0, min(bins - 1, idx))
-        vol_at_price[idx] += safe_float(vol)
-
-    poc_idx = int(np.argmax(vol_at_price))
-    poc = float((edges[poc_idx] + edges[poc_idx + 1]) / 2.0)
-    total = vol_at_price.sum()
-    if total <= 0:
-        return poc, high, low
-
-    target = total * 0.70
-    acc = vol_at_price[poc_idx]
-    lo_i = hi_i = poc_idx
-    while acc < target and (lo_i > 0 or hi_i < bins - 1):
-        vol_lo = vol_at_price[lo_i - 1] if lo_i > 0 else -1
-        vol_hi = vol_at_price[hi_i + 1] if hi_i < bins - 1 else -1
-        if vol_hi >= vol_lo and hi_i < bins - 1:
-            hi_i += 1
-            acc += vol_at_price[hi_i]
-        elif lo_i > 0:
-            lo_i -= 1
-            acc += vol_at_price[lo_i]
-        else:
-            break
-
-    val = float(edges[lo_i])
-    vah = float(edges[hi_i + 1])
-    return poc, vah, val
+    return volume_profile_levels(df, bins=bins)
 
 
 def evaluate_vp_breakout(
