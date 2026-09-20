@@ -58,7 +58,7 @@ class VwapPullbackStrategy(BaseStrategy):
     def size_multiplier(self, score: float) -> float:
         if score >= Config.SCORE_FULL_SIZE:
             return 1.0
-        if score >= Config.VWAP_MIN_SCORE:
+        if score >= Config.effective_min_score(Config.VWAP_MIN_SCORE):
             return Config.HALF_SIZE_MULTIPLIER
         return 0.0
 
@@ -82,7 +82,7 @@ class VwapPullbackStrategy(BaseStrategy):
             short_c,
             win_margin=Config.DIRECTION_WIN_MARGIN,
             resolve_margin=Config.DIRECTION_EQUILIBRIUM_MIN_MARGIN,
-            min_score_fn=lambda _c, _m: Config.VWAP_MIN_SCORE,
+            min_score_fn=lambda _c, _m: Config.effective_min_score(Config.VWAP_MIN_SCORE),
             enable_equilibrium_resolve=False,
         )
 

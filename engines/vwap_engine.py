@@ -56,8 +56,13 @@ def evaluate_vwap_pullback(
     result.distance_atr = dist / atr if atr > 0 else 999.0
     action = action.upper()
 
-    macro_bull = not df_trend.empty and bool(df_trend.iloc[-1].get("trend_bullish"))
-    macro_bear = not df_trend.empty and bool(df_trend.iloc[-1].get("trend_bearish"))
+    trend_df = df_trend
+    if trend_df.empty and Config.testnet_strategy_relax() and not df_entry.empty:
+        trend_df = df_entry
+
+    macro_bull = not trend_df.empty and bool(trend_df.iloc[-1].get("trend_bullish"))
+    macro_bear = not trend_df.empty and bool(trend_df.iloc[-1].get("trend_bearish"))
+    max_distance = Config.vwap_max_distance_atr()
 
     if action == "LONG":
         if not macro_bull:
@@ -66,7 +71,7 @@ def evaluate_vwap_pullback(
         if price < vwap:
             result.reasons.append("price_below_vwap")
             return result
-        if result.distance_atr > 0.6:
+        if result.distance_atr > max_distance:
             result.reasons.append("too_far_from_vwap")
             return result
     else:
@@ -76,7 +81,7 @@ def evaluate_vwap_pullback(
         if price > vwap:
             result.reasons.append("price_above_vwap")
             return result
-        if result.distance_atr > 0.6:
+        if result.distance_atr > max_distance:
             result.reasons.append("too_far_from_vwap")
             return result
 
@@ -95,7 +100,7 @@ def evaluate_vwap_pullback(
         score += 5.0
 
     result.score = min(score, 92.0)
-    result.passed = result.score >= Config.VWAP_MIN_SCORE
+    result.passed = result.score >= Config.effective_min_score(Config.VWAP_MIN_SCORE)
     if not result.passed:
         result.reasons.append(f"score_below_min_{result.score:.1f}")
     return result

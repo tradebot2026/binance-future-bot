@@ -17,7 +17,8 @@ import telebot
 from config import Config
 from constants import TP1_PORTION, TP2_PORTION, TP3_PORTION, strategy_display_label
 from database import DatabaseManager
-from logger import error_logger, read_recent_error_log_lines, system_logger
+from exceptions import OrderExecutionError
+from logger import error_logger, read_recent_error_log_lines, system_logger, trade_logger
 from reporter import format_bot_health_message
 from telegram_alerts import (
     format_active_positions_message,
@@ -25,7 +26,7 @@ from telegram_alerts import (
     format_live_account_header,
     format_watchlist_message,
 )
-from utils import escape_html, safe_float, utc_today_str
+from utils import escape_html, minimum_order_quantity, safe_float, utc_today_str
 
 if TYPE_CHECKING:
     from bot_controller import BotController
@@ -405,6 +406,85 @@ class TelegramManager:
         subprocess.Popen([sys.executable, script, *sys.argv[1:]], cwd=cwd)
         os._exit(0)
 
+    def _place_testnet_test_trade(self, symbol: str) -> str:
+        """Place a minimum-size Testnet market LONG using REST ticker price."""
+        if not Config.USE_TESTNET:
+            return "🚫 /testtrade is blocked on MAINNET."
+        if Config.DRY_RUN:
+            return "🚫 /testtrade skipped — DRY_RUN is enabled."
+        if self.exchange is None:
+            return "⚠️ Exchange not attached."
+
+        symbol = symbol.strip().upper()
+        if not symbol:
+            return "Usage: /testtrade SYMBOL  (example: /testtrade ONGUSDT)"
+        if not symbol.endswith(Config.QUOTE_ASSET):
+            symbol = f"{symbol}{Config.QUOTE_ASSET}"
+
+        try:
+            price = safe_float(self.exchange.fetch_ticker(symbol))
+        except Exception as exc:
+            return f"❌ REST ticker failed for {escape_html(symbol)}: {escape_html(str(exc))}"
+        if price <= 0:
+            return f"❌ No live REST price for {escape_html(symbol)}."
+
+        try:
+            rules = self.exchange.get_symbol_rules(symbol)
+            qty = minimum_order_quantity(
+                price,
+                rules.min_qty,
+                rules.min_notional,
+                rules.step_size,
+                rules.quantity_precision,
+            )
+            try:
+                self.exchange.optimize_and_set_leverage(symbol)
+            except Exception as exc:
+                system_logger.warning("testtrade leverage setup %s: %s", symbol, exc)
+            trade_logger.info(
+                "[TESTTRADE] submitting MARKET BUY %s qty=%s rest_price=%.6f",
+                symbol,
+                qty,
+                price,
+            )
+            response = self.exchange.execute_futures_order(
+                symbol=symbol,
+                side="BUY",
+                position_side="LONG",
+                quantity=qty,
+            )
+        except OrderExecutionError as exc:
+            error_logger.error("testtrade order failed for %s: %s", symbol, exc)
+            return (
+                f"❌ Test trade failed on {escape_html(symbol)}:\n"
+                f"{escape_html(str(exc))}"
+            )
+        except Exception as exc:
+            error_logger.error("testtrade unexpected error for %s: %s", symbol, exc)
+            return (
+                f"❌ Test trade unexpected error on {escape_html(symbol)}:\n"
+                f"{escape_html(str(exc))}"
+            )
+
+        if not response:
+            return f"❌ Exchange returned an empty response for {escape_html(symbol)}."
+
+        order_id = escape_html(str(response.get("orderId", "?")))
+        status = escape_html(str(response.get("status", "?")))
+        avg = safe_float(response.get("avgPrice")) or price
+        filled = safe_float(response.get("executedQty")) or qty
+        return (
+            f"✅ <b>TEST TRADE SUBMITTED</b>\n\n"
+            f"🪙 <b>Symbol:</b> {escape_html(symbol)}\n"
+            f"🎯 <b>Side:</b> LONG MARKET\n"
+            f"💵 <b>REST price:</b> {price:.6f}\n"
+            f"📦 <b>Qty:</b> {filled:g}\n"
+            f"🏷 <b>Order ID:</b> {order_id}\n"
+            f"📌 <b>Status:</b> {status}\n"
+            f"📈 <b>Avg fill:</b> {avg:.6f}\n"
+            f"<i>Use /closeall to flatten if you do not want this position.</i>"
+        )
+
     # ---------------- Command handlers ----------------
 
     def _register_handlers(self) -> None:
@@ -727,6 +807,24 @@ class TelegramManager:
                 text = text[:3990] + "\n…"
             self.bot.reply_to(message, text)
 
+        @self.bot.message_handler(commands=["testtrade"])
+        @authorized
+        def testtrade_handler(message: telebot.types.Message) -> None:
+            parts = (message.text or "").split()
+            symbol = parts[1] if len(parts) >= 2 else ""
+            if not symbol:
+                self.bot.reply_to(
+                    message,
+                    "Usage: /testtrade SYMBOL\nExample: <code>/testtrade ONGUSDT</code>",
+                )
+                return
+            self.bot.reply_to(
+                message,
+                f"⏳ Placing Testnet min-size market LONG on {escape_html(symbol.upper())}…",
+            )
+            result = self._place_testnet_test_trade(symbol)
+            self.bot.reply_to(message, result)
+
         @self.bot.message_handler(commands=["help"])
         @authorized
         def help_handler(message: telebot.types.Message) -> None:
@@ -749,6 +847,7 @@ class TelegramManager:
                 "/active — open positions (DB + Binance REST)\n"
                 "/watchlist — Tier 1 hot scan + Tier 2 candidates\n"
                 "/health — system diagnostics (alias /pulse)\n"
+                "/testtrade SYMBOL — Testnet min-size market order (REST price)\n"
                 "/ping — quick online check\n"
                 "/help — this message",
             )

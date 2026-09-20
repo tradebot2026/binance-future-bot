@@ -171,6 +171,7 @@ class MarketDataHub:
         self._reconnect_lock = threading.Lock()
         self._reconnect_in_progress = False
         self._last_reconnect_request_at: float = 0.0
+        self._last_stale_reconnect_success_at: float = 0.0
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
         self._reconnect_policy = WsReconnectPolicy(
@@ -210,7 +211,10 @@ class MarketDataHub:
             elif self._last_health_stamp() <= 0:
                 state = "WARMING" if self.is_ws_warming_up() else "STALE"
             elif self.ws_is_stale() or self._book_stream_is_stale():
-                state = "STALE"
+                if self._kline_feeds_healthy() and self.is_ticker_cache_usable():
+                    state = "DEGRADED"
+                else:
+                    state = "STALE"
             else:
                 state = "HEALTHY"
 
@@ -251,7 +255,7 @@ class MarketDataHub:
 
     @staticmethod
     def _effective_ticker_stale_seconds() -> float:
-        """Testnet uses 60s to absorb quiet bursts; mainnet stays at 30s."""
+        """Testnet uses a longer window to absorb quiet bursts; mainnet stays at 30s."""
         if Config.USE_TESTNET:
             return float(max(Config.WS_STALE_SECONDS_TESTNET, 60))
         return float(max(Config.WS_STALE_SECONDS, 30))
@@ -347,11 +351,39 @@ class MarketDataHub:
         blocked, _ = self.is_rest_blocked()
         return blocked
 
+    def _kline_feeds_healthy(self) -> bool:
+        """True when at least one kline multiplex socket still received data recently."""
+        if not self._kline_sockets:
+            return False
+        stale_after = max(Config.WS_KLINE_SOCKET_STALE_SECONDS, 60)
+        if Config.USE_TESTNET:
+            stale_after = max(stale_after, Config.WS_STALE_SECONDS_TESTNET, 60)
+        now = time.monotonic()
+        return any(
+            bool(sock.streams) and (now - sock.last_event_at) < stale_after
+            for sock in self._kline_sockets
+        )
+
+    def _stale_reconnect_on_cooldown(self) -> bool:
+        cooldown = float(max(Config.WS_STALE_RECONNECT_COOLDOWN_SECONDS, 0.0))
+        if cooldown <= 0 or self._last_stale_reconnect_success_at <= 0:
+            return False
+        return (time.monotonic() - self._last_stale_reconnect_success_at) < cooldown
+
     def _should_reconnect_for_stale_ticker(self) -> bool:
-        """True when miniTicker or bookTicker age exceeds the 30s stale threshold."""
-        if self.ws_is_stale():
-            return True
-        return self._book_stream_is_stale()
+        """True when miniTicker/bookTicker age exceeds stale threshold.
+
+        Testnet miniTicker/bookTicker often idle while klines still tick. Do not
+        tear down the whole hub (and wipe kline sockets) in that case — REST-refresh
+        tickers instead. Also honor a cooldown after a successful stale reconnect.
+        """
+        if not self.ws_is_stale() and not self._book_stream_is_stale():
+            return False
+        if self._kline_feeds_healthy() or self._stale_reconnect_on_cooldown():
+            if not self._rest_quiet_mode():
+                self.refresh_ticker_cache_from_rest(silent=True)
+            return False
+        return True
 
     def is_ticker_cache_usable(self, min_symbols: int = 1) -> bool:
         """Scanner may proceed when tickers are present (WS or REST)."""
@@ -740,6 +772,7 @@ class MarketDataHub:
             )
             self._start_ws_internal(preserve_cache=preserve_cache)
             self._mark_stream_freshness()
+            self._last_stale_reconnect_success_at = time.monotonic()
             self._ws_log.reset()
             system_logger.info(
                 "WebSocket streams re-subscribed (miniTicker + bookTicker + userData) "

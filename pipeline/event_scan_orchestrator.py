@@ -234,14 +234,20 @@ class EventScanOrchestrator:
                 "Priority scan dispatching %s execution candidate(s).",
                 len(dict_results),
             )
+        else:
+            scanner_logger.info(
+                "Priority scan produced 0 execution candidates "
+                "(tier2=%s hot=%s background=%s).",
+                self.assignment_manager.tier2_size,
+                hot_count,
+                len(self.priority_queue.background_symbols),
+            )
         return dict_results
 
     def process_hot_scan_cycle(self) -> list[SignalCandidate]:
-        """Tier 1 — frequent WS-only scan of high-activity symbols."""
-        if not self.priority_queue.should_run_hot_scan():
-            return []
-
-        symbols = self.priority_queue.hot_symbols
+        """Tier 1 — frequent WS-only scan of high-activity + Tier-2 symbols."""
+        run_hot = self.priority_queue.should_run_hot_scan()
+        symbols = self._execution_scan_symbols(include_hot=run_hot)
         if not symbols:
             return []
 
@@ -270,7 +276,8 @@ class EventScanOrchestrator:
                 if signal is not None:
                     candidates.append(signal)
 
-        self.priority_queue.mark_hot_scan_complete()
+        if run_hot:
+            self.priority_queue.mark_hot_scan_complete()
         if candidates:
             scanner_logger.info(
                 "Hot scan produced %s execution candidate(s) from %s symbols.",
@@ -376,6 +383,7 @@ class EventScanOrchestrator:
         if (
             self.priority_queue.rotation.is_in_evaluated_memory(symbol)
             and not self.priority_queue.is_priority(symbol)
+            and not self.assignment_manager.is_hot(symbol)
         ):
             scanner_logger.debug(
                 "Skip %s — in evaluated memory (rotation cooldown).", symbol
@@ -388,7 +396,7 @@ class EventScanOrchestrator:
 
         ticker = ticker_map.get(symbol, {})
         book = book_map.get(symbol, {})
-        price = self._price_map.get(symbol, float(ticker.get("lastPrice", 0) or 0))
+        price = self._resolve_eval_price(symbol, ticker)
         volume_24h = float(ticker.get("quoteVolume", 0) or 0)
         volume_rank = self._volume_ranks.get(symbol, 0)
 
@@ -443,8 +451,10 @@ class EventScanOrchestrator:
             self.assignment_manager.gc_demoted(
                 gc_symbol, self._hub.demote_symbol_klines
             )
-        if promoted and self._hub:
-            self._hub.subscribe_kline_streams([symbol])
+        if promoted:
+            self.priority_queue.rotation.clear_evaluated([symbol])
+            if self._hub:
+                self._hub.subscribe_kline_streams([symbol])
 
         best = self.scoring_engine.pick_best(scores)
         if mark_event is not None:
@@ -594,6 +604,36 @@ class EventScanOrchestrator:
             len(promoted),
             ", ".join(promoted[:8]),
         )
+
+    def _execution_scan_symbols(self, *, include_hot: bool) -> list[str]:
+        """Hot queue plus already-promoted Tier-2 names (execution, not a 4th scanner)."""
+        symbols: list[str] = []
+        seen: set[str] = set()
+        rows: list[str] = []
+        if include_hot:
+            rows.extend(self.priority_queue.hot_symbols)
+        rows.extend(self.assignment_manager.hot_symbols())
+        for raw in rows:
+            key = str(raw).upper()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            symbols.append(key)
+        return symbols
+
+    def _resolve_eval_price(self, symbol: str, ticker: dict[str, Any]) -> float:
+        """Prefer cached last price; never REST inside scan_context."""
+        price = float(self._price_map.get(symbol, 0.0) or 0.0)
+        if price <= 0:
+            price = float(ticker.get("lastPrice", 0) or 0)
+        if price <= 0 and self._hub is not None:
+            try:
+                cached = self._hub.get_price(symbol)
+            except Exception:
+                cached = None
+            if cached:
+                price = float(cached)
+        return price if price > 0 else 0.0
 
     def _ws_ticker_map(self) -> dict[str, Any]:
         if self._hub:

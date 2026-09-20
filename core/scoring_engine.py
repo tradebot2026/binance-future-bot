@@ -67,47 +67,51 @@ class ScoringEngine:
     ) -> float:
         """Per-strategy execution floor used for normalization."""
         if strategy == STRATEGY_RANGE_REVERSION:
-            return Config.RANGE_MIN_SCORE
-        if strategy == STRATEGY_SMC_TREND:
+            base = Config.RANGE_MIN_SCORE
+        elif strategy == STRATEGY_SMC_TREND:
             if signal is not None:
-                return effective_smc_min_score(
+                base = effective_smc_min_score(
                     signal.confluence, signal.macro_trend or "NEUTRAL"
                 )
-            return Config.STRATEGY_MIN_SCORE
-        if strategy == STRATEGY_LIQUIDITY_SWEEP:
-            return Config.LSC_MIN_SCORE
-        if strategy == STRATEGY_VWAP_PULLBACK:
-            return Config.VWAP_MIN_SCORE
-        if strategy == STRATEGY_VP_BREAKOUT:
-            return Config.VPB_MIN_SCORE
-        if strategy == STRATEGY_VOL_EXPANSION:
-            return Config.VEMR_MIN_SCORE
-        if strategy == STRATEGY_BREAKOUT_RETEST:
-            return Config.BREAKOUT_RETEST_MIN_SCORE
-        if strategy == STRATEGY_FALSE_BREAKOUT_SFP:
-            return Config.FALSE_BREAKOUT_SFP_MIN_SCORE
-        if strategy == STRATEGY_VOL_SQUEEZE:
-            return Config.VOL_SQUEEZE_MIN_SCORE
-        if strategy == STRATEGY_TREND_MOMENTUM:
-            return Config.TREND_MOMENTUM_MIN_SCORE
-        if strategy == STRATEGY_PRICE_ACTION_REVERSAL:
-            return Config.PRICE_ACTION_REVERSAL_MIN_SCORE
-        from constants import (
-            STRATEGY_MTF_ALIGNMENT,
-            STRATEGY_OI_FUNDING,
-            STRATEGY_ORDER_FLOW,
-            STRATEGY_VP_KEYLEVEL,
-        )
+            else:
+                base = Config.STRATEGY_MIN_SCORE
+        elif strategy == STRATEGY_LIQUIDITY_SWEEP:
+            base = Config.LSC_MIN_SCORE
+        elif strategy == STRATEGY_VWAP_PULLBACK:
+            base = Config.VWAP_MIN_SCORE
+        elif strategy == STRATEGY_VP_BREAKOUT:
+            base = Config.VPB_MIN_SCORE
+        elif strategy == STRATEGY_VOL_EXPANSION:
+            base = Config.VEMR_MIN_SCORE
+        elif strategy == STRATEGY_BREAKOUT_RETEST:
+            base = Config.BREAKOUT_RETEST_MIN_SCORE
+        elif strategy == STRATEGY_FALSE_BREAKOUT_SFP:
+            base = Config.FALSE_BREAKOUT_SFP_MIN_SCORE
+        elif strategy == STRATEGY_VOL_SQUEEZE:
+            base = Config.VOL_SQUEEZE_MIN_SCORE
+        elif strategy == STRATEGY_TREND_MOMENTUM:
+            base = Config.TREND_MOMENTUM_MIN_SCORE
+        elif strategy == STRATEGY_PRICE_ACTION_REVERSAL:
+            base = Config.PRICE_ACTION_REVERSAL_MIN_SCORE
+        else:
+            from constants import (
+                STRATEGY_MTF_ALIGNMENT,
+                STRATEGY_OI_FUNDING,
+                STRATEGY_ORDER_FLOW,
+                STRATEGY_VP_KEYLEVEL,
+            )
 
-        if strategy == STRATEGY_MTF_ALIGNMENT:
-            return Config.MTF_ALIGNMENT_MIN_SCORE
-        if strategy == STRATEGY_VP_KEYLEVEL:
-            return Config.VP_KEYLEVEL_MIN_SCORE
-        if strategy == STRATEGY_ORDER_FLOW:
-            return Config.ORDER_FLOW_MIN_SCORE
-        if strategy == STRATEGY_OI_FUNDING:
-            return Config.OI_FUNDING_MIN_SCORE
-        return Config.STRATEGY_MIN_SCORE
+            if strategy == STRATEGY_MTF_ALIGNMENT:
+                base = Config.MTF_ALIGNMENT_MIN_SCORE
+            elif strategy == STRATEGY_VP_KEYLEVEL:
+                base = Config.VP_KEYLEVEL_MIN_SCORE
+            elif strategy == STRATEGY_ORDER_FLOW:
+                base = Config.ORDER_FLOW_MIN_SCORE
+            elif strategy == STRATEGY_OI_FUNDING:
+                base = Config.OI_FUNDING_MIN_SCORE
+            else:
+                base = Config.STRATEGY_MIN_SCORE
+        return Config.effective_min_score(base)
 
     @staticmethod
     def scaled_adjusted_threshold(
@@ -172,9 +176,9 @@ class ScoringEngine:
         effective = best.final_score or best.score
         if effective < best.min_score:
             return False
-        if effective >= Config.TIER2_PROMOTE_SCORE:
+        if effective >= Config.tier2_promote_score():
             return True
-        promote = promote_normalized or Config.TIER2_PROMOTE_NORMALIZED
+        promote = promote_normalized or Config.tier2_promote_normalized()
         if best.normalized_score >= promote:
             return True
         required_adjusted = ScoringEngine.scaled_adjusted_threshold(

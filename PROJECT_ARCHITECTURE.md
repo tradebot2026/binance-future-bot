@@ -140,7 +140,7 @@ Scan, ranking, and sub-scans run under `exchange.scan_context()` which **blocks 
 
 #### Staleness & halt
 
-- Ticker / bookTicker stale: `WS_STALE_SECONDS` (30s mainnet) / `WS_STALE_SECONDS_TESTNET` (60s). Watchdog force-resets `miniTicker`, `bookTicker`, and `userData`. `/health` is `HEALTHY` only after a live tick. Ping/pong: 15s / 10s. Silent REST ticker poll while sockets reconnect.
+- Ticker / bookTicker stale: `WS_STALE_SECONDS` (30s mainnet) / `WS_STALE_SECONDS_TESTNET` (180s). Watchdog force-resets `miniTicker`, `bookTicker`, and `userData` only when kline feeds are also stale (and not inside `WS_STALE_RECONNECT_COOLDOWN_SECONDS`). Quiet Testnet tickers with live klines are `DEGRADED` — REST ticker cache is refreshed, klines are not torn down. `/health` is `HEALTHY` after a live tick. Ping/pong: 15s / 10s. Execution uses REST `fetch_ticker()` when WS is STALE/WARMING/DEGRADED.
 - `-1003` IP ban → `halt_scanning()`; scanner returns empty; monitor continues
 - Startup `futures_ping()` defers REST init if already banned
 
@@ -325,6 +325,7 @@ Authorized `TELEGRAM_CHAT_ID` only.
 | `/ping` `/health` | Liveness; `/ping` shows TESTNET/MAINNET and DRY_RUN |
 | `/status` `/risk` `/positions` `/balance` `/active` | Portfolio |
 | `/watchlist` | HOT + rotating + Tier-2 |
+| `/testtrade SYMBOL` | Testnet-only min-size MARKET LONG via REST ticker (`fetch_ticker`) |
 | `/pause` `/resume` | Entries only |
 | `/forceresume` | Clears daily stop — **testnet only** unless `ALLOW_MAINNET_FORCE_RESUME=True` |
 | `/errors` | DB + `errors.log` from the last `TELEGRAM_ERROR_LOG_MAX_AGE_HOURS` (default 48) |

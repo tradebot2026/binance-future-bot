@@ -47,6 +47,11 @@ class SnapshotFactory:
                 return None
             candles[tf] = df
 
+        if price <= 0:
+            entry_df = candles.get(Config.ENTRY_TIMEFRAME)
+            if entry_df is not None and not entry_df.empty:
+                price = safe_float(entry_df.iloc[-1].get("close"))
+
         spread_pct = self._spread_from_book(book)
         top_limit = Config.VP_BREAKOUT_TOP_VOLUME_LIMIT
         snapshot = MarketSnapshot(

@@ -24,10 +24,8 @@ class AssignmentManager:
         demote_normalized: Optional[float] = None,
         max_hot: Optional[int] = None,
     ) -> None:
-        self._promote_normalized = (
-            promote_normalized or Config.TIER2_PROMOTE_NORMALIZED
-        )
-        self._demote_normalized = demote_normalized or Config.TIER2_DEMOTE_NORMALIZED
+        self._promote_normalized = promote_normalized
+        self._demote_normalized = demote_normalized
         self._max_hot = max_hot or Config.TIER2_HOT_SIZE
         self._tier2: dict[str, CoinAssignment] = {}
         self._last_best: dict[str, StrategyScore] = {}
@@ -82,7 +80,11 @@ class AssignmentManager:
                 existing.strategy = best.strategy
                 return False, False, None
 
-            if best.normalized_score < self._demote_normalized:
+            if best.normalized_score < (
+                self._demote_normalized
+                if self._demote_normalized is not None
+                else Config.TIER2_DEMOTE_NORMALIZED
+            ):
                 del self._tier2[symbol]
                 scanner_logger.info(
                     "Tier2 demote %s | strategy=%s norm=%.1f raw=%.1f < %.1f",
@@ -90,7 +92,9 @@ class AssignmentManager:
                     existing.strategy,
                     best.normalized_score,
                     best.score,
-                    self._demote_normalized,
+                    self._demote_normalized
+                    if self._demote_normalized is not None
+                    else Config.TIER2_DEMOTE_NORMALIZED,
                 )
                 return False, True, symbol
 
@@ -144,7 +148,9 @@ class AssignmentManager:
             best.min_score,
             best.normalized_score,
             Config.TIER2_PROMOTE_SCORE,
-            self._promote_normalized,
+            self._promote_normalized
+            if self._promote_normalized is not None
+            else Config.tier2_promote_normalized(),
         )
 
     def near_miss_summary(self, limit: int = 10) -> list[tuple[str, str, float, float]]:
@@ -192,7 +198,11 @@ class AssignmentManager:
     def _qualifies_for_promotion(self, best: StrategyScore) -> bool:
         return ScoringEngine.qualifies_for_tier2(
             best,
-            promote_normalized=self._promote_normalized,
+            promote_normalized=(
+                self._promote_normalized
+                if self._promote_normalized is not None
+                else Config.tier2_promote_normalized()
+            ),
         )
 
     def _evict_lowest(self, unless: str) -> Optional[str]:

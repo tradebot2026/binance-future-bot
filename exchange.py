@@ -2885,6 +2885,16 @@ class BinanceExchangeManager:
         else:
             order_params["type"] = "MARKET"
 
+        trade_logger.info(
+            "[ORDER_SUBMIT] %s | %s %s | type=%s qty=%s reduce_only=%s",
+            symbol,
+            side.upper(),
+            position_side.upper(),
+            order_params["type"],
+            order_params["quantity"],
+            reduce_only,
+        )
+
         try:
             with self.execution_context():
                 response = self._throttled_call(
@@ -2896,12 +2906,12 @@ class BinanceExchangeManager:
             self.invalidate_balance_cache()
             self.invalidate_position_cache()
             trade_logger.info(
-                "Order filled | %s | %s %s | qty=%s | reduce_only=%s",
+                "[ORDER_FILLED] %s | orderId=%s status=%s avg=%s qty=%s",
                 symbol,
-                side,
-                position_side,
+                response.get("orderId") if isinstance(response, dict) else None,
+                response.get("status") if isinstance(response, dict) else None,
+                response.get("avgPrice") if isinstance(response, dict) else None,
                 order_params["quantity"],
-                reduce_only,
             )
             return response
         except PositionAlreadyClosedError:
@@ -2914,10 +2924,13 @@ class BinanceExchangeManager:
                     str(exc.message), code=int(exc.code)
                 ) from exc
             error_logger.error(
-                "Binance rejected order on %s: %s (code=%s)",
+                "[ORDER_REJECT] Binance rejected %s %s %s: %s (code=%s) payload=%s",
                 symbol,
+                side.upper(),
+                position_side.upper(),
                 exc.message,
                 exc.code,
+                {k: order_params.get(k) for k in ("symbol", "side", "positionSide", "type", "quantity", "price")},
             )
             if self._critical_alerts:
                 self._critical_alerts.notify(

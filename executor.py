@@ -663,7 +663,7 @@ class TradeExecutor:
             snap = snap_fn()
             if isinstance(snap, dict):
                 state = str(snap.get("state", "")).upper()
-                if state in {"WARMING", "RECONNECTING", "STALE"}:
+                if state in {"WARMING", "RECONNECTING", "STALE", "DEGRADED"}:
                     return True
         fresh_fn = getattr(hub, "get_fresh_ticker_price", None)
         if callable(fresh_fn):
@@ -902,6 +902,15 @@ class TradeExecutor:
             leverage = Config.MAX_LEVERAGE
 
         trade_side = "BUY" if action == "LONG" else "SELL"
+        trade_logger.info(
+            "[ORDER_SUBMIT] dispatching %s %s %s | qty=%.8f | price=%.6f | strategy=%s",
+            symbol,
+            trade_side,
+            position_side,
+            quantity,
+            current_price,
+            strategy,
+        )
         try:
             response = self.exchange.execute_futures_order(
                 symbol=symbol,

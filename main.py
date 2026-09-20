@@ -272,6 +272,30 @@ def _execute_candidates(
 
         try:
             valid, validation_reason, normalized = _validate_candidate(candidate)
+            if not valid and "invalid price" in validation_reason:
+                symbol_hint = str(candidate.get("symbol", "")).strip().upper()
+                rest_price = 0.0
+                if symbol_hint:
+                    try:
+                        rest_price = safe_float(
+                            executor.exchange.fetch_ticker(symbol_hint)
+                        )
+                    except Exception as exc:
+                        error_logger.warning(
+                            "REST ticker fallback failed for %s: %s",
+                            symbol_hint,
+                            exc,
+                        )
+                if rest_price > 0:
+                    patched = dict(candidate)
+                    patched["price"] = rest_price
+                    system_logger.info(
+                        "Candidate %s price filled from REST ticker %.6f "
+                        "(WS/cache price was missing).",
+                        symbol_hint,
+                        rest_price,
+                    )
+                    valid, validation_reason, normalized = _validate_candidate(patched)
             if not valid:
                 log_execution_rejected(
                     str(candidate.get("symbol", "?")),

@@ -41,8 +41,10 @@ class ContextStrategyBase(BaseStrategy):
 
     def min_score(self, signal=None) -> float:
         if self._min_score_attr:
-            return float(getattr(Config, self._min_score_attr, Config.STRATEGY_MIN_SCORE))
-        return Config.STRATEGY_MIN_SCORE
+            base = float(getattr(Config, self._min_score_attr, Config.STRATEGY_MIN_SCORE))
+        else:
+            base = Config.STRATEGY_MIN_SCORE
+        return Config.effective_min_score(base)
 
     def max_concurrent_positions(self) -> int:
         if self._max_positions_attr:

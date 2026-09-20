@@ -77,7 +77,10 @@ class Config:
     INIT_REST_DELAY_SECONDS: float = _env_float("INIT_REST_DELAY_SECONDS", 0.5)
     ENABLE_WEBSOCKET_STREAMS: bool = _env_bool("ENABLE_WEBSOCKET_STREAMS", True)
     WS_STALE_SECONDS: int = _env_int("WS_STALE_SECONDS", 30)
-    WS_STALE_SECONDS_TESTNET: int = _env_int("WS_STALE_SECONDS_TESTNET", 60)
+    WS_STALE_SECONDS_TESTNET: int = _env_int("WS_STALE_SECONDS_TESTNET", 180)
+    WS_STALE_RECONNECT_COOLDOWN_SECONDS: float = _env_float(
+        "WS_STALE_RECONNECT_COOLDOWN_SECONDS", 180.0
+    )
     WS_PING_INTERVAL_SECONDS: float = _env_float("WS_PING_INTERVAL_SECONDS", 15.0)
     WS_PING_TIMEOUT_SECONDS: float = _env_float("WS_PING_TIMEOUT_SECONDS", 10.0)
     WS_USER_STALE_SECONDS: int = _env_int("WS_USER_STALE_SECONDS", 120)
@@ -330,6 +333,10 @@ class Config:
     RANGE_MIN_SCORE: float = _env_float("RANGE_MIN_SCORE", 65.0)
     LSC_MIN_SCORE: float = _env_float("LSC_MIN_SCORE", 68.0)
     VWAP_MIN_SCORE: float = _env_float("VWAP_MIN_SCORE", 70.0)
+    VWAP_MAX_DISTANCE_ATR: float = _env_float("VWAP_MAX_DISTANCE_ATR", 0.6)
+    VWAP_MAX_DISTANCE_ATR_TESTNET: float = _env_float(
+        "VWAP_MAX_DISTANCE_ATR_TESTNET", 1.25
+    )
     VPB_MIN_SCORE: float = _env_float("VPB_MIN_SCORE", 72.0)
     VEMR_MIN_SCORE: float = _env_float("VEMR_MIN_SCORE", 65.0)
     BREAKOUT_RETEST_MIN_SCORE: float = _env_float("BREAKOUT_RETEST_MIN_SCORE", 70.0)
@@ -463,9 +470,13 @@ class Config:
     )
     TIER2_HOT_SIZE: int = _env_int("TIER2_HOT_SIZE", 20)
     TIER2_PROMOTE_SCORE: float = _env_float("TIER2_PROMOTE_SCORE", 80.0)
+    TIER2_PROMOTE_SCORE_TESTNET: float = _env_float("TIER2_PROMOTE_SCORE_TESTNET", 65.0)
     TIER2_DEMOTE_SCORE: float = _env_float("TIER2_DEMOTE_SCORE", 70.0)
     # Normalized Tier-2 gates: (raw - min) / (100 - min) * 100 — fair across strategies.
     TIER2_PROMOTE_NORMALIZED: float = _env_float("TIER2_PROMOTE_NORMALIZED", 70.0)
+    TIER2_PROMOTE_NORMALIZED_TESTNET: float = _env_float(
+        "TIER2_PROMOTE_NORMALIZED_TESTNET", 40.0
+    )
     TIER2_DEMOTE_NORMALIZED: float = _env_float("TIER2_DEMOTE_NORMALIZED", 50.0)
     EVENT_EVAL_STAGGER_MS: float = _env_float("EVENT_EVAL_STAGGER_MS", 50.0)
     EVENT_CATCHUP_INTERVAL_SECONDS: int = _env_int("EVENT_CATCHUP_INTERVAL_SECONDS", 60)
@@ -614,6 +625,10 @@ class Config:
     TESTNET_RELAX_UNIVERSE_FILTERS: bool = _env_bool(
         "TESTNET_RELAX_UNIVERSE_FILTERS", True
     )
+    TESTNET_RELAX_STRATEGY_THRESHOLDS: bool = _env_bool(
+        "TESTNET_RELAX_STRATEGY_THRESHOLDS", True
+    )
+    TESTNET_MIN_SCORE_RELAX: float = _env_float("TESTNET_MIN_SCORE_RELAX", 10.0)
     TESTNET_MIN_24H_VOLUME_USDT: float = _env_float("TESTNET_MIN_24H_VOLUME_USDT", 0.0)
     TESTNET_MIN_24H_RANGE_PCT: float = _env_float("TESTNET_MIN_24H_RANGE_PCT", 0.0)
     TESTNET_DISABLE_UNIVERSE_ATR_FILTER: bool = _env_bool(
@@ -686,6 +701,39 @@ class Config:
     @classmethod
     def is_mega_cap_blacklisted(cls, symbol: str) -> bool:
         return symbol.upper() in cls.DEFAULT_MEGA_CAP_BLACKLIST
+
+    @classmethod
+    def testnet_strategy_relax(cls) -> bool:
+        """True when Testnet should use looser entry floors (quiet ticker streams)."""
+        return bool(cls.USE_TESTNET and cls.TESTNET_RELAX_STRATEGY_THRESHOLDS)
+
+    @classmethod
+    def effective_min_score(cls, base: float) -> float:
+        """Strategy execution floor; Testnet subtracts TESTNET_MIN_SCORE_RELAX."""
+        value = float(base)
+        if cls.testnet_strategy_relax():
+            value = max(50.0, value - float(cls.TESTNET_MIN_SCORE_RELAX))
+        return value
+
+    @classmethod
+    def vwap_max_distance_atr(cls) -> float:
+        if cls.testnet_strategy_relax():
+            return float(cls.VWAP_MAX_DISTANCE_ATR_TESTNET)
+        return float(cls.VWAP_MAX_DISTANCE_ATR)
+
+    @classmethod
+    def tier2_promote_score(cls) -> float:
+        if cls.testnet_strategy_relax():
+            return float(min(cls.TIER2_PROMOTE_SCORE, cls.TIER2_PROMOTE_SCORE_TESTNET))
+        return float(cls.TIER2_PROMOTE_SCORE)
+
+    @classmethod
+    def tier2_promote_normalized(cls) -> float:
+        if cls.testnet_strategy_relax():
+            return float(
+                min(cls.TIER2_PROMOTE_NORMALIZED, cls.TIER2_PROMOTE_NORMALIZED_TESTNET)
+            )
+        return float(cls.TIER2_PROMOTE_NORMALIZED)
 
     @classmethod
     def get_scan_kline_intervals(cls) -> list[str]:

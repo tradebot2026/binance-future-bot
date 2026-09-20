@@ -158,7 +158,7 @@ class TestWsStaleReconnect(unittest.TestCase):
     def test_book_ticker_message_updates_book_freshness(self) -> None:
         hub = _hub_with_running_ws()
         hub._last_ticker_event_at = time.monotonic()
-        hub._last_book_event_at = time.monotonic() - 90.0
+        hub._last_book_event_at = time.monotonic() - 250.0
         with patch.object(Config, "ENABLE_WS_BOOK_STREAM", True), patch.object(
             Config, "WS_STALE_SECONDS", 30
         ):
@@ -182,6 +182,40 @@ class TestWsStaleReconnect(unittest.TestCase):
         ), patch.object(Config, "WS_STALE_SECONDS_TESTNET", 60):
             self.assertTrue(hub.execution_requires_rest_price("BTCUSDT"))
             self.assertIsNone(hub.get_execution_ticker_price("BTCUSDT"))
+
+    def test_healthy_klines_skip_full_ticker_reconnect(self) -> None:
+        from market_data_hub import _KlineMultiplexSocket
+
+        hub = _hub_with_running_ws()
+        hub._last_ticker_event_at = time.monotonic() - 90.0
+        hub._last_book_event_at = time.monotonic() - 90.0
+        hub._kline_sockets = [
+            _KlineMultiplexSocket(
+                streams=["ongusdt@kline_5m"],
+                last_event_at=time.monotonic(),
+            )
+        ]
+        with patch.object(Config, "USE_TESTNET", True), patch.object(
+            Config, "ENABLE_WS_BOOK_STREAM", True
+        ), patch.object(Config, "WS_STALE_SECONDS_TESTNET", 60), patch.object(
+            hub, "refresh_ticker_cache_from_rest", return_value=12
+        ) as rest:
+            self.assertTrue(hub._kline_feeds_healthy())
+            self.assertFalse(hub._should_reconnect_for_stale_ticker())
+            rest.assert_called()
+            self.assertEqual(hub.get_ws_health_snapshot()["state"], "DEGRADED")
+
+    def test_stale_reconnect_cooldown_skips_repeat(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._last_ticker_event_at = time.monotonic() - 90.0
+        hub._last_stale_reconnect_success_at = time.monotonic()
+        with patch.object(Config, "USE_TESTNET", True), patch.object(
+            Config, "ENABLE_WS_BOOK_STREAM", False
+        ), patch.object(Config, "WS_STALE_SECONDS_TESTNET", 60), patch.object(
+            Config, "WS_STALE_RECONNECT_COOLDOWN_SECONDS", 180.0
+        ), patch.object(hub, "refresh_ticker_cache_from_rest", return_value=12):
+            self.assertTrue(hub._stale_reconnect_on_cooldown())
+            self.assertFalse(hub._should_reconnect_for_stale_ticker())
 
 
 if __name__ == "__main__":

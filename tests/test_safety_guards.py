@@ -259,5 +259,83 @@ class TestEnginesPackage(unittest.TestCase):
         self.assertTrue(callable(evaluate_range_setup))
 
 
+class TestTelegramTestTrade(unittest.TestCase):
+    def test_testtrade_blocked_on_mainnet(self) -> None:
+        from telegram_bot import TelegramManager
+
+        tg = TelegramManager.__new__(TelegramManager)
+        tg.exchange = MagicMock()
+        with patch.object(Config, "USE_TESTNET", False):
+            msg = tg._place_testnet_test_trade("ONGUSDT")
+        self.assertIn("MAINNET", msg)
+        tg.exchange.fetch_ticker.assert_not_called()
+
+    def test_testtrade_places_min_market_on_testnet(self) -> None:
+        from telegram_bot import TelegramManager
+
+        tg = TelegramManager.__new__(TelegramManager)
+        tg.exchange = MagicMock()
+        tg.exchange.fetch_ticker.return_value = 1.25
+        rules = MagicMock()
+        rules.min_qty = 1.0
+        rules.min_notional = 5.0
+        rules.step_size = 1.0
+        rules.quantity_precision = 0
+        tg.exchange.get_symbol_rules.return_value = rules
+        tg.exchange.execute_futures_order.return_value = {
+            "orderId": 99,
+            "status": "FILLED",
+            "avgPrice": "1.25",
+            "executedQty": "4",
+        }
+        with patch.object(Config, "USE_TESTNET", True), patch.object(
+            Config, "DRY_RUN", False
+        ), patch.object(Config, "QUOTE_ASSET", "USDT"):
+            msg = tg._place_testnet_test_trade("ONGUSDT")
+        self.assertIn("TEST TRADE SUBMITTED", msg)
+        tg.exchange.fetch_ticker.assert_called_once_with("ONGUSDT")
+        tg.exchange.execute_futures_order.assert_called_once()
+        kwargs = tg.exchange.execute_futures_order.call_args.kwargs
+        self.assertEqual(kwargs["side"], "BUY")
+        self.assertEqual(kwargs["position_side"], "LONG")
+
+
+class TestCandidateRestPrice(unittest.TestCase):
+    def test_execute_candidates_fills_zero_price_from_rest(self) -> None:
+        import main as main_mod
+
+        executor = MagicMock()
+        executor.exchange.fetch_ticker.return_value = 12.5
+        executor.execute_trade.return_value = None
+        candidate = {
+            "symbol": "ONGUSDT",
+            "action": "LONG",
+            "atr": 0.1,
+            "price": 0.0,
+            "score": 90.0,
+            "strategy": "VWAP_PULLBACK",
+        }
+        with patch.object(Config, "DRY_RUN", False), patch.object(
+            Config, "MAX_ENTRIES_PER_CYCLE", 3
+        ), patch.object(
+            main_mod, "_entries_allowed", return_value=(True, "")
+        ), patch(
+            "core.risk_engine.RiskEngine.approve_entry", return_value=(True, "")
+        ), patch(
+            "strategies.build_strategy_registry", return_value=MagicMock()
+        ):
+            main_mod._execute_candidates(
+                [candidate],
+                executor,
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+            )
+        executor.exchange.fetch_ticker.assert_called()
+        executor.execute_trade.assert_called()
+        self.assertEqual(executor.execute_trade.call_args.kwargs["current_price"], 12.5)
+
+
 if __name__ == "__main__":
     unittest.main()
