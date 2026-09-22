@@ -59,6 +59,26 @@ performance_logger = setup_logger("Performance", "performance.log")
 error_logger = setup_logger("Error", "errors.log", level=logging.WARNING)
 
 
+def log_strategy_approved(
+    symbol: str,
+    action: str,
+    strategy: str,
+    score: float,
+    extra: str = "",
+) -> None:
+    """Strategy/risk gate only — does not mean a Binance order was sent."""
+    tail = f" | {extra}" if extra else ""
+    signal_logger.info(
+        "[TRADE_APPROVED] %s %s | strategy=%s | score=%.1f | "
+        "(strategy gate only — no Binance order yet)%s",
+        symbol,
+        action,
+        strategy,
+        score,
+        tail,
+    )
+
+
 def error_log_cutoff(max_age_hours: float | None = None) -> datetime:
     """UTC cutoff for Telegram /errors reports (default last 48 hours)."""
     hours = (

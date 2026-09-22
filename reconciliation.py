@@ -749,3 +749,54 @@ def _purge_orphan_exchange_file(exchange: "BinanceExchangeManager") -> int:
         error_logger.error("Failed to purge orphan exchange file: %s", exc)
 
     return purged
+
+
+def reconcile_uncertain_executions(
+    exchange: "BinanceExchangeManager",
+    executor: Any = None,
+) -> int:
+    """Resolve accepted-but-unconfirmed orders against Binance. Never re-submits."""
+    from core.execution_ledger import ExecutionPhase, get_execution_ledger
+
+    if exchange.rest_account_reads_blocked():
+        return 0
+    ledger = get_execution_ledger()
+    adopted = 0
+    for record in ledger.unresolved():
+        order = None
+        if record.binance_order_id:
+            order = exchange.lookup_order_by_id(record.symbol, record.binance_order_id)
+        elif record.client_order_id:
+            order = exchange.lookup_order_by_client_id(
+                record.symbol, record.client_order_id
+            )
+        if not order:
+            continue
+        status = str(order.get("status") or "").upper()
+        if status in {"FILLED", "PARTIALLY_FILLED"}:
+            fill = {
+                "symbol": record.symbol,
+                "orderId": order.get("orderId") or record.binance_order_id,
+                "clientOrderId": order.get("clientOrderId") or record.client_order_id,
+                "status": status,
+                "avgPrice": order.get("avgPrice"),
+                "executedQty": order.get("executedQty"),
+            }
+            if executor is None:
+                continue
+            result = executor.adopt_confirmed_fill(fill)
+            if result:
+                adopted += 1
+                trade_logger.info(
+                    "[RECONCILE_LATE_FILL] %s %s -> POSITION_CONFIRMED",
+                    record.exec_id,
+                    record.symbol,
+                )
+        elif status in {"CANCELED", "EXPIRED", "REJECTED"}:
+            phase = (
+                ExecutionPhase.CANCELED
+                if status == "CANCELED"
+                else ExecutionPhase.ORDER_REJECTED
+            )
+            ledger.transition(record, phase, extra=f"reconcile status={status}")
+    return adopted

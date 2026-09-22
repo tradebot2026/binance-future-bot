@@ -1,18 +1,22 @@
 """
 Global REST rate-limit guard for Binance Futures.
 Token-bucket weight budgeting with hard-stop on 429 / -1003.
+Tracks HTTP request count and X-MBX-USED-WEIGHT-1M headers.
 """
 
 from __future__ import annotations
 
+import enum
 import threading
 import time
+from collections import deque
 from typing import Any, Optional
 
 from config import Config
+from logger import system_logger
 
 
-# Approximate Binance Futures endpoint weights (request weight units).
+# Approximate Binance USD-M Futures endpoint weights (request weight units).
 ENDPOINT_WEIGHTS: dict[str, int] = {
     "futures_ping": 1,
     "futures_exchange_info": 1,
@@ -28,12 +32,240 @@ ENDPOINT_WEIGHTS: dict[str, int] = {
     "futures_symbol_ticker": 1,
     "futures_get_position_mode": 1,
     "futures_change_position_mode": 1,
+    "futures_mark_price": 1,
+    "futures_open_interest": 1,
+    "futures_open_interest_hist": 1,
+    "futures_account_balance": 5,
+    "futures_income_history": 30,
+    "futures_account_trades": 5,
 }
 
 
-def weight_for_call(func: Any, default: int = 1) -> int:
+def weight_for_call(func: Any, default: int = 1, **kwargs: Any) -> int:
     name = getattr(func, "__name__", "") or ""
+    if name == "futures_ticker" and not kwargs.get("symbol"):
+        return 40
+    if name == "futures_klines":
+        try:
+            limit = int(kwargs.get("limit") or 500)
+        except (TypeError, ValueError):
+            limit = 500
+        if limit < 100:
+            return 1
+        if limit < 500:
+            return 2
+        if limit <= 1000:
+            return 5
+        return 10
     return ENDPOINT_WEIGHTS.get(name, default)
+
+
+class ApiHealthState(str, enum.Enum):
+    HEALTHY = "HEALTHY"
+    HIGH_USAGE = "HIGH_USAGE"
+    RATE_LIMIT_WARNING = "RATE_LIMIT_WARNING"
+    API_RATE_LIMITED = "API_RATE_LIMITED"
+    IP_BANNED = "IP_BANNED"
+
+
+class RestUsageTracker:
+    """
+    Sliding 60s HTTP request counter + last used-weight header.
+    Drives API SAFETY MODE so callers stop hammering Binance.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._window: deque[float] = deque()
+        self._used_weight_1m: int = 0
+        self._last_http_status: int = 0
+        self._last_error_code: int = 0
+        self._safety_until: float = 0.0
+        self._state: ApiHealthState = ApiHealthState.HEALTHY
+        self._reason: str = ""
+        self._retry_after_seconds: float = 0.0
+        self._logged_state: ApiHealthState = ApiHealthState.HEALTHY
+
+    def requests_last_minute(self) -> int:
+        self._purge()
+        with self._lock:
+            return len(self._window)
+
+    def snapshot(self) -> dict[str, Any]:
+        self._purge()
+        with self._lock:
+            remaining = max(self._safety_until - time.monotonic(), 0.0)
+            state = self._effective_state_locked(remaining)
+            return {
+                "state": state.value,
+                "reason": self._reason,
+                "requests_1m": len(self._window),
+                "used_weight_1m": self._used_weight_1m,
+                "ip_limit": Config.rest_ip_request_limit(),
+                "safety_remaining_seconds": remaining,
+                "last_http_status": self._last_http_status,
+                "last_error_code": self._last_error_code,
+                "retry_after_seconds": self._retry_after_seconds,
+            }
+
+    def allows_background_rest(self) -> bool:
+        snap = self.snapshot()
+        return snap["state"] in {
+            ApiHealthState.HEALTHY.value,
+            ApiHealthState.HIGH_USAGE.value,
+        }
+
+    def allows_new_entries(self) -> bool:
+        snap = self.snapshot()
+        return snap["state"] in {
+            ApiHealthState.HEALTHY.value,
+            ApiHealthState.HIGH_USAGE.value,
+        }
+
+    def in_safety_mode(self) -> bool:
+        snap = self.snapshot()
+        return snap["state"] in {
+            ApiHealthState.API_RATE_LIMITED.value,
+            ApiHealthState.IP_BANNED.value,
+        }
+
+    def safety_remaining(self) -> float:
+        with self._lock:
+            return max(self._safety_until - time.monotonic(), 0.0)
+
+    def note_http_response(self, response: Any) -> None:
+        """Record one HTTP round-trip (python-binance session response)."""
+        now = time.monotonic()
+        status = 0
+        used_weight = 0
+        retry_after = 0.0
+        try:
+            status = int(getattr(response, "status_code", 0) or 0)
+        except (TypeError, ValueError):
+            status = 0
+        headers = getattr(response, "headers", None) or {}
+        used_weight = _header_int(
+            headers,
+            "X-MBX-USED-WEIGHT-1M",
+            "x-mbx-used-weight-1m",
+        )
+        retry_after = _header_float(headers, "Retry-After", "retry-after")
+        with self._lock:
+            self._window.append(now)
+            self._last_http_status = status
+            if used_weight > 0:
+                self._used_weight_1m = used_weight
+            if retry_after > 0:
+                self._retry_after_seconds = retry_after
+            if status in (418, 429):
+                halt = max(retry_after, float(Config.RATE_LIMIT_HALT_SECONDS), 180.0)
+                if status == 418:
+                    halt = max(halt, 600.0)
+                    self._state = ApiHealthState.IP_BANNED
+                    self._reason = f"HTTP {status} — IP banned / WAF"
+                else:
+                    self._state = ApiHealthState.API_RATE_LIMITED
+                    self._reason = f"HTTP {status} — too many requests"
+                self._safety_until = max(self._safety_until, now + halt)
+
+    def note_transport_error(self, exc: BaseException) -> None:
+        with self._lock:
+            self._reason = f"transport error: {exc}"[:160]
+
+    def note_binance_error(
+        self,
+        *,
+        code: int,
+        message: str,
+        halt_seconds: float,
+        banned: bool = False,
+    ) -> None:
+        now = time.monotonic()
+        halt = max(float(halt_seconds), 0.0)
+        with self._lock:
+            self._last_error_code = int(code)
+            self._reason = (message or f"Binance code {code}")[:200]
+            if halt > 0:
+                self._safety_until = max(self._safety_until, now + halt)
+                self._retry_after_seconds = halt
+            if banned or code == 418:
+                self._state = ApiHealthState.IP_BANNED
+            elif code in (-1003, -1015, 429):
+                self._state = ApiHealthState.API_RATE_LIMITED
+
+    def _purge(self) -> None:
+        cutoff = time.monotonic() - 60.0
+        with self._lock:
+            while self._window and self._window[0] < cutoff:
+                self._window.popleft()
+
+    def _effective_state_locked(self, remaining: float) -> ApiHealthState:
+        if remaining > 0 and self._state in {
+            ApiHealthState.API_RATE_LIMITED,
+            ApiHealthState.IP_BANNED,
+        }:
+            self._log_state_locked(len(self._window), Config.rest_ip_request_limit())
+            return self._state
+        ip_limit = max(Config.rest_ip_request_limit(), 1)
+        count = len(self._window)
+        if count >= int(ip_limit * 0.85):
+            self._state = ApiHealthState.RATE_LIMIT_WARNING
+            self._reason = f"{count} HTTP requests in 60s (limit {ip_limit})"
+            self._log_state_locked(count, ip_limit)
+            return self._state
+        if count >= int(ip_limit * 0.55):
+            self._state = ApiHealthState.HIGH_USAGE
+            self._reason = f"{count} HTTP requests in 60s (limit {ip_limit})"
+            self._log_state_locked(count, ip_limit)
+            return self._state
+        self._state = ApiHealthState.HEALTHY
+        if remaining <= 0:
+            self._reason = ""
+        self._log_state_locked(count, ip_limit)
+        return self._state
+
+    def _log_state_locked(self, count: int, ip_limit: int) -> None:
+        if self._state == self._logged_state:
+            return
+        self._logged_state = self._state
+        system_logger.info(
+            "[API_HEALTH] %s | requests_1m=%s used_weight_1m=%s ip_limit=%s | %s",
+            self._state.value,
+            count,
+            self._used_weight_1m,
+            ip_limit,
+            self._reason or "ok",
+        )
+
+
+def _header_int(headers: Any, *keys: str) -> int:
+    for key in keys:
+        try:
+            raw = headers.get(key)
+        except Exception:
+            raw = None
+        if raw is None:
+            continue
+        try:
+            return int(float(str(raw)))
+        except (TypeError, ValueError):
+            continue
+    return 0
+
+
+def _header_float(headers: Any, *keys: str) -> float:
+    for key in keys:
+        try:
+            raw = headers.get(key)
+        except Exception:
+            raw = None
+        if raw is None:
+            continue
+        try:
+            return float(str(raw))
+        except (TypeError, ValueError):
+            continue
+    return 0.0
 
 
 class RestTokenBucket:

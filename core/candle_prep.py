@@ -12,8 +12,18 @@ from indicators.market_analyzer import MIN_ANALYZER_BARS, MarketAnalyzer
 from utils import safe_float
 
 
+def drop_forming_bar(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
+    """Drop the in-progress last candle so setups only see closed bars."""
+    if df is None or df.empty:
+        return df
+    if len(df) < 2:
+        return df
+    return df.iloc[:-1].copy()
+
+
 def prepare_df(df: Optional[pd.DataFrame], analyzer: MarketAnalyzer) -> Optional[pd.DataFrame]:
     """Apply full or light indicators depending on bar count."""
+    df = drop_forming_bar(df)
     if df is None or df.empty or len(df) < 40:
         return None
     if len(df) >= MIN_ANALYZER_BARS:

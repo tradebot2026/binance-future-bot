@@ -788,7 +788,10 @@ class TelegramManager:
                 return
             tiers = scanner.get_watchlist_tiers()
             orchestrator = getattr(scanner, "orchestrator", None)
-            if orchestrator is not None and not tiers.get("tier2"):
+            rest_blocked = False
+            if self.exchange is not None and hasattr(self.exchange, "is_rest_blocked"):
+                rest_blocked = bool(self.exchange.is_rest_blocked()[0])
+            if orchestrator is not None and not tiers.get("tier2") and not rest_blocked:
                 try:
                     orchestrator.process_hot_scan_cycle()
                     tiers = scanner.get_watchlist_tiers()
@@ -802,6 +805,9 @@ class TelegramManager:
                 hot_scan_interval=Config.HOT_SCAN_INTERVAL_SECONDS,
                 tier2_display_limit=Config.TIER2_HOT_SIZE,
                 tier2_near_miss=tiers.get("tier2_near_miss", []),
+                rotation_cycle=int(tiers.get("rotation_cycle") or 0),
+                rotation_evaluated=int(tiers.get("rotation_evaluated") or 0),
+                exchange=self.exchange,
             )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"

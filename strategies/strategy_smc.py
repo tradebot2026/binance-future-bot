@@ -11,7 +11,7 @@ from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, RegimeLabel, SignalCandidate
 from indicators.market_analyzer import MarketAnalyzer
-from logger import signal_logger
+from logger import log_strategy_approved
 from engines.smc_engine import (
     effective_smc_min_score,
     evaluate_confluence_gate,
@@ -141,14 +141,12 @@ class SMCStrategy(BaseStrategy):
                 self.db.log_signal_rejection(symbol, action, score, [reason])
             return None
 
-        signal_logger.info(
-            "APPROVED %s %s | strategy=%s | score=%.1f | macro=%s | confluence=%s",
+        log_strategy_approved(
             symbol,
             action,
             self.tag,
             score,
-            gate.structure.macro_trend,
-            gate.structure.confluence_type,
+            extra=f"macro={gate.structure.macro_trend} confluence={gate.structure.confluence_type}",
         )
         fit = self.regime_fit(snapshot)
         meta = gate.structure.to_dict()

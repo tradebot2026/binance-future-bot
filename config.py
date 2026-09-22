@@ -19,6 +19,19 @@ def _env_bool(key: str, default: bool) -> bool:
 
 
 def _env_use_testnet() -> bool:
+    """
+    Testnet is the default. Live mainnet requires BOTH:
+      BINANCE_ENV=MAINNET (or LIVE/PROD) and USE_TESTNET=false.
+    BINANCE_ENV=TESTNET always wins so a coding mistake cannot go live.
+    """
+    env = str(os.getenv("BINANCE_ENV", "") or "").strip().upper()
+    if env in ("TESTNET", "TEST", "PAPER"):
+        return True
+    if env in ("MAINNET", "LIVE", "PROD", "PRODUCTION"):
+        raw = os.getenv("USE_TESTNET")
+        if raw is None or not str(raw).strip():
+            return True
+        return str(raw).strip().lower() in ("true", "1", "t", "yes")
     raw = os.getenv("USE_TESTNET")
     if raw is None or not str(raw).strip():
         return True
@@ -64,6 +77,7 @@ class Config:
     BINANCE_API_KEY: str = os.getenv("BINANCE_API_KEY", "")
     BINANCE_API_SECRET: str = os.getenv("BINANCE_API_SECRET", "")
     USE_TESTNET: bool = _env_use_testnet()
+    BINANCE_ENV: str = "TESTNET" if _env_use_testnet() else "MAINNET"
     DRY_RUN: bool = _env_dry_run()
     ALLOW_MAINNET_FORCE_RESUME: bool = _env_bool(
         "ALLOW_MAINNET_FORCE_RESUME", False
@@ -130,8 +144,10 @@ class Config:
     SCAN_WS_ONLY: bool = _env_bool("SCAN_WS_ONLY", True)
     BOOTSTRAP_KLINE_BATCH_SIZE: int = _env_int("BOOTSTRAP_KLINE_BATCH_SIZE", 9)
     BOOK_TICKER_CACHE_SECONDS: int = _env_int("BOOK_TICKER_CACHE_SECONDS", 90)
-    RATE_LIMIT_HALT_SECONDS: int = _env_int("RATE_LIMIT_HALT_SECONDS", 120)
-    RATE_LIMIT_SOFT_HALT_SECONDS: int = _env_int("RATE_LIMIT_SOFT_HALT_SECONDS", 90)
+    RATE_LIMIT_HALT_SECONDS: int = _env_int("RATE_LIMIT_HALT_SECONDS", 300)
+    RATE_LIMIT_SOFT_HALT_SECONDS: int = _env_int("RATE_LIMIT_SOFT_HALT_SECONDS", 180)
+    REST_IP_REQUEST_LIMIT_MAINNET: int = _env_int("REST_IP_REQUEST_LIMIT_MAINNET", 2400)
+    REST_IP_REQUEST_LIMIT_TESTNET: int = _env_int("REST_IP_REQUEST_LIMIT_TESTNET", 6000)
     ENABLE_STRICT_RATE_LIMIT: bool = _env_bool("ENABLE_STRICT_RATE_LIMIT", True)
     API_BACKOFF_MAX_SECONDS: int = _env_int("API_BACKOFF_MAX_SECONDS", 60)
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -231,6 +247,12 @@ class Config:
         "WS_KLINE_BOOTSTRAP_WARMUP_SECONDS", 3.0
     )
     ENABLE_PACED_KLINE_BOOTSTRAP: bool = _env_bool("ENABLE_PACED_KLINE_BOOTSTRAP", True)
+    KLINE_BOOTSTRAP_MAX_SERIES_PER_MINUTE: int = _env_int(
+        "KLINE_BOOTSTRAP_MAX_SERIES_PER_MINUTE", 12
+    )
+    UNCERTAIN_ORDER_RECONCILE_SECONDS: float = _env_float(
+        "UNCERTAIN_ORDER_RECONCILE_SECONDS", 30.0
+    )
     ENABLE_REST_TICKER_FALLBACK: bool = _env_bool("ENABLE_REST_TICKER_FALLBACK", True)
     ENABLE_REST_BALANCE_POLL: bool = _env_bool("ENABLE_REST_BALANCE_POLL", False)
     ENABLE_REST_POSITION_POLL: bool = _env_bool("ENABLE_REST_POSITION_POLL", False)
@@ -360,26 +382,27 @@ class Config:
     ENABLE_STRATEGY_VOL_EXPANSION: bool = _env_bool(
         "ENABLE_STRATEGY_VOL_EXPANSION", True
     )
-    # Extension strategies (disabled until engine logic is implemented)
+    # Valid Phase-2 price-action engines (closed-bar evaluation)
     ENABLE_STRATEGY_BREAKOUT_RETEST: bool = _env_bool(
-        "ENABLE_STRATEGY_BREAKOUT_RETEST", False
+        "ENABLE_STRATEGY_BREAKOUT_RETEST", True
     )
     ENABLE_STRATEGY_TREND_MOMENTUM: bool = _env_bool(
-        "ENABLE_STRATEGY_TREND_MOMENTUM", False
+        "ENABLE_STRATEGY_TREND_MOMENTUM", True
     )
-    ENABLE_STRATEGY_VOL_SQUEEZE: bool = _env_bool("ENABLE_STRATEGY_VOL_SQUEEZE", False)
+    ENABLE_STRATEGY_VOL_SQUEEZE: bool = _env_bool("ENABLE_STRATEGY_VOL_SQUEEZE", True)
+    ENABLE_STRATEGY_FALSE_BREAKOUT_SFP: bool = _env_bool(
+        "ENABLE_STRATEGY_FALSE_BREAKOUT_SFP", True
+    )
+    ENABLE_STRATEGY_PRICE_ACTION_REVERSAL: bool = _env_bool(
+        "ENABLE_STRATEGY_PRICE_ACTION_REVERSAL", True
+    )
+    # Context / REST-dependent — stay disabled as standalone entry strategies
     ENABLE_STRATEGY_ORDER_FLOW: bool = _env_bool("ENABLE_STRATEGY_ORDER_FLOW", False)
     ENABLE_STRATEGY_OI_FUNDING: bool = _env_bool("ENABLE_STRATEGY_OI_FUNDING", False)
     ENABLE_STRATEGY_VWAP_MR: bool = _env_bool("ENABLE_STRATEGY_VWAP_MR", False)
     ENABLE_STRATEGY_VP_KEYLEVEL: bool = _env_bool("ENABLE_STRATEGY_VP_KEYLEVEL", False)
     ENABLE_STRATEGY_MTF_ALIGNMENT: bool = _env_bool(
         "ENABLE_STRATEGY_MTF_ALIGNMENT", False
-    )
-    ENABLE_STRATEGY_FALSE_BREAKOUT_SFP: bool = _env_bool(
-        "ENABLE_STRATEGY_FALSE_BREAKOUT_SFP", False
-    )
-    ENABLE_STRATEGY_PRICE_ACTION_REVERSAL: bool = _env_bool(
-        "ENABLE_STRATEGY_PRICE_ACTION_REVERSAL", False
     )
     # Confluence / correlation scoring
     ENABLE_CONFLUENCE_SCORING: bool = _env_bool("ENABLE_CONFLUENCE_SCORING", True)
@@ -462,7 +485,7 @@ class Config:
     ENABLE_EVENT_DRIVEN_SCAN: bool = _env_bool("ENABLE_EVENT_DRIVEN_SCAN", True)
     SCAN_TRIGGER_TIMEFRAMES: str = os.getenv("SCAN_TRIGGER_TIMEFRAMES", "5m,15m")
     TIER1_WATCHLIST_SIZE: int = _env_int("TIER1_WATCHLIST_SIZE", 100)
-    HOT_SCAN_SIZE: int = _env_int("HOT_SCAN_SIZE", 15)
+    HOT_SCAN_SIZE: int = _env_int("HOT_SCAN_SIZE", 20)
     HOT_SCAN_INTERVAL_SECONDS: float = _env_float("HOT_SCAN_INTERVAL_SECONDS", 20.0)
     BACKGROUND_SCAN_BATCH_SIZE: int = _env_int("BACKGROUND_SCAN_BATCH_SIZE", 16)
     BACKGROUND_SCAN_BATCH_DELAY_SECONDS: float = _env_float(
@@ -610,7 +633,7 @@ class Config:
     HOT_VOLUME_RATIO: float = _env_float("HOT_VOLUME_RATIO", 1.18)
     HOT_RANGE_EXPANSION_PCT: float = _env_float("HOT_RANGE_EXPANSION_PCT", 0.35)
     HOT_FAST_TRACK_MAX_PER_CYCLE: int = _env_int("HOT_FAST_TRACK_MAX_PER_CYCLE", 8)
-    ROTATING_SCAN_BATCH_SIZE: int = _env_int("ROTATING_SCAN_BATCH_SIZE", 16)
+    ROTATING_SCAN_BATCH_SIZE: int = _env_int("ROTATING_SCAN_BATCH_SIZE", 20)
     MIN_24H_VOLUME_USDT: float = _env_float("MIN_24H_VOLUME_USDT", 10_000_000.0)
     MAX_SPREAD_PERCENT: float = _env_float("MAX_SPREAD_PERCENT", 0.08)
     MIN_SCAN_UNIVERSE: int = _env_int("MIN_SCAN_UNIVERSE", 50)
@@ -701,6 +724,13 @@ class Config:
     @classmethod
     def is_mega_cap_blacklisted(cls, symbol: str) -> bool:
         return symbol.upper() in cls.DEFAULT_MEGA_CAP_BLACKLIST
+
+    @classmethod
+    def rest_ip_request_limit(cls) -> int:
+        """Binance IP HTTP-request cap (not weight). Testnet reports 6000/min."""
+        if cls.USE_TESTNET:
+            return max(int(cls.REST_IP_REQUEST_LIMIT_TESTNET), 1)
+        return max(int(cls.REST_IP_REQUEST_LIMIT_MAINNET), 1)
 
     @classmethod
     def testnet_strategy_relax(cls) -> bool:

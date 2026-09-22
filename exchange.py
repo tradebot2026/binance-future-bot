@@ -20,6 +20,7 @@ from binance.exceptions import BinanceAPIException, BinanceOrderException
 
 from rest_rate_guard import (
     RestBlockLogSuppressor,
+    RestUsageTracker,
     build_default_token_bucket,
     weight_for_call,
 )
@@ -201,8 +202,10 @@ class BinanceExchangeManager:
         client_params = inspect.signature(Client.__init__).parameters
         if "strict_rate_limit" in client_params:
             client_kwargs["strict_rate_limit"] = Config.ENABLE_STRICT_RATE_LIMIT
+        self._rest_usage = RestUsageTracker()
         self.client = Client(**client_kwargs)
         self.recv_window_param = {"recvWindow": 60000}
+        self._install_rest_usage_hook()
 
         self._rules_lock = threading.RLock()
         self._symbol_rules_cache: dict[str, SymbolRules] = {}
@@ -306,6 +309,12 @@ class BinanceExchangeManager:
                         return False, reason
                     return True, ""
                 return False, reason
+        if not execution_priority and self._rest_usage.in_safety_mode():
+            remaining = int(self._rest_usage.safety_remaining())
+            return False, (
+                f"API SAFETY MODE — REST halted "
+                f"({remaining}s remaining, {self._rest_usage.snapshot().get('state')})"
+            )
         return True, ""
 
     @contextmanager
@@ -347,6 +356,99 @@ class BinanceExchangeManager:
         finally:
             with self._bootstrap_lock:
                 self._bootstrap_depth = max(0, self._bootstrap_depth - 1)
+
+    def _install_rest_usage_hook(self) -> None:
+        """Count every HTTP call and capture used-weight / Retry-After headers."""
+        session = getattr(self.client, "session", None)
+        if session is None or getattr(session, "_bfb_usage_hooked", False):
+            return
+        original = session.request
+        tracker = self._rest_usage
+
+        def _hooked(method: str, url: str, **kwargs: Any) -> Any:
+            try:
+                response = original(method, url, **kwargs)
+            except Exception as exc:
+                tracker.note_transport_error(exc)
+                error_logger.warning(
+                    "REST transport error %s %s: %s", method, url, exc
+                )
+                raise
+            try:
+                tracker.note_http_response(response)
+            except Exception as exc:
+                error_logger.debug("REST usage tracker failed: %s", exc)
+            return response
+
+        session.request = _hooked
+        session._bfb_usage_hooked = True
+
+    def rest_usage_snapshot(self) -> dict[str, Any]:
+        return self._rest_usage.snapshot()
+
+    def get_execution_safety(self, symbol: str = "") -> tuple[str, str]:
+        """Infrastructure gate for NEW entries only. Position monitoring stays active."""
+        usage = self._rest_usage.snapshot()
+        state = str(usage.get("state", "HEALTHY"))
+        if state in {"IP_BANNED", "API_RATE_LIMITED"}:
+            remaining = int(usage.get("safety_remaining_seconds") or 0)
+            reason = usage.get("reason") or f"REST safety mode ({remaining}s)"
+            self._log_entry_block("RATE_LIMITED", reason, symbol)
+            return state, reason
+        if state == "RATE_LIMIT_WARNING":
+            reason = usage.get("reason") or "REST usage near IP cap — new entries paused"
+            self._log_entry_block("RATE_LIMITED", reason, symbol)
+            return "EXECUTION_PAUSED", reason
+        hub = self._market_data
+        if hub is not None:
+            ready_fn = getattr(hub, "is_market_data_ready_for_entry", None)
+            if callable(ready_fn):
+                ready, detail = ready_fn(symbol)
+                if not ready:
+                    mapped = {
+                        "WS_DISCONNECTED": "WS_DISCONNECTED",
+                        "WS_RECONNECTING": "RESYNC_REQUIRED",
+                        "WS_WARMUP": "WS_WARMING",
+                        "STALE_DATA": "STALE_DATA",
+                        "RESYNC": "RESYNC_REQUIRED",
+                    }.get(detail, "RESYNC_REQUIRED")
+                    self._log_entry_block(detail or mapped, mapped, symbol)
+                    return mapped, detail or mapped
+            else:
+                if getattr(hub, "_reconnect_in_progress", False):
+                    self._log_entry_block("WS_RECONNECTING", "reconnect", symbol)
+                    return "RESYNC_REQUIRED", "WebSocket reconnecting — waiting to resync"
+                if getattr(hub, "is_ws_warming_up", lambda: False)():
+                    self._log_entry_block("WS_WARMUP", "warming", symbol)
+                    return "WS_WARMING", "market-data WebSocket is warming up"
+                if not hub.ws_is_running():
+                    self._log_entry_block("WS_DISCONNECTED", "ws down", symbol)
+                    return "WS_DISCONNECTED", "market-data WebSocket is down"
+                if not hub.is_ticker_cache_usable():
+                    self._log_entry_block("RESYNC", "empty ticker cache", symbol)
+                    return "RESYNC_REQUIRED", "ticker cache empty after disconnect"
+        if not hasattr(self, "_entry_ready_logged"):
+            self._entry_ready_logged = False
+        if not self._entry_ready_logged:
+            trade_logger.info("[ENTRY_DATA_READY] market data + API healthy for new entries")
+            self._entry_ready_logged = True
+        return "EXECUTION_SAFE", ""
+
+    def _log_entry_block(self, kind: str, detail: str, symbol: str = "") -> None:
+        tag = {
+            "WS_DISCONNECTED": "ENTRY_BLOCKED_WS_DISCONNECTED",
+            "WS_RECONNECTING": "ENTRY_BLOCKED_WS_RECONNECTING",
+            "WS_WARMUP": "ENTRY_BLOCKED_WS_WARMUP",
+            "STALE_DATA": "ENTRY_BLOCKED_STALE_DATA",
+            "RESYNC": "ENTRY_BLOCKED_RESYNC",
+            "RATE_LIMITED": "ENTRY_BLOCKED_RESYNC",
+        }.get(kind, f"ENTRY_BLOCKED_{kind}")
+        key = f"{tag}:{symbol or '*'}"
+        if not hasattr(self, "_entry_block_log"):
+            self._entry_block_log = RestBlockLogSuppressor(90)
+        if self._entry_block_log.should_log(key):
+            trade_logger.warning("[%s] %s %s", tag, symbol or "ALL", detail)
+        self._entry_ready_logged = False
 
     @property
     def in_scan_mode(self) -> bool:
@@ -428,23 +530,32 @@ class BinanceExchangeManager:
 
         message = str(exc.message)
         until_ms = parse_ban_until_ms(message)
+        banned = bool(until_ms) or exc.code == 418 or "banned until" in message.lower()
         if until_ms:
             halt_seconds = max(
                 int((until_ms / 1000.0) - time.time()),
                 Config.RATE_LIMIT_HALT_SECONDS,
             )
+        elif exc.code == 418:
+            halt_seconds = max(Config.RATE_LIMIT_HALT_SECONDS, 600)
         elif exc.code == -1003:
             halt_seconds = max(
                 Config.RATE_LIMIT_SOFT_HALT_SECONDS,
                 Config.RATE_LIMIT_HALT_SECONDS,
+                300,
             )
-            halt_seconds = min(halt_seconds, 120)
         else:
             halt_seconds = max(
                 Config.REST_BAN_MIN_SLEEP_SECONDS,
                 Config.RATE_LIMIT_HALT_SECONDS,
             )
 
+        self._rest_usage.note_binance_error(
+            code=int(exc.code),
+            message=message,
+            halt_seconds=float(halt_seconds),
+            banned=banned,
+        )
         self._rest_token_bucket.trigger_hard_stop(float(halt_seconds))
         already_blocked = False
         if self._market_data:
@@ -496,6 +607,8 @@ class BinanceExchangeManager:
             return False
         if self._rest_token_bucket.is_hard_stopped():
             return False
+        if self._rest_usage.in_safety_mode() or not self._rest_usage.allows_background_rest():
+            return False
         if not Config.ENABLE_STRICT_RATE_LIMIT:
             return True
         lane = RestLane.BOOTSTRAP if self._is_bootstrap_priority() else RestLane.BACKGROUND
@@ -503,6 +616,12 @@ class BinanceExchangeManager:
 
     def is_rest_blocked(self) -> tuple[bool, str]:
         """True when REST must not be attempted (IP ban / hard-stop)."""
+        if self._rest_usage.in_safety_mode():
+            remaining = int(self._rest_usage.safety_remaining())
+            return True, (
+                f"API SAFETY MODE — REST halted "
+                f"({remaining}s remaining, {self._rest_usage.health_state.value})"
+            )
         if self._market_data:
             blocked, reason = self._market_data.is_rest_blocked()
             if blocked:
@@ -754,6 +873,8 @@ class BinanceExchangeManager:
             return False
         if self._rest_token_bucket.is_hard_stopped():
             return False
+        if self._rest_usage.in_safety_mode() or not self._rest_usage.allows_background_rest():
+            return False
         if not Config.ENABLE_STRICT_RATE_LIMIT:
             return True
         reserve = max(Config.REST_BUDGET_MIN_REMAINING_FRACTION, 0.0)
@@ -925,8 +1046,18 @@ class BinanceExchangeManager:
                 "REST API call rejected during scan cycle — use WebSocket cache."
             )
 
-        call_weight = weight_for_call(func)
+        call_weight = weight_for_call(func, **kwargs)
         lane = self._resolve_rest_lane(execution_priority=priority)
+
+        if self._rest_usage.in_safety_mode() and lane != RestLane.EXECUTION:
+            if self._is_account_rest_call(func):
+                if bypass_account_cache and priority:
+                    raise ExchangeRateLimitError("API SAFETY MODE — REST halted")
+                return self._return_cached_account_call(func)
+            if is_bootstrap_kline:
+                self.halt_kline_bootstrap("api_safety_mode")
+                return []
+            raise ExchangeRateLimitError("API SAFETY MODE — non-execution REST halted")
 
         if Config.ENABLE_STRICT_RATE_LIMIT:
             if lane != RestLane.EXECUTION:
@@ -955,7 +1086,9 @@ class BinanceExchangeManager:
             self._rest_token_bucket.acquire(call_weight)
 
         limiter = self._execution_rate_limiter if priority else self._rate_limiter
-        network_retries = max(Config.REST_NETWORK_MAX_RETRIES, 1)
+        func_name = getattr(func, "__name__", "")
+        is_order_submit = func_name == "futures_create_order"
+        network_retries = 1 if is_order_submit else max(Config.REST_NETWORK_MAX_RETRIES, 1)
         for attempt in range(1, network_retries + 1):
             if Config.ENABLE_STRICT_RATE_LIMIT:
                 limiter.wait()
@@ -1318,8 +1451,10 @@ class BinanceExchangeManager:
                         oi_change_pct = (last_oi - prev_oi) / prev_oi * 100.0
                     if oi <= 0:
                         oi = last_oi
-            except Exception:
-                pass
+            except Exception as exc:
+                error_logger.debug(
+                    "Open-interest history unavailable for %s: %s", sym, exc
+                )
 
             entry = DerivativesCacheEntry(
                 funding_rate=funding,
@@ -2272,15 +2407,6 @@ class BinanceExchangeManager:
                     )
                 return rest_mark
 
-        if self._market_data and self._market_data.ws_is_stale():
-            if allow_rest and not self.is_rest_blocked()[0]:
-                forced = self.fetch_mark_price_rest(symbol)
-                if forced and forced > 0:
-                    with self._rest_mark_lock:
-                        self._rest_mark_cache[symbol] = forced
-                        self._rest_mark_fetched_at[symbol] = time.monotonic()
-                    return forced
-
         return None
 
     def get_tp_monitor_price(
@@ -2305,7 +2431,10 @@ class BinanceExchangeManager:
             if callable(requires_fn):
                 try:
                     needs_rest = bool(requires_fn(symbol))
-                except Exception:
+                except Exception as exc:
+                    error_logger.debug(
+                        "execution_requires_rest_price failed for %s: %s", symbol, exc
+                    )
                     needs_rest = True
             elif hasattr(hub, "ws_is_stale") and hub.ws_is_stale():
                 needs_rest = True
@@ -2846,6 +2975,128 @@ class BinanceExchangeManager:
 
     # ---------------- Orders ----------------
 
+    def lookup_order_by_client_id(
+        self, symbol: str, client_order_id: str
+    ) -> Optional[dict[str, Any]]:
+        """Reconcile an uncertain submit using origClientOrderId (no duplicate create)."""
+        if not client_order_id:
+            return None
+        try:
+            with self.execution_context():
+                response = self._throttled_call(
+                    self.client.futures_get_order,
+                    symbol=symbol,
+                    origClientOrderId=client_order_id,
+                    execution_priority=True,
+                    **self.recv_window_param,
+                )
+            return response if isinstance(response, dict) else None
+        except ExchangeRateLimitError as exc:
+            error_logger.warning(
+                "Order lookup rate-limited for %s clientOrderId=%s: %s",
+                symbol,
+                client_order_id,
+                exc,
+            )
+            return None
+        except Exception as exc:
+            error_logger.warning(
+                "Order lookup failed for %s clientOrderId=%s: %s",
+                symbol,
+                client_order_id,
+                exc,
+            )
+            return None
+
+    def lookup_order_by_id(
+        self, symbol: str, order_id: Any
+    ) -> Optional[dict[str, Any]]:
+        if not order_id:
+            return None
+        try:
+            with self.execution_context():
+                response = self._throttled_call(
+                    self.client.futures_get_order,
+                    symbol=symbol,
+                    orderId=order_id,
+                    execution_priority=True,
+                    **self.recv_window_param,
+                )
+            return response if isinstance(response, dict) else None
+        except Exception as exc:
+            error_logger.warning(
+                "Order lookup failed for %s orderId=%s: %s", symbol, order_id, exc
+            )
+            return None
+
+    def _confirm_order_status(
+        self,
+        symbol: str,
+        response: dict[str, Any],
+        client_order_id: str = "",
+    ) -> dict[str, Any]:
+        status = str(response.get("status") or "").upper()
+        if status in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}:
+            return response
+        order_id = response.get("orderId")
+        for attempt in range(3):
+            time.sleep(0.35 * (attempt + 1))
+            looked = None
+            if client_order_id:
+                looked = self.lookup_order_by_client_id(symbol, client_order_id)
+            if looked is None and order_id:
+                looked = self.lookup_order_by_id(symbol, order_id)
+            if not looked:
+                continue
+            response = looked
+            status = str(response.get("status") or "").upper()
+            if status in {
+                "FILLED",
+                "PARTIALLY_FILLED",
+                "CANCELED",
+                "EXPIRED",
+                "REJECTED",
+            }:
+                return response
+        return response
+
+    def _finalize_order_response(
+        self,
+        symbol: str,
+        response: dict[str, Any],
+        quantity_label: str,
+        client_order_id: str = "",
+    ) -> dict[str, Any]:
+        response = self._confirm_order_status(symbol, response, client_order_id)
+        status = str(response.get("status") or "").upper()
+        if status == "FILLED":
+            trade_logger.info(
+                "[ORDER_FILLED] %s | orderId=%s avg=%s qty=%s",
+                symbol,
+                response.get("orderId"),
+                response.get("avgPrice"),
+                quantity_label,
+            )
+        elif status == "PARTIALLY_FILLED":
+            trade_logger.info(
+                "[PARTIALLY_FILLED] %s | orderId=%s executedQty=%s",
+                symbol,
+                response.get("orderId"),
+                response.get("executedQty"),
+            )
+        elif status in {"CANCELED", "EXPIRED", "REJECTED"}:
+            raise OrderExecutionError(
+                f"ORDER_REJECTED: Binance status={status} orderId={response.get('orderId')}"
+            )
+        else:
+            trade_logger.info(
+                "[ORDER_ACCEPTED_NOT_FILLED] %s | orderId=%s status=%s",
+                symbol,
+                response.get("orderId"),
+                status or "UNKNOWN",
+            )
+        return response
+
     def execute_futures_order(
         self,
         symbol: str,
@@ -2854,6 +3105,7 @@ class BinanceExchangeManager:
         quantity: float,
         price: Optional[float] = None,
         reduce_only: bool = False,
+        new_client_order_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
         rules = self.get_symbol_rules(symbol)
         clean_qty = amount_to_precision(
@@ -2885,14 +3137,18 @@ class BinanceExchangeManager:
         else:
             order_params["type"] = "MARKET"
 
+        if new_client_order_id:
+            order_params["newClientOrderId"] = new_client_order_id
+
         trade_logger.info(
-            "[ORDER_SUBMIT] %s | %s %s | type=%s qty=%s reduce_only=%s",
+            "[ORDER_SUBMITTING] %s | %s %s | type=%s qty=%s reduce_only=%s clientOrderId=%s",
             symbol,
             side.upper(),
             position_side.upper(),
             order_params["type"],
             order_params["quantity"],
             reduce_only,
+            new_client_order_id or "",
         )
 
         try:
@@ -2905,17 +3161,39 @@ class BinanceExchangeManager:
                 )
             self.invalidate_balance_cache()
             self.invalidate_position_cache()
+            if not isinstance(response, dict):
+                raise OrderExecutionError("SUBMISSION_FAILED: empty Binance order response")
             trade_logger.info(
-                "[ORDER_FILLED] %s | orderId=%s status=%s avg=%s qty=%s",
+                "[BINANCE_ACK] %s | orderId=%s status=%s clientOrderId=%s",
                 symbol,
-                response.get("orderId") if isinstance(response, dict) else None,
-                response.get("status") if isinstance(response, dict) else None,
-                response.get("avgPrice") if isinstance(response, dict) else None,
-                order_params["quantity"],
+                response.get("orderId"),
+                response.get("status"),
+                response.get("clientOrderId") or new_client_order_id or "",
             )
-            return response
+            return self._finalize_order_response(
+                symbol,
+                response,
+                order_params["quantity"],
+                new_client_order_id or "",
+            )
         except PositionAlreadyClosedError:
             raise
+        except ExchangeRateLimitError as exc:
+            recovered = (
+                self.lookup_order_by_client_id(symbol, new_client_order_id)
+                if new_client_order_id
+                else None
+            )
+            if recovered:
+                trade_logger.warning(
+                    "[BINANCE_ACK] %s recovered after rate-limit via clientOrderId=%s",
+                    symbol,
+                    new_client_order_id,
+                )
+                return self._finalize_order_response(
+                    symbol, recovered, order_params["quantity"], new_client_order_id or ""
+                )
+            raise OrderExecutionError(f"RATE_LIMITED: {exc}") from exc
         except BinanceAPIException as exc:
             if exc.code == -2022 or "reduceonly order is rejected" in str(
                 exc.message
@@ -2923,14 +3201,23 @@ class BinanceExchangeManager:
                 raise PositionAlreadyClosedError(
                     str(exc.message), code=int(exc.code)
                 ) from exc
+            recovered = (
+                self.lookup_order_by_client_id(symbol, new_client_order_id)
+                if new_client_order_id
+                else None
+            )
+            if recovered:
+                return self._finalize_order_response(
+                    symbol, recovered, order_params["quantity"], new_client_order_id or ""
+                )
             error_logger.error(
-                "[ORDER_REJECT] Binance rejected %s %s %s: %s (code=%s) payload=%s",
+                "[ORDER_REJECTED] Binance rejected %s %s %s: %s (code=%s) payload=%s",
                 symbol,
                 side.upper(),
                 position_side.upper(),
                 exc.message,
                 exc.code,
-                {k: order_params.get(k) for k in ("symbol", "side", "positionSide", "type", "quantity", "price")},
+                {k: order_params.get(k) for k in ("symbol", "side", "positionSide", "type", "quantity", "price", "newClientOrderId")},
             )
             if self._critical_alerts:
                 self._critical_alerts.notify(
@@ -2938,11 +3225,25 @@ class BinanceExchangeManager:
                     f"Order rejected on {symbol} {side} {position_side}: {exc.message}",
                     exc=exc,
                 )
-            raise OrderExecutionError(exc.message) from exc
+            raise OrderExecutionError(f"ORDER_REJECTED: {exc.message}") from exc
         except ExchangeError as exc:
             if PositionAlreadyClosedError.matches(exc):
                 raise PositionAlreadyClosedError(str(exc)) from exc
-            raise OrderExecutionError(str(exc)) from exc
+            recovered = (
+                self.lookup_order_by_client_id(symbol, new_client_order_id)
+                if new_client_order_id
+                else None
+            )
+            if recovered:
+                trade_logger.warning(
+                    "[BINANCE_ACK] %s recovered after uncertain submit via clientOrderId=%s",
+                    symbol,
+                    new_client_order_id,
+                )
+                return self._finalize_order_response(
+                    symbol, recovered, order_params["quantity"], new_client_order_id or ""
+                )
+            raise OrderExecutionError(f"SUBMISSION_FAILED: {exc}") from exc
         except BinanceOrderException as exc:
             if self._critical_alerts:
                 self._critical_alerts.notify(
@@ -2950,15 +3251,24 @@ class BinanceExchangeManager:
                     f"Order exception on {symbol}: {exc.message}",
                     exc=exc,
                 )
-            raise OrderExecutionError(exc.message) from exc
+            raise OrderExecutionError(f"ORDER_REJECTED: {exc.message}") from exc
         except Exception as exc:
+            recovered = (
+                self.lookup_order_by_client_id(symbol, new_client_order_id)
+                if new_client_order_id
+                else None
+            )
+            if recovered:
+                return self._finalize_order_response(
+                    symbol, recovered, order_params["quantity"], new_client_order_id or ""
+                )
             if self._critical_alerts:
                 self._critical_alerts.notify(
                     "ORDER_FAILURE",
                     f"Unexpected order failure on {symbol}: {exc}",
                     exc=exc,
                 )
-            raise OrderExecutionError(str(exc)) from exc
+            raise OrderExecutionError(f"SUBMISSION_FAILED: {exc}") from exc
 
     # ---------------- Native TP/SL (exchange conditional orders) ----------------
 

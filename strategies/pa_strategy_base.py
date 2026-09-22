@@ -11,7 +11,7 @@ from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, StrategyResult
 from indicators.market_analyzer import MarketAnalyzer
-from logger import signal_logger
+from logger import log_strategy_approved
 from strategies.pa_common import (
     PaSetupResult,
     pick_directional_setup,
@@ -132,12 +132,10 @@ class PaStrategyBase(BaseStrategy):
         return "NEUTRAL"
 
     def _log_approval(self, snapshot: MarketSnapshot, setup: PaSetupResult) -> None:
-        signal_logger.info(
-            "APPROVED %s %s | strategy=%s | score=%.1f | entry=%.6f sl=%.6f",
+        log_strategy_approved(
             snapshot.symbol,
             setup.direction,
             self.tag,
             setup.score,
-            setup.entry,
-            setup.stop_loss,
+            extra=f"entry={setup.entry:.6f} sl={setup.stop_loss:.6f}",
         )

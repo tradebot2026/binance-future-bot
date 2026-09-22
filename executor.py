@@ -13,6 +13,7 @@ from typing import Any, Optional
 
 from config import Config
 from constants import TP1_PORTION, TP2_PORTION, TRADE_STATUS_OPEN, is_range_strategy
+from core.execution_ledger import ExecutionPhase, ExecutionRecord, get_execution_ledger
 from database import DatabaseManager
 from exchange import BinanceExchangeManager, SymbolRules
 from exceptions import OrderExecutionError
@@ -607,8 +608,62 @@ class TradeExecutor:
             )
             return None
 
+        ledger = get_execution_ledger()
+        existing = ledger.find_by_ids(symbol=symbol)
+        if existing is not None and existing.is_unresolved():
+            log_execution_rejected(
+                symbol,
+                f"duplicate execution blocked — {existing.exec_id} still {existing.phase.value}",
+                strategy=strategy,
+            )
+            return None
+        record = ledger.new_record(
+            symbol=symbol,
+            action=action,
+            strategy=strategy,
+            score=score,
+        )
+        record.atr = atr
+        ledger.transition(
+            record,
+            ExecutionPhase.EXECUTION_QUEUED,
+            extra=f"price={current_price:.6f}",
+        )
+
+        safety_fn = getattr(self.exchange, "get_execution_safety", None)
+        if callable(safety_fn):
+            try:
+                raw_safety = safety_fn(symbol)
+            except TypeError:
+                raw_safety = safety_fn()
+            if isinstance(raw_safety, tuple) and raw_safety and isinstance(raw_safety[0], str):
+                safety_state, safety_reason = raw_safety[0], str(raw_safety[1] if len(raw_safety) > 1 else "")
+                if safety_state != "EXECUTION_SAFE":
+                    phase = {
+                        "WS_DISCONNECTED": ExecutionPhase.WS_DISCONNECTED,
+                        "RESYNC_REQUIRED": ExecutionPhase.RESYNC_REQUIRED,
+                        "WS_WARMING": ExecutionPhase.RESYNC_REQUIRED,
+                        "STALE_DATA": ExecutionPhase.RESYNC_REQUIRED,
+                        "API_RATE_LIMITED": ExecutionPhase.RATE_LIMITED,
+                        "IP_BANNED": ExecutionPhase.RATE_LIMITED,
+                        "EXECUTION_PAUSED": ExecutionPhase.RATE_LIMITED,
+                    }.get(safety_state, ExecutionPhase.RESYNC_REQUIRED)
+                    ledger.transition(
+                        record,
+                        phase,
+                        extra=safety_reason,
+                        error_message=safety_reason,
+                    )
+                    log_execution_rejected(
+                        symbol,
+                        f"execution safety {safety_state} — {safety_reason}",
+                        strategy=strategy,
+                    )
+                    return None
+
         trade_logger.info(
-            "[EXECUTION_ATTEMPT] %s %s | strategy=%s | score=%.1f | price=%.6f",
+            "[EXECUTION_ATTEMPT] %s %s | %s | strategy=%s | score=%.1f | price=%.6f",
+            record.exec_id,
             symbol,
             action,
             strategy,
@@ -619,6 +674,11 @@ class TradeExecutor:
         with self.exchange.execution_context():
             live_price = self._resolve_live_execution_price(symbol, current_price)
             if live_price <= 0:
+                ledger.transition(
+                    record,
+                    ExecutionPhase.ORDER_SUBMISSION_FAILED,
+                    error_message="no live price",
+                )
                 log_execution_rejected(
                     symbol,
                     "no live price from REST or cache — cannot place order",
@@ -633,6 +693,7 @@ class TradeExecutor:
                 strategy,
                 score,
                 structure_metadata,
+                record=record,
             )
 
     def _ws_needs_execution_rest_price(self, symbol: str, current_price: float) -> bool:
@@ -668,10 +729,12 @@ class TradeExecutor:
         fresh_fn = getattr(hub, "get_fresh_ticker_price", None)
         if callable(fresh_fn):
             try:
-                fresh = safe_float(fresh_fn(symbol))
+                raw = fresh_fn(symbol)
             except Exception:
-                fresh = 0.0
-            if fresh <= 0:
+                return True
+            if raw is None:
+                return True
+            if isinstance(raw, (int, float)) and float(raw) <= 0:
                 return True
         return False
 
@@ -714,14 +777,53 @@ class TradeExecutor:
                 return cached
         return current_price if current_price > 0 else 0.0
 
+    def _market_data_blocks_new_entry(self, symbol: str) -> bool:
+        """True when WS/cache is explicitly unready for a NEW entry."""
+        hub = None
+        if hasattr(self.exchange, "get_market_data_hub"):
+            hub = self.exchange.get_market_data_hub()
+        if hub is None:
+            return False
+        ready_fn = getattr(hub, "is_market_data_ready_for_entry", None)
+        if callable(ready_fn):
+            try:
+                raw = ready_fn(symbol)
+            except TypeError:
+                raw = ready_fn()
+            if isinstance(raw, tuple) and raw and raw[0] is False:
+                return True
+        if getattr(hub, "_reconnect_in_progress", False) is True:
+            return True
+        warming_fn = getattr(hub, "is_ws_warming_up", None)
+        if callable(warming_fn):
+            try:
+                if warming_fn() is True:
+                    return True
+            except Exception:
+                pass
+        stale_fn = getattr(hub, "ws_is_stale", None)
+        if callable(stale_fn):
+            try:
+                if stale_fn() is True:
+                    return True
+            except Exception:
+                pass
+        return False
+
     def _resolve_live_execution_price(self, symbol: str, current_price: float) -> float:
-        """
-        Never drop an approved entry because WS is STALE/WARMING.
-        Prefer a REST ticker immediately; if REST fails, use cache/signal price.
-        """
+        """Fresh WS price only. REST fallback must not rescue a stale/warming entry."""
+        if self._market_data_blocks_new_entry(symbol):
+            return 0.0
         if not self._ws_needs_execution_rest_price(symbol, current_price):
             return current_price
 
+        rest_block = (
+            self.exchange.is_rest_blocked()
+            if hasattr(self.exchange, "is_rest_blocked")
+            else (False, "")
+        )
+        if isinstance(rest_block, tuple) and rest_block and rest_block[0] is True:
+            return 0.0
         rest_price = self._fetch_execution_rest_price(symbol)
         if rest_price > 0:
             trade_logger.info(
@@ -731,16 +833,7 @@ class TradeExecutor:
                 rest_price,
             )
             return rest_price
-
-        fallback = self._cached_execution_price(symbol, current_price)
-        if fallback > 0:
-            trade_logger.warning(
-                "REST ticker unavailable for %s — proceeding with cached/signal "
-                "price %.6f (WS stale/warming).",
-                symbol,
-                fallback,
-            )
-        return fallback
+        return 0.0
 
     def _execute_trade_inner(
         self,
@@ -751,6 +844,7 @@ class TradeExecutor:
         strategy: str = "DEFAULT",
         score: float = 0.0,
         structure_metadata: Optional[dict[str, Any]] = None,
+        record: Optional[ExecutionRecord] = None,
     ) -> Optional[dict[str, Any]]:
         """Execute entry under high-priority REST path (not blocked by scan loops)."""
         if Config.is_mega_cap_blacklisted(symbol):
@@ -790,6 +884,7 @@ class TradeExecutor:
                 strategy=strategy,
                 score=score,
                 structure_metadata=structure_metadata,
+                record=record,
             )
 
     def _place_entry_order(
@@ -802,6 +897,7 @@ class TradeExecutor:
         strategy: str = "DEFAULT",
         score: float = 0.0,
         structure_metadata: Optional[dict[str, Any]] = None,
+        record: Optional[ExecutionRecord] = None,
     ) -> Optional[dict[str, Any]]:
         """Place entry order — caller must hold entry_in_flight_mutex for symbol."""
         position_side = action
@@ -902,14 +998,33 @@ class TradeExecutor:
             leverage = Config.MAX_LEVERAGE
 
         trade_side = "BUY" if action == "LONG" else "SELL"
+        ledger = get_execution_ledger()
+        client_order_id = record.client_order_id if record else ""
+        if record:
+            record.quantity = quantity
+            record.entry = current_price
+            record.sl = sl
+            record.tp = tp1
+            record.atr = atr
+            ledger.transition(
+                record,
+                ExecutionPhase.ORDER_SUBMITTING,
+                extra=(
+                    f"qty={quantity:.8f} entry={current_price:.6f} "
+                    f"sl={sl:.6f} tp1={tp1:.6f}"
+                ),
+                quantity=quantity,
+                entry=current_price,
+            )
         trade_logger.info(
-            "[ORDER_SUBMIT] dispatching %s %s %s | qty=%.8f | price=%.6f | strategy=%s",
+            "[ORDER_SUBMITTING] dispatching %s %s %s | qty=%.8f | price=%.6f | strategy=%s | clientOrderId=%s",
             symbol,
             trade_side,
             position_side,
             quantity,
             current_price,
             strategy,
+            client_order_id,
         )
         try:
             response = self.exchange.execute_futures_order(
@@ -917,18 +1032,175 @@ class TradeExecutor:
                 side=trade_side,
                 position_side=position_side,
                 quantity=quantity,
+                new_client_order_id=client_order_id or None,
             )
         except OrderExecutionError as exc:
+            msg = str(exc)
+            if record:
+                if msg.startswith("RATE_LIMITED"):
+                    phase = ExecutionPhase.RATE_LIMITED
+                elif msg.startswith("ORDER_REJECTED"):
+                    phase = ExecutionPhase.ORDER_REJECTED
+                else:
+                    phase = ExecutionPhase.ORDER_SUBMISSION_FAILED
+                ledger.transition(record, phase, error_message=msg)
             log_execution_rejected(symbol, f"order rejected — {exc}", strategy=strategy)
             return None
 
         if not response:
+            if record:
+                ledger.transition(
+                    record,
+                    ExecutionPhase.ORDER_SUBMISSION_FAILED,
+                    error_message="empty order response",
+                )
             log_execution_rejected(
                 symbol, "exchange returned empty order response", strategy=strategy
             )
             return None
 
+        order_status = str(response.get("status") or "").upper()
         exchange_order_id = str(response.get("orderId", ""))
+        if record:
+            ledger.transition(
+                record,
+                ExecutionPhase.ORDER_ID_RECEIVED
+                if exchange_order_id
+                else ExecutionPhase.BINANCE_ACK,
+                binance_order_id=exchange_order_id,
+                extra=f"status={order_status or 'UNKNOWN'}",
+            )
+
+        if order_status not in {"FILLED", "PARTIALLY_FILLED"}:
+            if record:
+                ledger.transition(
+                    record,
+                    ExecutionPhase.ORDER_ACCEPTED_NOT_FILLED,
+                    binance_order_id=exchange_order_id,
+                    extra=f"status={order_status or 'UNKNOWN'}",
+                )
+                ledger.transition(
+                    record,
+                    ExecutionPhase.ORDER_STATUS_UNCERTAIN,
+                    binance_order_id=exchange_order_id,
+                    extra="awaiting late fill / user-data / reconcile",
+                )
+            trade_logger.warning(
+                "[ORDER_STATUS_UNCERTAIN] %s %s accepted orderId=%s status=%s — "
+                "not opening a local position and not sending a second order",
+                symbol,
+                action,
+                exchange_order_id or "?",
+                order_status or "UNKNOWN",
+            )
+            return None
+
+        return self._complete_filled_entry(
+            symbol=symbol,
+            action=action,
+            atr=atr,
+            current_price=current_price,
+            strategy=strategy,
+            score=score,
+            structure=structure,
+            record=record,
+            response=response,
+            quantity=quantity,
+            leverage=leverage,
+            metadata=metadata,
+            rules=rules,
+        )
+
+    def adopt_confirmed_fill(self, fill: dict[str, Any]) -> Optional[dict[str, Any]]:
+        """Idempotent late-fill adoption from user-data WS or REST reconcile."""
+        ledger = get_execution_ledger()
+        record = ledger.find_by_ids(
+            client_order_id=str(fill.get("clientOrderId") or ""),
+            binance_order_id=str(fill.get("orderId") or ""),
+            symbol=str(fill.get("symbol") or ""),
+        )
+        if record is None or record.is_opened() or not record.is_unresolved():
+            return None
+        status = str(fill.get("status") or "FILLED").upper()
+        if status not in {"FILLED", "PARTIALLY_FILLED"}:
+            return None
+        fill_qty = safe_float(fill.get("executedQty")) or record.quantity
+        fill_price = safe_float(fill.get("avgPrice")) or record.entry
+        if fill_qty <= 0 or record.atr <= 0:
+            return None
+        rules = self.exchange.get_symbol_rules(record.symbol)
+        structure: dict[str, Any] = {}
+        try:
+            metadata = self._build_partial_quantities(fill_qty, rules)
+        except OrderExecutionError:
+            metadata = {}
+        metadata["atr_at_entry"] = record.atr
+        metadata["strategy_tag"] = record.strategy
+        metadata["size_multiplier"] = size_multiplier_for_score(record.score)
+        response = {
+            "status": status,
+            "orderId": fill.get("orderId") or record.binance_order_id,
+            "avgPrice": fill_price,
+            "executedQty": fill_qty,
+        }
+        trade_logger.info(
+            "[LATE_FILL] adopting %s %s | %s | orderId=%s qty=%.8f px=%.6f",
+            record.exec_id,
+            record.symbol,
+            record.action,
+            response["orderId"],
+            fill_qty,
+            fill_price,
+        )
+        return self._complete_filled_entry(
+            symbol=record.symbol,
+            action=record.action,
+            atr=record.atr,
+            current_price=fill_price or record.entry,
+            strategy=record.strategy,
+            score=record.score,
+            structure=structure,
+            record=record,
+            response=response,
+            quantity=fill_qty,
+            leverage=Config.MAX_LEVERAGE,
+            metadata=metadata,
+            rules=rules,
+        )
+
+    def _complete_filled_entry(
+        self,
+        *,
+        symbol: str,
+        action: str,
+        atr: float,
+        current_price: float,
+        strategy: str,
+        score: float,
+        structure: dict[str, Any],
+        record: Optional[ExecutionRecord],
+        response: dict[str, Any],
+        quantity: float,
+        leverage: int,
+        metadata: dict[str, Any],
+        rules: SymbolRules,
+    ) -> Optional[dict[str, Any]]:
+        position_side = action
+        order_status = str(response.get("status") or "").upper()
+        exchange_order_id = str(response.get("orderId", ""))
+        if record:
+            ledger = get_execution_ledger()
+            if record.is_opened():
+                return None
+            ledger.transition(
+                record,
+                ExecutionPhase.ORDER_FILLED
+                if order_status == "FILLED"
+                else ExecutionPhase.PARTIALLY_FILLED,
+                binance_order_id=exchange_order_id,
+                quantity=quantity,
+                entry=safe_float(response.get("avgPrice")) or current_price,
+            )
         fill_price = safe_float(response.get("avgPrice"))
         if fill_price <= 0:
             executed = safe_float(response.get("executedQty"))
@@ -973,6 +1245,7 @@ class TradeExecutor:
                 error_logger.error("Failed to close orphan %s: %s", symbol, exc)
             return None
 
+        metadata.setdefault("size_multiplier", size_multiplier_for_score(score))
         metadata["best_price"] = fill_price
         metadata["r_distance"] = abs(fill_price - sl)
 
@@ -1097,8 +1370,8 @@ class TradeExecutor:
             return None
 
         trade_logger.info(
-            "Entry executed | %s %s | strategy=%s | qty=%s | fill=%.6f | SL=%.6f | TP1=%.6f | "
-            "R=%.6f | size_mult=%.2f | id=%s",
+            "[POSITION_CONFIRMED] %s %s | strategy=%s | qty=%s | fill=%.6f | SL=%.6f | TP1=%.6f | "
+            "R=%.6f | size_mult=%.2f | trade_id=%s | exec=%s",
             symbol,
             action,
             strategy,
@@ -1109,7 +1382,15 @@ class TradeExecutor:
             metadata["r_distance"],
             metadata["size_multiplier"],
             trade_id[:8],
+            record.exec_id if record else "",
         )
+        if record:
+            get_execution_ledger().transition(
+                record,
+                ExecutionPhase.POSITION_CONFIRMED,
+                binance_order_id=exchange_order_id,
+                extra=f"trade_id={trade_id[:8]} fill={fill_price:.6f}",
+            )
 
         return {
             "trade_id": trade_id,
@@ -1124,6 +1405,8 @@ class TradeExecutor:
             "quantity": quantity,
             "metadata": metadata,
             "exchange_order_id": exchange_order_id,
+            "exec_id": record.exec_id if record else "",
             "db_logged": db_logged,
             "orphan_fill": not db_logged,
+            "score": score,
         }

@@ -26,7 +26,12 @@ from executor import TradeExecutor, log_execution_rejected
 from logger import error_logger, system_logger
 from manager import TradeManager
 from risk_manager import RiskManager
-from reconciliation import reconcile_positions, reconcile_positions_at_startup
+from core.instance_lock import acquire_main_lock, release_main_lock
+from reconciliation import (
+    reconcile_positions,
+    reconcile_positions_at_startup,
+    reconcile_uncertain_executions,
+)
 from scheduler import DailyScheduler
 from telegram_bot import TelegramManager
 from utils import safe_float, utc_today_str
@@ -101,11 +106,14 @@ def _wait_for_rest_unblock(
     market_data.log_ban_pause_once(remaining)
     deadline = time.monotonic() + remaining
     while time.monotonic() < deadline and not controller.is_shutdown_requested():
+        from core.ops_heartbeat import touch_main_loop
+
+        touch_main_loop()
         blocked, _ = market_data.is_rest_blocked()
         if not blocked:
             system_logger.info("REST ban cleared — resuming trading loop.")
             return False
-        time.sleep(min(30.0, deadline - time.monotonic()))
+        time.sleep(min(20.0, max(deadline - time.monotonic(), 0.5)))
 
     return market_data.is_rest_blocked()[0]
 
@@ -322,6 +330,28 @@ def _execute_candidates(
                 log_execution_rejected(symbol, reason, strategy=normalized["strategy"])
                 continue
 
+            safety_fn = getattr(executor.exchange, "get_execution_safety", None)
+            if callable(safety_fn):
+                try:
+                    raw_safety = safety_fn(symbol)
+                except TypeError:
+                    raw_safety = safety_fn()
+                if (
+                    isinstance(raw_safety, tuple)
+                    and raw_safety
+                    and isinstance(raw_safety[0], str)
+                ):
+                    safety_state, safety_reason = raw_safety[0], str(
+                        raw_safety[1] if len(raw_safety) > 1 else ""
+                    )
+                    if safety_state != "EXECUTION_SAFE":
+                        log_execution_rejected(
+                            symbol,
+                            f"execution safety {safety_state} — {safety_reason}",
+                            strategy=normalized["strategy"],
+                        )
+                        break
+
             result: Optional[dict[str, Any]] = executor.execute_trade(
                 symbol=symbol,
                 action=action,
@@ -398,6 +428,40 @@ def _execute_candidates(
                     exc=exc,
                 )
             continue
+
+
+def _adopt_pending_user_fills(
+    market_data: Any,
+    executor: TradeExecutor,
+    tg: TelegramManager,
+    scheduler: DailyScheduler,
+    risk: RiskManager,
+    manager: Optional[TradeManager],
+) -> None:
+    drain = getattr(market_data, "drain_pending_order_fills", None)
+    if not callable(drain):
+        return
+    for fill in drain():
+        result = executor.adopt_confirmed_fill(fill)
+        if not result:
+            continue
+        if manager is not None:
+            manager.note_open_symbol(str(result.get("symbol", "")))
+        if not result.get("orphan_fill"):
+            tg.send_trade_alert(
+                action=result["action"],
+                symbol=result["symbol"],
+                price=float(result["entry_price"]),
+                tp1=float(result["take_profit_1"]),
+                sl=float(result["stop_loss"]),
+                tp2=float(result.get("take_profit_2", 0.0)),
+                tp3=float(result.get("take_profit_3", 0.0)),
+                score=float(result.get("score", 0.0)),
+                strategy=str(result.get("strategy", "")),
+                quantity=float(result.get("quantity", 0.0)),
+            )
+        scheduler.notify_trade_event()
+        risk.notify_trade_event()
 
 
 def _write_bot_heartbeat(cycle: int) -> None:
@@ -477,6 +541,12 @@ def main(controller: Optional[BotController] = None) -> str:
     Returns 'restart' if a graceful restart was requested, else 'stop'.
     """
     if not _validate_startup():
+        return "stop"
+
+    if not acquire_main_lock():
+        system_logger.critical(
+            "Another main.py holds the instance lock — refusing to start."
+        )
         return "stop"
 
     _startup_banner()
@@ -594,6 +664,7 @@ def main(controller: Optional[BotController] = None) -> str:
         system_logger.info("Initialization complete. Entering main trading loop.")
 
         last_heartbeat = time.monotonic()
+        last_uncertain_reconcile = 0.0
         last_report_day = ""
         last_reconciliation = time.monotonic()
         last_maintenance = time.monotonic()
@@ -615,6 +686,20 @@ def main(controller: Optional[BotController] = None) -> str:
 
                 # Step 1 — Periodic DB/exchange reconciliation (every 15 min)
                 now_mono = time.monotonic()
+                _adopt_pending_user_fills(
+                    market_data, executor, tg, scheduler, risk, manager
+                )
+                if (
+                    now_mono - last_uncertain_reconcile
+                    >= Config.UNCERTAIN_ORDER_RECONCILE_SECONDS
+                    and not market_data.is_rest_blocked()[0]
+                ):
+                    late = reconcile_uncertain_executions(exchange, executor)
+                    if late:
+                        system_logger.info(
+                            "Late-fill reconcile confirmed %s position(s).", late
+                        )
+                    last_uncertain_reconcile = now_mono
                 if now_mono - last_reconciliation >= Config.RECONCILIATION_INTERVAL_SECONDS:
                     if not market_data.is_rest_blocked()[0]:
                         reconcile_positions(
@@ -732,6 +817,7 @@ def main(controller: Optional[BotController] = None) -> str:
                     tg.stop_listening()
                 except Exception:
                     pass
+        release_main_lock()
 
 
 def run_with_auto_restart() -> None:

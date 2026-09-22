@@ -21,7 +21,6 @@ from exchange import BinanceExchangeManager
 from logger import error_logger, scanner_logger, signal_logger
 from pipeline.snapshot_factory import SnapshotFactory
 from pipeline.universe_builder import UniverseBuilder
-from engines.smc_engine import effective_smc_min_score
 from strategies import build_strategy_registry
 from utils import safe_float
 
@@ -351,13 +350,11 @@ class StrategyScannerPipeline:
         return len(tags) == 1
 
     def _passes_min_score(self, signal: SignalCandidate) -> bool:
-        if signal.strategy == STRATEGY_RANGE_REVERSION:
-            return signal.score >= Config.RANGE_MIN_SCORE
-        if signal.strategy == STRATEGY_SMC_TREND:
-            confluence = signal.confluence
-            macro = signal.macro_trend or "NEUTRAL"
-            return signal.score >= effective_smc_min_score(confluence, macro)
-        return signal.score >= Config.STRATEGY_MIN_SCORE
+        from core.scoring_engine import ScoringEngine
+
+        return signal.score >= ScoringEngine.strategy_min_score(
+            signal.strategy, signal
+        )
 
     def _log_accepted_signal(self, signal: SignalCandidate) -> None:
         self.db.log_signal(

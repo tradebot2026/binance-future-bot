@@ -11,7 +11,7 @@ from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, RegimeLabel, SignalCandidate
 from indicators.market_analyzer import MarketAnalyzer
-from logger import signal_logger
+from logger import log_strategy_approved
 from engines.range_engine import evaluate_range_setup
 from utils import safe_float
 
@@ -120,13 +120,12 @@ class RangeStrategy(BaseStrategy):
                 )
             return None
 
-        signal_logger.info(
-            "APPROVED %s %s | strategy=%s | score=%.1f | edge=%s",
+        log_strategy_approved(
             symbol,
             action,
             self.tag,
             result.score,
-            result.metadata.edge,
+            extra=f"edge={result.metadata.edge}",
         )
         fit = self.regime_fit(snapshot)
         meta = result.metadata.to_dict()

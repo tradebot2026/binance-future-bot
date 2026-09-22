@@ -169,6 +169,16 @@ class PositionWatchdog:
             return False
 
         if stale_seconds is not None and stale_seconds > Config.WATCHDOG_MAIN_STALE_SECONDS:
+            if process_running:
+                self._alert_main_down(
+                    f"Main bot heartbeat stale ({stale_seconds:.0f}s > "
+                    f"{Config.WATCHDOG_MAIN_STALE_SECONDS}s) but process still running — "
+                    "skipping auto-restart to avoid a duplicate bot."
+                )
+                watchdog_logger.warning(
+                    "Heartbeat stale while main process is alive — not auto-restarting."
+                )
+                return True
             self._alert_main_down(
                 f"Main bot heartbeat stale ({stale_seconds:.0f}s > "
                 f"{Config.WATCHDOG_MAIN_STALE_SECONDS}s)."
@@ -270,6 +280,13 @@ class PositionWatchdog:
         script = Config.WATCHDOG_MAIN_SCRIPT
         if not os.path.isfile(script):
             watchdog_logger.error("Auto-restart skipped — %s not found.", script)
+            return
+        from core.instance_lock import another_main_is_running
+
+        if another_main_is_running() or self.is_main_process_running():
+            watchdog_logger.warning(
+                "Auto-restart skipped — a live main.py instance already exists."
+            )
             return
         try:
             subprocess.Popen(

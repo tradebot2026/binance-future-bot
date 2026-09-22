@@ -157,12 +157,30 @@ def format_bot_health_message(
     cycle = hb_payload.get("cycle")
     cycle_line = f"🔄 <b>Main cycle:</b> {cycle}\n" if cycle is not None else ""
 
+    api_line = "UNKNOWN"
+    exec_line = "UNKNOWN"
+    if exchange is not None:
+        if hasattr(exchange, "rest_usage_snapshot"):
+            usage = exchange.rest_usage_snapshot() or {}
+            api_line = (
+                f"{usage.get('state', 'UNKNOWN')} "
+                f"({int(usage.get('requests_1m') or 0)} req/min, "
+                f"weight {int(usage.get('used_weight_1m') or 0)})"
+            )
+        if hasattr(exchange, "get_execution_safety"):
+            exec_state, exec_reason = exchange.get_execution_safety()
+            exec_line = exec_state if exec_state == "EXECUTION_SAFE" else (
+                f"{exec_state} ({exec_reason})" if exec_reason else exec_state
+            )
+
     return (
         f"🩺 <b>BOT HEALTH AND DIAGNOSTICS</b>\n"
         f"🌐 <b>Mode:</b> {escape_html(mode)}\n\n"
         f"⏱️ <b>Last Refreshed:</b> {refreshed}\n"
         f"💓 <b>Heartbeat:</b> {escape_html(hb_line)}\n"
         f"🌐 <b>WebSocket State:</b> {escape_html(ws_line)}\n"
+        f"🛡 <b>API Health:</b> {escape_html(api_line)}\n"
+        f"🚦 <b>Execution:</b> {escape_html(exec_line)}\n"
         f"🧠 <b>Decision Engine:</b> {escape_html(engine_line)}\n"
         f"📊 <b>Scanner:</b> {escape_html(scan_line)}\n"
         f"🛡️ <b>Watchdog:</b> {escape_html(watchdog_line)}\n"

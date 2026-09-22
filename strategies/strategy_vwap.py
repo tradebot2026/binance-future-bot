@@ -11,7 +11,7 @@ from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, RegimeLabel, SignalCandidate
 from indicators.market_analyzer import MarketAnalyzer
-from logger import signal_logger
+from logger import log_strategy_approved
 from utils import safe_float
 from engines.vwap_engine import evaluate_vwap_pullback
 
@@ -104,14 +104,12 @@ class VwapPullbackStrategy(BaseStrategy):
                     snapshot.symbol, action, result.score, result.reasons, strategy=self.tag
                 )
             return None
-        signal_logger.info(
-            "APPROVED %s %s | strategy=%s | score=%.1f | vwap=%.6f dist_atr=%.2f",
+        log_strategy_approved(
             snapshot.symbol,
             action,
             self.tag,
             result.score,
-            result.vwap,
-            result.distance_atr,
+            extra=f"vwap={result.vwap:.6f} dist_atr={result.distance_atr:.2f}",
         )
         return SignalCandidate(
             symbol=snapshot.symbol,

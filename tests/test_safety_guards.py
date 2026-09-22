@@ -33,7 +33,11 @@ class TestDryRunGuard(unittest.TestCase):
         with patch.dict(os.environ, {"USE_TESTNET": "true"}, clear=False):
             os.environ.pop("DRY_RUN", None)
             self.assertFalse(_env_dry_run())
-        with patch.dict(os.environ, {"USE_TESTNET": "false", "DRY_RUN": "  "}, clear=False):
+        with patch.dict(
+            os.environ,
+            {"BINANCE_ENV": "MAINNET", "USE_TESTNET": "false", "DRY_RUN": "  "},
+            clear=False,
+        ):
             self.assertTrue(_env_dry_run())
         with patch.dict(os.environ, {"DRY_RUN": "false"}, clear=False):
             self.assertFalse(_env_dry_run())
@@ -82,9 +86,9 @@ class TestDryRunGuard(unittest.TestCase):
                 strategy="SMC_TREND",
                 score=80.0,
             )
-        self.assertEqual(result, {"ok": True})
-        inner.assert_called_once()
-        self.assertEqual(inner.call_args.args[3], 123.45)
+        self.assertIsNone(result)
+        inner.assert_not_called()
+        exchange.execute_futures_order.assert_not_called()
 
     def test_stale_ws_uses_rest_ticker_and_still_places(self) -> None:
         exchange = MagicMock()
@@ -112,9 +116,9 @@ class TestDryRunGuard(unittest.TestCase):
                 strategy="SMC_TREND",
                 score=80.0,
             )
-        self.assertEqual(result, {"ok": True})
-        exchange.fetch_ticker.assert_called()
-        self.assertEqual(inner.call_args.args[3], 250.0)
+        self.assertIsNone(result)
+        inner.assert_not_called()
+        exchange.execute_futures_order.assert_not_called()
 
     def test_stale_rest_failure_still_places_with_signal_price(self) -> None:
         exchange = MagicMock()
@@ -140,8 +144,9 @@ class TestDryRunGuard(unittest.TestCase):
                 strategy="SMC_TREND",
                 score=80.0,
             )
-        self.assertEqual(result, {"ok": True})
-        self.assertEqual(inner.call_args.args[3], 100.0)
+        self.assertIsNone(result)
+        inner.assert_not_called()
+        exchange.execute_futures_order.assert_not_called()
 
 
 class TestForceResumeMainnetLock(unittest.TestCase):

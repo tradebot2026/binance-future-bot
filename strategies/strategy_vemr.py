@@ -11,7 +11,7 @@ from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, RegimeLabel, SignalCandidate
 from indicators.market_analyzer import MarketAnalyzer
-from logger import signal_logger
+from logger import log_strategy_approved
 from engines.vol_expansion_engine import evaluate_vol_expansion_mr
 
 if TYPE_CHECKING:
@@ -106,13 +106,12 @@ class VolExpansionStrategy(BaseStrategy):
                     snapshot.symbol, action, result.score, result.reasons, strategy=self.tag
                 )
             return None
-        signal_logger.info(
-            "APPROVED %s %s | strategy=%s | score=%.1f | ext_atr=%.2f",
+        log_strategy_approved(
             snapshot.symbol,
             action,
             self.tag,
             result.score,
-            result.extension_atr,
+            extra=f"ext_atr={result.extension_atr:.2f}",
         )
         return SignalCandidate(
             symbol=snapshot.symbol,

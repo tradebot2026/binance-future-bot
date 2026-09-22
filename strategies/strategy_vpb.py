@@ -11,7 +11,7 @@ from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, RegimeLabel, SignalCandidate
 from indicators.market_analyzer import MarketAnalyzer
-from logger import signal_logger
+from logger import log_strategy_approved
 from engines.vp_breakout_engine import evaluate_vp_breakout
 
 if TYPE_CHECKING:
@@ -112,13 +112,12 @@ class VpBreakoutStrategy(BaseStrategy):
                     snapshot.symbol, action, result.score, result.reasons, strategy=self.tag
                 )
             return None
-        signal_logger.info(
-            "APPROVED %s %s | strategy=%s | score=%.1f | poc=%.6f",
+        log_strategy_approved(
             snapshot.symbol,
             action,
             self.tag,
             result.score,
-            result.poc,
+            extra=f"poc={result.poc:.6f}",
         )
         return SignalCandidate(
             symbol=snapshot.symbol,

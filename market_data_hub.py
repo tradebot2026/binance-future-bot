@@ -160,8 +160,11 @@ class MarketDataHub:
         self._price_tick_listeners: list[Callable[[str, float], None]] = []
         self._ws_running = False
         self._last_ticker_event_at: float = 0.0
+        self._last_real_ticker_at: float = 0.0
         self._last_book_event_at: float = 0.0
         self._last_ws_seen_at: float = 0.0
+        self._pending_order_fills: list[dict[str, Any]] = []
+        self._bootstrap_series_window: deque[float] = deque()
         self._last_user_event_at: float = 0.0
         self._positions: list[dict[str, Any]] = []
         self._unrealized_pnl_total: float = 0.0
@@ -457,6 +460,31 @@ class MarketDataHub:
             min_symbols=min_syms,
         )
 
+    def is_market_data_ready_for_entry(self, symbol: str = "") -> tuple[bool, str]:
+        """NEW-entry gate. Open-position monitoring must not use this."""
+        if self._reconnect_in_progress:
+            return False, "WS_RECONNECTING"
+        if not self._ws_running:
+            return False, "WS_DISCONNECTED"
+        if self.is_ws_warming_up() or self._last_real_ticker_at <= 0:
+            return False, "WS_WARMUP"
+        stale_after = self._effective_ticker_stale_seconds()
+        if (time.monotonic() - self._last_real_ticker_at) > stale_after:
+            return False, "STALE_DATA"
+        if not self.is_ticker_cache_usable():
+            return False, "RESYNC"
+        if symbol:
+            fresh = self.get_fresh_ticker_price(symbol, max_age_seconds=stale_after)
+            if fresh is None or fresh <= 0:
+                return False, "STALE_DATA"
+        return True, ""
+
+    def drain_pending_order_fills(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = list(self._pending_order_fills)
+            self._pending_order_fills.clear()
+            return rows
+
     def is_ws_warming_up(self) -> bool:
         """True only while reconnect/start is in flight before freshness is stamped."""
         if self._reconnect_in_progress:
@@ -580,7 +608,8 @@ class MarketDataHub:
             streams = "miniTicker + user data"
             if Config.ENABLE_WS_BOOK_STREAM:
                 streams += " + bookTicker"
-            system_logger.info("WebSocket streams started (%s).", streams)
+            system_logger.info("[WS_CONNECTED] streams started (%s).", streams)
+            system_logger.info("[WS_SUBSCRIPTION_READY] miniTicker/userData subscribed.")
 
     def _start_watchdog(self) -> None:
         if not Config.WS_RECONNECT_ENABLED:
@@ -693,6 +722,7 @@ class MarketDataHub:
         def _wrapped(message: dict[str, Any]) -> None:
             if is_ws_error_message(message):
                 detail = str(message.get("m", message.get("type", "ws error")))
+                system_logger.warning("[WS_ERROR] %s stream=%s", detail, stream)
                 if is_read_loop_closed_error(detail):
                     self._request_reconnect(detail)
                 return
@@ -704,8 +734,13 @@ class MarketDataHub:
             except Exception as exc:
                 if is_read_loop_closed_error(exc):
                     self._request_reconnect(str(exc))
-                elif self._ws_log.should_log(f"callback:{type(exc).__name__}"):
-                    error_logger.warning("WebSocket callback error: %s", exc)
+                else:
+                    system_logger.warning(
+                        "[WS_ERROR] callback %s on %s stream: %s",
+                        type(exc).__name__,
+                        stream,
+                        exc,
+                    )
 
         return _wrapped
 
@@ -730,8 +765,15 @@ class MarketDataHub:
             if self._reconnect_in_progress:
                 return
             self._reconnect_in_progress = True
+            self._last_real_ticker_at = 0.0
 
         silent = preserve_cache and "stale" not in reason.lower()
+        if "stale" in reason.lower():
+            system_logger.info("[WS_RECONNECT_ATTEMPT] stale stream: %s", reason)
+        elif silent:
+            system_logger.info("[WS_RECONNECT_ATTEMPT] cache-preserving refresh: %s", reason)
+        else:
+            system_logger.warning("[WS_DISCONNECTED] %s", reason)
         if self._ws_log.should_log(reason):
             if silent:
                 system_logger.debug(
@@ -754,6 +796,12 @@ class MarketDataHub:
     def _reconnect_worker(self, reason: str, silent: bool = False) -> None:
         try:
             delay = self._reconnect_policy.next_delay()
+            system_logger.info(
+                "[WS_RECONNECT_ATTEMPT] in %.1fs (attempt %s) reason=%s",
+                delay,
+                self._reconnect_policy.attempt,
+                reason,
+            )
             if self._ws_log.should_log(f"backoff:{delay:.0f}s"):
                 log_fn = system_logger.debug if silent else system_logger.info
                 log_fn(
@@ -775,10 +823,10 @@ class MarketDataHub:
             self._last_stale_reconnect_success_at = time.monotonic()
             self._ws_log.reset()
             system_logger.info(
-                "WebSocket streams re-subscribed (miniTicker + bookTicker + userData) "
-                "after: %s",
+                "[WS_RECONNECTED] streams re-subscribed (miniTicker + bookTicker + userData) after: %s",
                 reason,
             )
+            system_logger.info("[WS_SUBSCRIPTION_READY] post-reconnect subscriptions active.")
             if not self._rest_quiet_mode():
                 self.refresh_ticker_cache_from_rest(silent=True)
             elif preserve_cache and self._ws_log.should_log("ws_reconnect_quiet"):
@@ -790,6 +838,11 @@ class MarketDataHub:
             else:
                 system_logger.info("WebSocket reconnected successfully.")
         except Exception as exc:
+            system_logger.error(
+                "[WS_ERROR] reconnect failed (attempt %s): %s",
+                self._reconnect_policy.attempt,
+                exc,
+            )
             if self._ws_log.should_log(f"reconnect_failed:{exc}"):
                 error_logger.error(
                     "WebSocket reconnect failed (attempt %s): %s",
@@ -880,8 +933,8 @@ class MarketDataHub:
         if sock.conn_key and self._ws_manager:
             try:
                 self._ws_manager.stop_socket(sock.conn_key)
-            except Exception:
-                pass
+            except Exception as exc:
+                error_logger.debug("Kline multiplex stop failed: %s", exc)
         sock.conn_key = None
 
     def _open_kline_socket_pool(self, streams: list[str]) -> int:
@@ -925,18 +978,18 @@ class MarketDataHub:
                 if self._user_conn_key:
                     try:
                         manager.stop_socket(self._user_conn_key)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        error_logger.debug("User-data socket stop failed: %s", exc)
                 if self._book_ticker_conn_key:
                     try:
                         manager.stop_socket(self._book_ticker_conn_key)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        error_logger.debug("BookTicker socket stop failed: %s", exc)
                 if self._ticker_conn_key:
                     try:
                         manager.stop_socket(self._ticker_conn_key)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        error_logger.debug("Ticker socket stop failed: %s", exc)
                 manager.stop()
                 if manager.is_alive() and join_timeout > 0:
                     manager.join(timeout=join_timeout)
@@ -1152,6 +1205,7 @@ class MarketDataHub:
                     updated = True
                 if updated:
                     self._last_ticker_event_at = now
+                    self._last_real_ticker_at = now
             if updated:
                 self._reconnect_policy.reset()
                 for sym, tick_price in tick_prices.items():
@@ -1237,10 +1291,12 @@ class MarketDataHub:
         fill_price = safe_float(order.get("L")) or safe_float(order.get("ap"))
         fill_qty = safe_float(order.get("l"))
         commission = safe_float(order.get("n"))
+        symbol = str(order.get("s", "")).upper()
+        status = str(order.get("X", "")).upper()
         self.fill_tracker.record(
             FillPnlRecord(
                 order_id=order_id,
-                symbol=str(order.get("s", "")).upper(),
+                symbol=symbol,
                 position_side=str(order.get("ps", "BOTH")).upper(),
                 realized_pnl=realized,
                 commission=commission,
@@ -1251,6 +1307,19 @@ class MarketDataHub:
                 source="ws",
             )
         )
+        if status in {"FILLED", "PARTIALLY_FILLED"} or fill_qty > 0:
+            with self._lock:
+                self._pending_order_fills.append(
+                    {
+                        "symbol": symbol,
+                        "orderId": order_id,
+                        "clientOrderId": str(order.get("c") or ""),
+                        "status": status or "FILLED",
+                        "avgPrice": fill_price,
+                        "executedQty": fill_qty or safe_float(order.get("z")),
+                        "positionSide": str(order.get("ps", "")).upper(),
+                    }
+                )
 
     def _on_kline_multiplex(self, message: dict[str, Any]) -> None:
         payload = message.get("data", message)
@@ -1655,6 +1724,21 @@ class MarketDataHub:
         )
         if not pending:
             return 0
+
+        now = time.monotonic()
+        while self._bootstrap_series_window and self._bootstrap_series_window[0] < now - 60.0:
+            self._bootstrap_series_window.popleft()
+        per_minute = max(int(getattr(Config, "KLINE_BOOTSTRAP_MAX_SERIES_PER_MINUTE", 12)), 1)
+        remaining = per_minute - len(self._bootstrap_series_window)
+        if remaining <= 0:
+            system_logger.info(
+                "Kline bootstrap paced — %s series already requested in the last 60s.",
+                per_minute,
+            )
+            return 0
+        pending = pending[:remaining]
+        for _ in pending:
+            self._bootstrap_series_window.append(now)
 
         exchange = getattr(rest_fetcher, "__self__", None)
         can_fetch = None

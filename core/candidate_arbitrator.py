@@ -51,19 +51,47 @@ class CandidateArbitrator:
             else:
                 winner = best_short
                 losers = longs + [c for c in shorts if c is not winner]
-            signal_logger.info(
-                "Arbitrator resolved %s conflict | winner=%s %s adj=%.1f | rejected=%s",
-                symbol,
-                winner.strategy,
-                winner.action,
-                winner.adjusted_score,
-                len(losers),
+            CandidateArbitrator._log_decision(
+                winner,
+                losers,
+                reason="CONFLICT_LONG_SHORT",
             )
             return winner, losers
 
         winner = max(valid, key=CandidateArbitrator._sort_key)
         losers = [c for c in valid if c is not winner]
+        if losers:
+            CandidateArbitrator._log_decision(
+                winner,
+                losers,
+                reason="BEST_OF_SAME_DIRECTION",
+            )
         return winner, losers
+
+    @staticmethod
+    def _log_decision(
+        winner: SignalCandidate,
+        losers: list[SignalCandidate],
+        *,
+        reason: str,
+    ) -> None:
+        confluence = ""
+        if winner.structure_metadata:
+            confluence = str(
+                winner.structure_metadata.get("confluence") or winner.confluence or ""
+            )
+        signal_logger.info(
+            "[ARBITRATOR] %s winner=%s %s raw=%.1f fit=%.2f final=%.1f confluence=%s reason=%s rejected=%s",
+            winner.symbol,
+            winner.strategy,
+            winner.action,
+            winner.score,
+            winner.regime_fit,
+            winner.adjusted_score,
+            confluence or winner.confluence or "-",
+            reason,
+            ",".join(f"{c.strategy}:{c.action}:{c.score:.0f}" for c in losers[:4]) or "-",
+        )
 
     @staticmethod
     def rank_global(

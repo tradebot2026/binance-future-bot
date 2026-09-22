@@ -11,7 +11,7 @@ from core.strategy_base import BaseStrategy
 from core.strategy_registry import strategy_enable_flag
 from core.types import MarketSnapshot, RegimeLabel, SignalCandidate
 from indicators.market_analyzer import MarketAnalyzer
-from logger import signal_logger
+from logger import log_strategy_approved
 from engines.lsc_engine import evaluate_lsc_setup
 from utils import safe_float
 
@@ -107,13 +107,12 @@ class LiquiditySweepStrategy(BaseStrategy):
                     snapshot.symbol, action, result.score, result.reasons, strategy=self.tag
                 )
             return None
-        signal_logger.info(
-            "APPROVED %s %s | strategy=%s | score=%.1f | sweep=%s",
+        log_strategy_approved(
             snapshot.symbol,
             action,
             self.tag,
             result.score,
-            result.sweep_type,
+            extra=f"sweep={result.sweep_type}",
         )
         return SignalCandidate(
             symbol=snapshot.symbol,

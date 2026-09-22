@@ -6,10 +6,58 @@ from typing import Any, Optional
 
 from config import Config
 from constants import strategy_display_label
+from core.execution_ledger import get_execution_ledger
 from database import DatabaseManager
 from reconciliation import sync_active_trades_on_demand
 from risk_manager import compute_daily_pnl_metrics
+from logger import error_logger
 from utils import escape_html, safe_float, utc_today_str
+
+
+def format_runtime_health_block(exchange: Any = None, scanner: Any = None) -> str:
+    """Compact WS/API/scanner/execution lines for /status and /watchlist."""
+    ws_state = "UNKNOWN"
+    api_state = "UNKNOWN"
+    exec_state = "UNKNOWN"
+    scan_line = "n/a"
+    open_positions = 0
+    if exchange is not None:
+        hub = None
+        if hasattr(exchange, "get_market_data_hub"):
+            hub = exchange.get_market_data_hub()
+        if hub is not None and hasattr(hub, "get_ws_health_snapshot"):
+            snap = hub.get_ws_health_snapshot() or {}
+            ws_state = str(snap.get("state", "UNKNOWN")).upper()
+        if hasattr(exchange, "rest_usage_snapshot"):
+            usage = exchange.rest_usage_snapshot() or {}
+            api_state = str(usage.get("state", "UNKNOWN"))
+        if hasattr(exchange, "get_execution_safety"):
+            exec_state, _ = exchange.get_execution_safety()
+        positions_fn = getattr(exchange, "get_all_open_positions", None)
+        if callable(positions_fn):
+            try:
+                open_positions = len(positions_fn(force_refresh=False) or [])
+            except Exception as exc:
+                error_logger.debug("Open-position count for Telegram failed: %s", exc)
+    if scanner is not None and hasattr(scanner, "get_watchlist_tiers"):
+        tiers = scanner.get_watchlist_tiers()
+        scan_line = (
+            f"cycle {tiers.get('rotation_cycle', 0)} | "
+            f"evaluated {tiers.get('rotation_evaluated', 0)} | "
+            f"hot {len(tiers.get('tier1_hot') or [])}"
+        )
+    ledger = get_execution_ledger().recent_summary()
+    queued = get_execution_ledger().queued_count()
+    return (
+        f"\n🛰 <b>RUNTIME</b>\n"
+        f"WS: {escape_html(ws_state)} | API: {escape_html(api_state)}\n"
+        f"RATE LIMIT: {escape_html(api_state)} | EXECUTION: {escape_html(exec_state)}\n"
+        f"SCANNER: {escape_html(scan_line)}\n"
+        f"OPEN POSITIONS: {open_positions} | QUEUE: {queued}\n"
+        f"APPROVED: {ledger['approved']} | SUBMITTED: {ledger['submitted']} | "
+        f"FILLED: {ledger['filled']} | REJECTED: {ledger['rejected']} | "
+        f"FAILED: {ledger['failed']}"
+    )
 
 
 def _position_pnl_percent(
@@ -188,7 +236,8 @@ def format_daily_status_message(
         f"⚖️ <b>Profit Factor:</b> {pf_display}\n"
         f"🚀 <b>Entries:</b> {entries}/{Config.MAX_DAILY_TRADES} | "
         f"<b>Closes:</b> {closes}\n"
-        f"⚙️ <b>Bot Status:</b> {engine_label} / {daily_status}"
+        f"⚙️ <b>Bot Status:</b> {engine_label} / {daily_status}\n"
+        f"{format_runtime_health_block(exchange)}"
     )
 
 
@@ -341,9 +390,17 @@ def format_watchlist_message(
     hot_scan_interval: float,
     tier2_display_limit: int = 20,
     tier2_near_miss: Optional[list[tuple[str, str, float, float]]] = None,
+    rotation_cycle: int = 0,
+    rotation_evaluated: int = 0,
+    exchange: Any = None,
 ) -> str:
     """Format /watchlist — Tier 1 hot scan universe + Tier 2 execution candidates."""
     lines = ["📡 <b>Scan Watchlist</b>\n"]
+    if rotation_cycle or rotation_evaluated:
+        lines.append(
+            f"🔄 <b>Rotation:</b> batch/cycle {rotation_cycle} | "
+            f"evaluated {rotation_evaluated}"
+        )
 
     lines.append(
         f"🔥 <b>Tier 1 — Hot Scan</b> ({len(tier1_hot)}) "
@@ -390,4 +447,5 @@ def format_watchlist_message(
                 f"| raw={raw:.1f} norm={norm:.0f}"
             )
 
+    lines.append(format_runtime_health_block(exchange))
     return "\n".join(lines)
