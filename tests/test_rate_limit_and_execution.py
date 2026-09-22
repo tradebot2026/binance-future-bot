@@ -70,6 +70,31 @@ class TestRestUsageTracker(unittest.TestCase):
         self.assertEqual(weight_for_call(futures_ticker, symbol="BTCUSDT"), 1)
 
 
+class TestRestBlockedUsesSnapshotState(unittest.TestCase):
+    def test_is_rest_blocked_does_not_use_missing_health_state(self) -> None:
+        from exchange import BinanceExchangeManager
+
+        exchange = BinanceExchangeManager.__new__(BinanceExchangeManager)
+        exchange._rest_usage = RestUsageTracker()
+        exchange._market_data = None
+        exchange._rest_token_bucket = SimpleNamespace(
+            is_hard_stopped=lambda: False,
+            hard_stop_remaining=lambda: 0,
+        )
+        blocked, reason = exchange.is_rest_blocked()
+        self.assertIsInstance(blocked, bool)
+        self.assertIsInstance(reason, str)
+        self.assertFalse(blocked)
+
+        exchange._rest_usage.note_http_response(
+            SimpleNamespace(status_code=429, headers={"Retry-After": "8"})
+        )
+        blocked, reason = exchange.is_rest_blocked()
+        self.assertTrue(blocked)
+        self.assertIn("API_RATE_LIMITED", reason)
+        self.assertFalse(hasattr(exchange._rest_usage, "health_state"))
+
+
 class TestExecutionLedger(unittest.TestCase):
     def test_approved_is_not_opened(self) -> None:
         ledger = ExecutionLedger()

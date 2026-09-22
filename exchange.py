@@ -616,20 +616,34 @@ class BinanceExchangeManager:
 
     def is_rest_blocked(self) -> tuple[bool, str]:
         """True when REST must not be attempted (IP ban / hard-stop)."""
-        if self._rest_usage.in_safety_mode():
-            remaining = int(self._rest_usage.safety_remaining())
-            return True, (
-                f"API SAFETY MODE — REST halted "
-                f"({remaining}s remaining, {self._rest_usage.health_state.value})"
-            )
-        if self._market_data:
-            blocked, reason = self._market_data.is_rest_blocked()
-            if blocked:
-                return True, reason
-        if self._rest_token_bucket.is_hard_stopped():
-            remaining = int(self._rest_token_bucket.hard_stop_remaining())
-            return True, f"REST hard-stop (~{remaining}s remaining)"
-        return False, ""
+        try:
+            usage = self._rest_usage
+            in_safety = bool(getattr(usage, "in_safety_mode", lambda: False)())
+            if in_safety:
+                remaining = int(getattr(usage, "safety_remaining", lambda: 0)() or 0)
+                snap = usage.snapshot() if callable(getattr(usage, "snapshot", None)) else {}
+                state = ""
+                if isinstance(snap, dict):
+                    state = str(snap.get("state") or "")
+                if not state:
+                    raw_state = getattr(usage, "health_state", None) or getattr(
+                        usage, "_state", None
+                    )
+                    state = str(getattr(raw_state, "value", raw_state) or "UNKNOWN")
+                return True, (
+                    f"API SAFETY MODE — REST halted "
+                    f"({remaining}s remaining, {state})"
+                )
+            if self._market_data:
+                blocked, reason = self._market_data.is_rest_blocked()
+                if blocked:
+                    return True, reason
+            if self._rest_token_bucket.is_hard_stopped():
+                remaining = int(self._rest_token_bucket.hard_stop_remaining())
+                return True, f"REST hard-stop (~{remaining}s remaining)"
+            return False, ""
+        except Exception as exc:
+            return True, f"REST safety check failed ({type(exc).__name__})"
 
     def rest_account_reads_blocked(self) -> bool:
         """True when account/position REST reads must use WS/cache only."""
