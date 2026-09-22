@@ -42,19 +42,32 @@ class StrategyEvaluator:
         bar_open_ms: int = 0,
         timeframe: str = "",
     ) -> list[StrategyScore]:
+        scores, _deduped = self.evaluate_detailed(
+            snapshot, bar_open_ms=bar_open_ms, timeframe=timeframe
+        )
+        return scores
+
+    def evaluate_detailed(
+        self,
+        snapshot: MarketSnapshot,
+        *,
+        bar_open_ms: int = 0,
+        timeframe: str = "",
+    ) -> tuple[list[StrategyScore], list[StrategyResult]]:
         institutional_context = None
         if self.institutional is not None:
             institutional_context = self.institutional.evaluate(snapshot)
 
         results = self._scan_all(snapshot)
         deduped = self.correlation_guard.deduplicate(results)
-        return self.confluence_scorer.score_results(
+        scores = self.confluence_scorer.score_results(
             snapshot,
             deduped,
             bar_open_ms=bar_open_ms,
             timeframe=timeframe,
             institutional_context=institutional_context,
         )
+        return scores, deduped
 
     def evaluate_batch(
         self,

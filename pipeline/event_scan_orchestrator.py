@@ -17,7 +17,7 @@ from core.types import CandleCloseEvent, SignalCandidate
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from executor import log_execution_rejected
-from logger import scanner_logger
+from logger import log_trade_approved, scanner_logger
 from pipeline.snapshot_factory import SnapshotFactory
 from pipeline.universe_builder import UniverseBuilder
 from strategies import build_strategy_registry
@@ -380,13 +380,15 @@ class EventScanOrchestrator:
         mark_event: Optional[CandleCloseEvent] = None,
     ) -> Optional[SignalCandidate]:
         symbol = symbol.upper()
+        skip_rotation_memory = Config.USE_TESTNET
         if (
-            self.priority_queue.rotation.is_in_evaluated_memory(symbol)
+            not skip_rotation_memory
+            and self.priority_queue.rotation.is_in_evaluated_memory(symbol)
             and not self.priority_queue.is_priority(symbol)
             and not self.assignment_manager.is_hot(symbol)
         ):
-            scanner_logger.debug(
-                "Skip %s — in evaluated memory (rotation cooldown).", symbol
+            log_execution_rejected(
+                symbol, "rotation evaluated-memory cooldown — skipped rescan"
             )
             if mark_event is not None:
                 self.event_scheduler.mark_evaluated(
@@ -409,9 +411,8 @@ class EventScanOrchestrator:
             volume_rank=volume_rank,
         )
         if snapshot is None:
-            scanner_logger.debug(
-                "Tier2 skip %s — snapshot unavailable (WS kline cache miss).",
-                symbol,
+            log_execution_rejected(
+                symbol, "snapshot unavailable (WS kline cache miss)"
             )
             if mark_event is not None:
                 self.event_scheduler.mark_evaluated(
@@ -419,13 +420,13 @@ class EventScanOrchestrator:
                 )
             return None
 
-        scores = self.scoring_engine.evaluate_symbol(
+        scores, first_pass = self.scoring_engine.evaluate_symbol_detailed(
             snapshot,
             bar_open_ms=bar_open_ms,
             timeframe=timeframe,
         )
         if not scores:
-            scanner_logger.debug("Tier2 skip %s — no strategy scores produced.", symbol)
+            log_execution_rejected(symbol, "no strategy scores produced after scan")
             if mark_event is not None:
                 self.event_scheduler.mark_evaluated(
                     symbol, mark_event.timeframe, mark_event.bar_open_ms
@@ -463,7 +464,30 @@ class EventScanOrchestrator:
             )
 
         if best is None:
+            log_execution_rejected(
+                symbol,
+                f"pick_best produced no valid winner from {len(scores)} scored setup(s)",
+            )
             return None
+
+        losers = [
+            row
+            for row in scores
+            if row.strategy != best.strategy and row.score > 0
+        ]
+        if losers:
+            log_execution_rejected(
+                symbol,
+                (
+                    f"Lower score than winner {best.strategy} {best.action} "
+                    f"raw={best.score:.1f} final={best.final_score:.1f} rejected="
+                    + ",".join(
+                        f"{row.strategy}:{row.action}:{row.score:.0f}"
+                        for row in losers[:6]
+                    )
+                ),
+                strategy=best.strategy,
+            )
 
         if best.score < best.min_score:
             log_execution_rejected(
@@ -473,7 +497,11 @@ class EventScanOrchestrator:
             )
             return None
 
-        signal = self.scoring_engine.signal_for_assignment(snapshot, best)
+        signal = self.scoring_engine.signal_from_first_pass(
+            snapshot, best, first_pass
+        )
+        if signal is None:
+            signal = self.scoring_engine.signal_for_assignment(snapshot, best)
         if signal is None:
             log_execution_rejected(
                 symbol,
@@ -520,6 +548,13 @@ class EventScanOrchestrator:
                 "structure_metadata": signal.structure_metadata,
             }
         )
+        log_trade_approved(
+            signal.symbol,
+            signal.action,
+            signal.strategy,
+            signal.score,
+            extra=f"regime={signal.regime} fit={signal.regime_fit:.2f}",
+        )
         return signal
 
     def _apply_portfolio_allocator(
@@ -557,6 +592,14 @@ class EventScanOrchestrator:
                 order.append(key)
                 continue
             if candidate.adjusted_score > existing.adjusted_score:
+                log_execution_rejected(
+                    existing.symbol,
+                    (
+                        f"Lower score than winner {candidate.strategy} "
+                        f"{candidate.action} adj={candidate.adjusted_score:.1f}"
+                    ),
+                    strategy=existing.strategy,
+                )
                 best[key] = candidate
         if len(best) == len(candidates):
             return candidates

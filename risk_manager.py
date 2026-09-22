@@ -198,7 +198,7 @@ class RiskManager:
         """
         snapshot = self.get_risk_snapshot()
         if not snapshot.entries_allowed:
-            return False, snapshot.block_reason
+            return False, snapshot.block_reason or "entries not allowed"
 
         if symbol and entry_price and entry_price > 0:
             floor_ok, floor_reason = self.validate_minimum_order_floor(

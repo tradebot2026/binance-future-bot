@@ -18,7 +18,7 @@ from core.symbol_conflict_guard import SymbolConflictGuard
 from core.types import SignalCandidate
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
-from logger import error_logger, scanner_logger, signal_logger
+from logger import error_logger, log_trade_approved, scanner_logger, signal_logger
 from pipeline.snapshot_factory import SnapshotFactory
 from pipeline.universe_builder import UniverseBuilder
 from strategies import build_strategy_registry
@@ -161,7 +161,14 @@ class StrategyScannerPipeline:
                 )
                 for loser in losers:
                     self.conflict_guard.reject_with_log(
-                        loser, "Lost symbol arbitration", context="arbitrator"
+                        loser,
+                        (
+                            f"Lower score than winner {winner.strategy} "
+                            f"{winner.action} raw={winner.score:.1f}"
+                            if winner is not None
+                            else "Lost symbol arbitration"
+                        ),
+                        context="arbitrator",
                     )
 
                 scanned += 1
@@ -368,6 +375,13 @@ class StrategyScannerPipeline:
                 "accepted": True,
                 "structure_metadata": signal.structure_metadata,
             }
+        )
+        log_trade_approved(
+            signal.symbol,
+            signal.action,
+            signal.strategy,
+            signal.score,
+            extra=f"regime={signal.regime}",
         )
         if Config.NEAR_MISS_SCORE_MIN <= signal.score <= Config.NEAR_MISS_SCORE_MAX:
             prev = self._near_miss_scores.get(signal.symbol, 0.0)

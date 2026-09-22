@@ -120,7 +120,13 @@ class MarketScanner:
         """Tiered hot/background/event scan cycle (WS-only evaluation)."""
         if self.orchestrator is None:
             return []
-        return self.orchestrator.process_priority_scan_cycle()
+        candidates = self.orchestrator.process_priority_scan_cycle()
+        if candidates:
+            scanner_logger.info(
+                "Scanner forwarding %s pick_best winner(s) to execute_trade().",
+                len(candidates),
+            )
+        return candidates
 
     def bootstrap_hot_symbols_at_startup(self) -> int:
         """Paced REST bootstrap for Tier-1 hot watchlist only."""

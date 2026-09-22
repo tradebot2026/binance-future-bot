@@ -66,11 +66,30 @@ def log_strategy_approved(
     score: float,
     extra: str = "",
 ) -> None:
-    """Strategy/risk gate only — does not mean a Binance order was sent."""
+    """First-pass strategy setup only — not a winner and not an order."""
+    tail = f" | {extra}" if extra else ""
+    signal_logger.debug(
+        "[STRATEGY_SETUP] %s %s | strategy=%s | score=%.1f%s",
+        symbol,
+        action,
+        strategy,
+        score,
+        tail,
+    )
+
+
+def log_trade_approved(
+    symbol: str,
+    action: str,
+    strategy: str,
+    score: float,
+    extra: str = "",
+) -> None:
+    """Winner passed CorrelationGuard + pick_best — ready for order submission."""
     tail = f" | {extra}" if extra else ""
     signal_logger.info(
         "[TRADE_APPROVED] %s %s | strategy=%s | score=%.1f | "
-        "(strategy gate only — no Binance order yet)%s",
+        "(ready for order submission)%s",
         symbol,
         action,
         strategy,

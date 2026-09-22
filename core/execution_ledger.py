@@ -1,6 +1,7 @@
 """Traceable trade-execution state machine.
 
-TRADE_APPROVED is a strategy/risk gate only. It is never a Binance fill.
+TRADE_APPROVED means a pick_best winner is ready for order submission.
+It is never a Binance fill.
 """
 
 from __future__ import annotations

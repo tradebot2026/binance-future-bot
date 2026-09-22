@@ -626,6 +626,11 @@ class TradeExecutor:
         record.atr = atr
         ledger.transition(
             record,
+            ExecutionPhase.TRADE_APPROVED,
+            extra="dispatched winner ready for order submission",
+        )
+        ledger.transition(
+            record,
             ExecutionPhase.EXECUTION_QUEUED,
             extra=f"price={current_price:.6f}",
         )

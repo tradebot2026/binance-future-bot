@@ -7,6 +7,7 @@ from typing import Iterable
 
 from config import Config
 from core.types import StrategyResult
+from executor import log_execution_rejected
 from utils import safe_float
 
 # Tag groups that describe the same structural zone — only highest score counts.
@@ -71,6 +72,16 @@ class CorrelationGuard:
                     },
                 )
                 kept.append(merged)
+                for dropped in cluster[1:]:
+                    log_execution_rejected(
+                        dropped.symbol,
+                        (
+                            f"Dropped by CorrelationGuard — overlapped "
+                            f"{candidate.strategy} {candidate.direction} "
+                            f"score={candidate.score:.1f}"
+                        ),
+                        strategy=dropped.strategy,
+                    )
             else:
                 kept.append(candidate)
 

@@ -433,6 +433,52 @@ class TestStrategiesAndArbitration(unittest.TestCase):
         self.assertFalse(ok2)
         self.assertIn("Scale-in disabled", reason)
 
+    def test_correlation_drop_is_logged(self) -> None:
+        from core.correlation_guard import CorrelationGuard
+        from core.types import StrategyResult
+
+        guard = CorrelationGuard(level_tolerance_atr=0.5)
+        strong = StrategyResult(
+            symbol="ONGUSDT",
+            strategy="TREND_MOMENTUM",
+            direction="LONG",
+            score=94.0,
+            atr=1.0,
+            key_levels=[100.0],
+            level_tags=["breakout"],
+        )
+        weak = StrategyResult(
+            symbol="ONGUSDT",
+            strategy="BREAKOUT_RETEST",
+            direction="LONG",
+            score=72.0,
+            atr=1.0,
+            key_levels=[100.1],
+            level_tags=["breakout"],
+        )
+        with patch("core.correlation_guard.log_execution_rejected") as rejected:
+            kept = guard.deduplicate([strong, weak])
+        self.assertEqual(
+            [row.strategy for row in kept if row.is_actionable], ["TREND_MOMENTUM"]
+        )
+        rejected.assert_called()
+        args = rejected.call_args.args
+        self.assertEqual(args[0], "ONGUSDT")
+        self.assertIn("Dropped by CorrelationGuard", args[1])
+
+    def test_strategy_setup_is_not_trade_approved(self) -> None:
+        from logger import log_strategy_approved, log_trade_approved
+
+        with patch("logger.signal_logger") as slog:
+            log_strategy_approved("ONGUSDT", "LONG", "TREND_MOMENTUM", 94.0)
+            slog.debug.assert_called()
+            self.assertIn("[STRATEGY_SETUP]", slog.debug.call_args.args[0])
+            slog.info.assert_not_called()
+            log_trade_approved("ONGUSDT", "LONG", "TREND_MOMENTUM", 94.0)
+            slog.info.assert_called()
+            self.assertIn("[TRADE_APPROVED]", slog.info.call_args.args[0])
+            self.assertIn("ready for order submission", slog.info.call_args.args[0])
+
 
 class TestTestnetFailClosed(unittest.TestCase):
     def test_current_config_is_testnet(self) -> None:

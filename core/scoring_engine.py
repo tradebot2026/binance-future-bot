@@ -23,7 +23,7 @@ from core.confluence_scorer import ConfluenceScorer
 from core.context.institutional_context import InstitutionalContextEvaluator
 from core.strategy_evaluator import StrategyEvaluator
 from core.strategy_registry import StrategyRegistry
-from core.types import MarketSnapshot, SignalCandidate, StrategyScore
+from core.types import MarketSnapshot, SignalCandidate, StrategyResult, StrategyScore
 from logger import error_logger
 from engines.smc_engine import effective_smc_min_score
 
@@ -131,7 +131,21 @@ class ScoringEngine:
         bar_open_ms: int = 0,
         timeframe: str = "",
     ) -> list[StrategyScore]:
-        return self.evaluator.evaluate(
+        scores, _deduped = self.evaluate_symbol_detailed(
+            snapshot,
+            bar_open_ms=bar_open_ms,
+            timeframe=timeframe,
+        )
+        return scores
+
+    def evaluate_symbol_detailed(
+        self,
+        snapshot: MarketSnapshot,
+        *,
+        bar_open_ms: int = 0,
+        timeframe: str = "",
+    ) -> tuple[list[StrategyScore], list[StrategyResult]]:
+        return self.evaluator.evaluate_detailed(
             snapshot,
             bar_open_ms=bar_open_ms,
             timeframe=timeframe,
@@ -188,6 +202,33 @@ class ScoringEngine:
             best.priority_weight,
         )
         return best.adjusted_score >= required_adjusted
+
+    def signal_from_first_pass(
+        self,
+        snapshot: MarketSnapshot,
+        assignment: StrategyScore,
+        results: list[StrategyResult],
+    ) -> Optional[SignalCandidate]:
+        """Build the execution signal from the scan that already won pick_best."""
+        from core.strategy_base import BaseStrategy
+
+        strategy = self.registry.get(assignment.strategy)
+        if strategy is None or not strategy.is_enabled():
+            return None
+        fit = strategy.regime_fit(snapshot)
+        if fit <= 0:
+            return None
+        for result in results:
+            if result.strategy != assignment.strategy or not result.is_actionable:
+                continue
+            signal = BaseStrategy.result_to_signal(result, snapshot)
+            if signal is None:
+                continue
+            signal = CandidateArbitrator.apply_regime_fit(signal, fit)
+            if not self._passes_min_score(signal):
+                return None
+            return signal
+        return None
 
     def signal_for_assignment(
         self,
