@@ -68,16 +68,38 @@ class ApiHealthState(str, enum.Enum):
     IP_BANNED = "IP_BANNED"
 
 
+def _weight_thresholds() -> tuple[int, int, int]:
+    """Return (throttle_at, hard_at, limit) for X-MBX-USED-WEIGHT-1M."""
+    limit = Config.rest_used_weight_limit()
+    throttle = Config.rest_weight_throttle_threshold()
+    hard = Config.rest_weight_hard_threshold()
+    return throttle, hard, limit
+
+
+def _weight_pause_seconds(used_weight: int) -> float:
+    """How long to pause background REST after a used-weight header."""
+    throttle, hard, limit = _weight_thresholds()
+    if used_weight >= limit:
+        return max(float(Config.REST_WEIGHT_OVER_LIMIT_PAUSE_SECONDS), 45.0)
+    if used_weight >= hard:
+        return max(float(Config.REST_WEIGHT_HARD_THROTTLE_SECONDS), 8.0)
+    if used_weight >= throttle:
+        return max(float(Config.REST_WEIGHT_THROTTLE_SECONDS), 5.0)
+    return 0.0
+
+
 class RestUsageTracker:
     """
     Sliding 60s HTTP request counter + last used-weight header.
-    Drives API SAFETY MODE so callers stop hammering Binance.
+    Drives API SAFETY MODE and the used-weight REST governor.
     """
 
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self._window: deque[float] = deque()
         self._used_weight_1m: int = 0
+        self._used_weight_updated_at: float = 0.0
+        self._weight_throttle_until: float = 0.0
         self._last_http_status: int = 0
         self._last_error_code: int = 0
         self._safety_until: float = 0.0
@@ -96,12 +118,15 @@ class RestUsageTracker:
         with self._lock:
             remaining = max(self._safety_until - time.monotonic(), 0.0)
             state = self._effective_state_locked(remaining)
+            throttle_remaining = max(self._weight_throttle_until - time.monotonic(), 0.0)
             return {
                 "state": state.value,
                 "reason": self._reason,
                 "requests_1m": len(self._window),
                 "used_weight_1m": self._used_weight_1m,
                 "ip_limit": Config.rest_ip_request_limit(),
+                "weight_limit": Config.rest_used_weight_limit(),
+                "weight_throttle_remaining_seconds": throttle_remaining,
                 "safety_remaining_seconds": remaining,
                 "last_http_status": self._last_http_status,
                 "last_error_code": self._last_error_code,
@@ -133,6 +158,16 @@ class RestUsageTracker:
         with self._lock:
             return max(self._safety_until - time.monotonic(), 0.0)
 
+    def weight_throttle_remaining(self) -> float:
+        with self._lock:
+            return max(self._weight_throttle_until - time.monotonic(), 0.0)
+
+    def used_weight_1m(self) -> int:
+        self._purge()
+        with self._lock:
+            self._decay_used_weight_locked()
+            return int(self._used_weight_1m)
+
     def note_http_response(self, response: Any) -> None:
         """Record one HTTP round-trip (python-binance session response)."""
         now = time.monotonic()
@@ -155,6 +190,28 @@ class RestUsageTracker:
             self._last_http_status = status
             if used_weight > 0:
                 self._used_weight_1m = used_weight
+                self._used_weight_updated_at = now
+                pause = _weight_pause_seconds(used_weight)
+                if pause > 0:
+                    self._weight_throttle_until = max(
+                        self._weight_throttle_until, now + pause
+                    )
+                    throttle, hard, limit = _weight_thresholds()
+                    if used_weight >= limit:
+                        self._reason = (
+                            f"used_weight_1m={used_weight} at/over limit {limit} "
+                            f"— REST paused {int(pause)}s"
+                        )
+                    elif used_weight >= hard:
+                        self._reason = (
+                            f"used_weight_1m={used_weight} near weight cap "
+                            f"(hard {hard}) — REST paused {int(pause)}s"
+                        )
+                    else:
+                        self._reason = (
+                            f"used_weight_1m={used_weight} over throttle "
+                            f"{throttle} — REST paused {int(pause)}s"
+                        )
             if retry_after > 0:
                 self._retry_after_seconds = retry_after
             if status in (418, 429):
@@ -198,8 +255,18 @@ class RestUsageTracker:
         with self._lock:
             while self._window and self._window[0] < cutoff:
                 self._window.popleft()
+            self._decay_used_weight_locked()
+
+    def _decay_used_weight_locked(self) -> None:
+        """Drop stale used-weight headers after Binance's rolling 60s window."""
+        if self._used_weight_updated_at <= 0:
+            return
+        if time.monotonic() - self._used_weight_updated_at >= 60.0:
+            self._used_weight_1m = 0
+            self._used_weight_updated_at = 0.0
 
     def _effective_state_locked(self, remaining: float) -> ApiHealthState:
+        self._decay_used_weight_locked()
         if remaining > 0 and self._state in {
             ApiHealthState.API_RATE_LIMITED,
             ApiHealthState.IP_BANNED,
@@ -208,9 +275,44 @@ class RestUsageTracker:
             return self._state
         ip_limit = max(Config.rest_ip_request_limit(), 1)
         count = len(self._window)
+        throttle_at, hard_at, weight_limit = _weight_thresholds()
+        used_weight = int(self._used_weight_1m)
+        throttle_remaining = max(self._weight_throttle_until - time.monotonic(), 0.0)
+
+        if used_weight >= weight_limit and throttle_remaining > 0:
+            self._state = ApiHealthState.RATE_LIMIT_WARNING
+            self._reason = (
+                f"used_weight_1m={used_weight} at/over limit {weight_limit} "
+                f"(pause {int(throttle_remaining)}s)"
+            )
+            self._log_state_locked(count, ip_limit)
+            return self._state
+        if used_weight >= throttle_at and throttle_remaining > 0:
+            self._state = ApiHealthState.RATE_LIMIT_WARNING
+            if not self._reason.startswith("used_weight_1m="):
+                self._reason = (
+                    f"used_weight_1m={used_weight} over throttle {throttle_at} "
+                    f"(pause {int(throttle_remaining)}s)"
+                )
+            self._log_state_locked(count, ip_limit)
+            return self._state
         if count >= int(ip_limit * 0.85):
             self._state = ApiHealthState.RATE_LIMIT_WARNING
             self._reason = f"{count} HTTP requests in 60s (limit {ip_limit})"
+            self._log_state_locked(count, ip_limit)
+            return self._state
+        if used_weight >= hard_at:
+            self._state = ApiHealthState.HIGH_USAGE
+            self._reason = (
+                f"used_weight_1m={used_weight} near weight cap {weight_limit}"
+            )
+            self._log_state_locked(count, ip_limit)
+            return self._state
+        if used_weight >= throttle_at:
+            self._state = ApiHealthState.HIGH_USAGE
+            self._reason = (
+                f"used_weight_1m={used_weight} (throttle {throttle_at}, probe allowed)"
+            )
             self._log_state_locked(count, ip_limit)
             return self._state
         if count >= int(ip_limit * 0.55):
@@ -219,7 +321,7 @@ class RestUsageTracker:
             self._log_state_locked(count, ip_limit)
             return self._state
         self._state = ApiHealthState.HEALTHY
-        if remaining <= 0:
+        if remaining <= 0 and throttle_remaining <= 0:
             self._reason = ""
         self._log_state_locked(count, ip_limit)
         return self._state

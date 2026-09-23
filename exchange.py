@@ -88,9 +88,14 @@ class BalanceCache:
     def is_valid(self) -> bool:
         return self.updated_at > 0 and (time.monotonic() - self.updated_at) < self.ttl_seconds
 
+    def last_known(self) -> float:
+        """Last non-zero wallet even if the TTL has expired (rate-limit fallback)."""
+        return self.value if self.value > 0 else 0.0
+
     def set(self, balance: float) -> None:
-        self.value = balance
-        self.updated_at = time.monotonic()
+        if balance > 0:
+            self.value = balance
+            self.updated_at = time.monotonic()
 
     def invalidate(self) -> None:
         self.updated_at = 0.0
@@ -221,6 +226,7 @@ class BinanceExchangeManager:
         )
         self._balance_cache = BalanceCache()
         self._balance_rest_backoff_until: float = 0.0
+        self._cold_start_balance_rest_done: bool = False
         self._last_balance_rest_at: float = 0.0
         self._last_account_rest_at: float = 0.0
         self._account_rest_cache = AccountRestCache()
@@ -314,6 +320,13 @@ class BinanceExchangeManager:
             return False, (
                 f"API SAFETY MODE — REST halted "
                 f"({remaining}s remaining, {self._rest_usage.snapshot().get('state')})"
+            )
+        if not execution_priority and not self._rest_usage.allows_background_rest():
+            snap = self._rest_usage.snapshot()
+            remaining = int(snap.get("weight_throttle_remaining_seconds") or 0)
+            return False, (
+                f"REST weight governor — {snap.get('state')} "
+                f"(used_weight_1m={snap.get('used_weight_1m')}, pause {remaining}s)"
             )
         return True, ""
 
@@ -592,6 +605,21 @@ class BinanceExchangeManager:
         message = str(exc.message).lower()
         return "429" in message or "418" in message or "rate limit" in message
 
+    @staticmethod
+    def _is_rate_limit_error_text(exc: BaseException) -> bool:
+        if isinstance(exc, ExchangeRateLimitError):
+            return True
+        if isinstance(exc, BinanceAPIException) and exc.code in (-1003, -1015, 429, 418):
+            return True
+        message = str(exc).lower()
+        return (
+            "-1003" in message
+            or "too many requests" in message
+            or "rate limit" in message
+            or "used weight" in message
+            or "banned until" in message
+        )
+
     def _resolve_rest_lane(
         self, *, execution_priority: bool
     ) -> RestLane:
@@ -600,6 +628,21 @@ class BinanceExchangeManager:
         if self._is_bootstrap_priority():
             return RestLane.BOOTSTRAP
         return RestLane.BACKGROUND
+
+    def background_account_rest_allowed(self) -> bool:
+        """True when a non-execution account/status REST read may proceed."""
+        if self.is_rest_blocked()[0]:
+            return False
+        if not self._rest_usage.allows_background_rest():
+            return False
+        return True
+
+    def wallet_is_hydrated(self) -> bool:
+        """True when WS or last-known cache already has a usable wallet."""
+        ws_balance = self._hydrate_balance_from_ws()
+        if ws_balance is not None and ws_balance > 0:
+            return True
+        return self._balance_cache.last_known() > 0
 
     def can_make_background_rest_call(self, weight: int = 1) -> bool:
         """True when a non-execution REST call is allowed (ban, hard-stop, budget)."""
@@ -633,6 +676,16 @@ class BinanceExchangeManager:
                 return True, (
                     f"API SAFETY MODE — REST halted "
                     f"({remaining}s remaining, {state})"
+                )
+            if not bool(getattr(usage, "allows_background_rest", lambda: True)()):
+                snap = usage.snapshot() if callable(getattr(usage, "snapshot", None)) else {}
+                if not isinstance(snap, dict):
+                    snap = {}
+                remaining = int(snap.get("weight_throttle_remaining_seconds") or 0)
+                state = str(snap.get("state") or "RATE_LIMIT_WARNING")
+                return True, (
+                    f"REST weight governor — {state} "
+                    f"(used_weight_1m={snap.get('used_weight_1m', 0)}, pause {remaining}s)"
                 )
             if self._market_data:
                 blocked, reason = self._market_data.is_rest_blocked()
@@ -674,6 +727,21 @@ class BinanceExchangeManager:
             return None
         self._balance_cache.set(ws_balance)
         return ws_balance
+
+    def _fallback_quote_balance(self) -> float:
+        """Last-known USDT wallet: WS estimate, then cache (including expired TTL)."""
+        margin_est = self._ws_margin_balance_estimate()
+        if margin_est is not None and margin_est > 0:
+            return margin_est
+        last_known = self._balance_cache.last_known()
+        if last_known > 0:
+            return last_known
+        cached = self._account_rest_cache.account_info
+        if cached:
+            balance = self._extract_quote_balance(cached, Config.QUOTE_ASSET)
+            if balance > 0:
+                return balance
+        return 0.0
 
     @staticmethod
     def _coerce_api_payload(data: Any) -> Any:
@@ -822,15 +890,15 @@ class BinanceExchangeManager:
         self._sync_account_cache_from_ws()
         if self._account_rest_cache.account_info:
             return dict(self._account_rest_cache.account_info)
-        if self._balance_cache.is_valid():
+        last_known = self._balance_cache.last_known()
+        if last_known > 0:
             quote = Config.QUOTE_ASSET
-            balance = self._balance_cache.value
             return {
                 "assets": [
                     {
                         "asset": quote,
-                        "availableBalance": str(balance),
-                        "crossWalletBalance": str(balance),
+                        "availableBalance": str(last_known),
+                        "crossWalletBalance": str(last_known),
                     }
                 ]
             }
@@ -1266,13 +1334,17 @@ class BinanceExchangeManager:
         self._balance_cache.invalidate()
 
     def refresh_wallet_after_trade(self) -> float:
-        """Force REST wallet refresh after a fill/close — updates balance + account cache."""
-        self.invalidate_balance_cache()
+        """Refresh wallet after a fill/close — WS first, then background REST only."""
+        ws_balance = self._hydrate_balance_from_ws()
+        if ws_balance is not None and ws_balance > 0:
+            return ws_balance
+        if not self.background_account_rest_allowed():
+            return self._fallback_quote_balance()
         self._account_rest_cache.updated_at = 0.0
         self._last_account_rest_at = 0.0
         account_info, _ = self._fetch_futures_account_rest(
-            force_live=True,
-            max_attempts=max(Config.STARTUP_BALANCE_MAX_ATTEMPTS, 3),
+            force_live=False,
+            max_attempts=1,
         )
         if account_info:
             wallet = self._extract_quote_balance(account_info, Config.QUOTE_ASSET)
@@ -1281,7 +1353,7 @@ class BinanceExchangeManager:
             if wallet > 0:
                 self._balance_cache.set(wallet)
                 return wallet
-        return self.get_futures_balance(force_refresh=True)
+        return self.get_futures_balance(force_refresh=False)
 
     def invalidate_position_cache(self) -> None:
         self._position_cache.updated_at = 0.0
@@ -1493,8 +1565,8 @@ class BinanceExchangeManager:
 
     def fetch_futures_ticker_map_rest(self) -> dict[str, dict[str, Any]]:
         """
-        Single futures_ticker() REST call to warm the cache (weight=1, batched).
-        Skipped entirely during IP ban, hard-stop, or low REST budget reserve.
+        Single futures_ticker() REST call to warm the cache (weight=40 all-symbols).
+        Skipped entirely during IP ban, hard-stop, weight governor, or low reserve.
         """
         if self._market_data and self._market_data.is_rest_blocked()[0]:
             return {}
@@ -1563,11 +1635,11 @@ class BinanceExchangeManager:
                     self._balance_cache.set(balance)
                     return balance
         except ExchangeRateLimitError:
-            pass
+            return self._fallback_quote_balance()
         except Exception as exc:
             error_logger.warning("Startup balance fetch failed: %s", exc)
 
-        return self._balance_cache.value
+        return self._fallback_quote_balance()
 
     def fetch_account_balance(self, force_refresh: bool = False) -> float:
         """
@@ -1595,10 +1667,15 @@ class BinanceExchangeManager:
                 if wallet > 0:
                     self._balance_cache.set(wallet)
                     return wallet
+        except ExchangeRateLimitError:
+            return self._fallback_quote_balance()
         except Exception as exc:
             if self._rest_block_log.should_log("fetch_account_balance"):
                 error_logger.warning("fetch_account_balance failed: %s", exc)
 
+        fallback = self._fallback_quote_balance()
+        if fallback > 0:
+            return fallback
         return self.get_futures_balance(force_refresh=force_refresh)
 
     def get_futures_balance(self, force_refresh: bool = False) -> float:
@@ -1621,40 +1698,41 @@ class BinanceExchangeManager:
             if cached > 0:
                 return cached
 
-        now = time.monotonic()
-        poll_interval = max(float(Config.ACCOUNT_REST_MIN_INTERVAL_SECONDS), 60.0)
+        if self.is_rest_blocked()[0] and not self._is_execution_priority():
+            return self._fallback_quote_balance()
 
-        needs_rest = force_refresh or self._balance_cache.value <= 0
+        now = time.monotonic()
+        poll_interval = max(float(Config.ACCOUNT_REST_MIN_INTERVAL_SECONDS), 180.0)
+        last_known = self._balance_cache.last_known()
+        needs_rest = force_refresh or last_known <= 0
+
+        if last_known <= 0:
+            if now < self._balance_rest_backoff_until:
+                return 0.0
+            if self._cold_start_balance_rest_done or not self.background_account_rest_allowed():
+                self._balance_rest_backoff_until = max(
+                    self._balance_rest_backoff_until, now + min(poll_interval, 60.0)
+                )
+                return 0.0
 
         if (
             not needs_rest
             and self._last_account_rest_at > 0
             and (now - self._last_account_rest_at) < poll_interval
         ):
-            cached = self._balance_cache.value
-            if cached > 0:
-                return cached
-            margin_est = self._ws_margin_balance_estimate()
-            return margin_est if margin_est is not None else cached
+            return self._fallback_quote_balance()
 
         if now < self._balance_rest_backoff_until and not needs_rest:
-            cached = self._balance_cache.value
-            if cached > 0:
-                return cached
-            margin_est = self._ws_margin_balance_estimate()
-            return margin_est if margin_est is not None else cached
+            return self._fallback_quote_balance()
 
         if not Config.ENABLE_REST_BALANCE_POLL and not needs_rest:
-            margin_est = self._ws_margin_balance_estimate()
-            if margin_est is not None and margin_est > 0:
-                return margin_est
-            return self._balance_cache.value
+            return self._fallback_quote_balance()
 
         if not self._rest_reads_allowed() and not self._is_execution_priority():
-            margin_est = self._ws_margin_balance_estimate()
-            if margin_est is not None and margin_est > 0:
-                return margin_est
-            return self._balance_cache.value
+            if last_known <= 0:
+                self._cold_start_balance_rest_done = True
+                self._balance_rest_backoff_until = now + min(poll_interval, 60.0)
+            return self._fallback_quote_balance()
 
         if self.rest_account_reads_blocked() and not self._is_execution_priority():
             cached = self._cached_futures_account_response()
@@ -1663,15 +1741,14 @@ class BinanceExchangeManager:
                 if balance > 0:
                     self._balance_cache.set(balance)
                     return balance
-            margin_est = self._ws_margin_balance_estimate()
-            if margin_est is not None and margin_est > 0:
-                return margin_est
-            return self._balance_cache.value
+            return self._fallback_quote_balance()
 
         try:
+            if last_known <= 0:
+                self._cold_start_balance_rest_done = True
             account_info, _ = self._fetch_futures_account_rest(
-                force_live=force_refresh,
-                max_attempts=max(Config.REST_NETWORK_MAX_RETRIES, 2),
+                force_live=False,
+                max_attempts=1,
             )
             if account_info:
                 balance = self._extract_quote_balance(account_info, quote)
@@ -1679,29 +1756,33 @@ class BinanceExchangeManager:
                     balance = safe_float(account_info.get("totalWalletBalance"))
                 if balance > 0:
                     return balance
-            margin_est = self._ws_margin_balance_estimate()
-            if margin_est is not None and margin_est > 0:
-                return margin_est
-            return self._balance_cache.value
+            if last_known <= 0:
+                self._balance_rest_backoff_until = now + min(poll_interval, 60.0)
+            return self._fallback_quote_balance()
         except ExchangeRateLimitError:
             self._balance_rest_backoff_until = now + poll_interval
+            if self._rest_block_log.should_log("balance_rate_limited"):
+                error_logger.warning(
+                    "Balance REST skipped after rate limit — using last-known wallet."
+                )
             cached = self._cached_futures_account_response()
             if cached:
                 balance = self._extract_quote_balance(cached, quote)
                 if balance > 0:
                     return balance
-            margin_est = self._ws_margin_balance_estimate()
-            if margin_est is not None and margin_est > 0:
-                return margin_est
-            return self._balance_cache.value
+            return self._fallback_quote_balance()
         except Exception as exc:
             self._balance_rest_backoff_until = now + min(poll_interval, 120.0)
+            if self._is_rate_limit_error_text(exc):
+                if self._rest_block_log.should_log("balance_rate_limited"):
+                    error_logger.warning(
+                        "Balance REST hit -1003/rate limit — using last-known wallet: %s",
+                        exc,
+                    )
+                return self._fallback_quote_balance()
             if self._rest_block_log.should_log("balance_fetch_failed"):
                 error_logger.warning("Balance REST fetch failed (cached fallback): %s", exc)
-            margin_est = self._ws_margin_balance_estimate()
-            if margin_est is not None and margin_est > 0:
-                return margin_est
-            return self._balance_cache.value
+            return self._fallback_quote_balance()
 
     @staticmethod
     def _normalize_balance_rows(data: Any) -> list[dict[str, Any]]:
@@ -1798,13 +1879,13 @@ class BinanceExchangeManager:
         last_exc: Optional[Exception] = None
 
         for attempt in range(1, attempts + 1):
-            if self.is_rest_blocked()[0] and not force_live:
+            if not self.background_account_rest_allowed():
                 break
             try:
                 raw = self._throttled_call(
                     self.client.futures_account,
-                    execution_priority=force_live,
-                    bypass_account_cache=force_live,
+                    execution_priority=False,
+                    bypass_account_cache=False,
                     **self.recv_window_param,
                 )
                 account_info = self._parse_futures_account_payload(raw, quote)
@@ -1822,10 +1903,11 @@ class BinanceExchangeManager:
                     )
             except ExchangeRateLimitError as exc:
                 last_exc = exc
-                if not force_live:
-                    break
+                break
             except Exception as exc:
                 last_exc = exc
+                if self._is_rate_limit_error_text(exc):
+                    break
                 if self._rest_block_log.should_log("account_fetch_retry"):
                     error_logger.warning(
                         "futures_account fetch attempt %s/%s failed: %s",
@@ -1836,12 +1918,15 @@ class BinanceExchangeManager:
             if attempt < attempts:
                 time.sleep(delay * attempt)
 
-        if not self.is_rest_blocked()[0] or force_live:
+        rate_limited = isinstance(last_exc, ExchangeRateLimitError) or (
+            last_exc is not None and self._is_rate_limit_error_text(last_exc)
+        )
+        if not rate_limited and self.background_account_rest_allowed():
             try:
                 raw = self._throttled_call(
                     self.client.futures_account_balance,
-                    execution_priority=force_live,
-                    bypass_account_cache=force_live,
+                    execution_priority=False,
+                    bypass_account_cache=False,
                     **self.recv_window_param,
                 )
                 account_info = self._parse_futures_account_payload(raw, quote)
@@ -1872,20 +1957,33 @@ class BinanceExchangeManager:
         self,
         *,
         include_today_income: bool = True,
-        force_refresh: bool = True,
+        force_refresh: bool = False,
     ) -> LiveAccountSnapshot:
         """
-        Live wallet/margin/unrealized from Binance fapi/v2/account (futures_account).
-        Used by Telegram /status and /active — prefers a fresh REST read with retries.
+        Wallet/margin/unrealized for Telegram /status and daily PnL.
+        Uses WS/cache first. REST is a background read and never uses
+        execution_priority, so the used-weight governor still applies.
         """
         snapshot = LiveAccountSnapshot()
-        account_info, source = self._fetch_futures_account_rest(
-            force_live=force_refresh,
-        )
+        source = "unavailable"
 
-        if account_info:
-            self._apply_account_info_to_snapshot(snapshot, account_info)
-        else:
+        cached = self._cached_futures_account_response()
+        if cached:
+            self._apply_account_info_to_snapshot(snapshot, cached)
+            source = "WS/cache"
+
+        allow_rest = self.background_account_rest_allowed()
+        if snapshot.wallet_balance <= 0 or (force_refresh and allow_rest):
+            if allow_rest:
+                account_info, rest_source = self._fetch_futures_account_rest(
+                    force_live=False,
+                    max_attempts=1,
+                )
+                if account_info:
+                    self._apply_account_info_to_snapshot(snapshot, account_info)
+                    source = rest_source
+
+        if snapshot.wallet_balance <= 0:
             ws_wallet = self._hydrate_balance_from_ws()
             if ws_wallet is not None and ws_wallet > 0:
                 snapshot.wallet_balance = ws_wallet
@@ -1900,8 +1998,19 @@ class BinanceExchangeManager:
                         self._market_data.get_ws_unrealized_pnl_total()
                     )
                 source = "WS user stream"
+            else:
+                fallback = self._fallback_quote_balance()
+                if fallback > 0:
+                    snapshot.wallet_balance = fallback
+                    if snapshot.margin_balance <= 0:
+                        snapshot.margin_balance = fallback
+                    source = "last-known cache"
 
-        if include_today_income and not self.is_rest_blocked()[0]:
+        if (
+            include_today_income
+            and allow_rest
+            and self.can_make_background_rest_call(30)
+        ):
             snapshot.today_realized_pnl = self._fetch_today_realized_income_rest()
 
         snapshot.source = source

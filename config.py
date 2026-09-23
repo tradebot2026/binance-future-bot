@@ -104,10 +104,10 @@ class Config:
     WS_WARMUP_SECONDS: int = _env_int("WS_WARMUP_SECONDS", 120)
     WS_STARTUP_WAIT_SECONDS: int = _env_int("WS_STARTUP_WAIT_SECONDS", 45)
     TICKER_REST_FALLBACK_AFTER_SECONDS: float = _env_float(
-        "TICKER_REST_FALLBACK_AFTER_SECONDS", 60.0
+        "TICKER_REST_FALLBACK_AFTER_SECONDS", 180.0
     )
     TICKER_REST_MIN_INTERVAL_SECONDS: float = _env_float(
-        "TICKER_REST_MIN_INTERVAL_SECONDS", 60.0
+        "TICKER_REST_MIN_INTERVAL_SECONDS", 120.0
     )
     WS_RECONNECT_JOIN_TIMEOUT_SECONDS: float = _env_float(
         "WS_RECONNECT_JOIN_TIMEOUT_SECONDS", 2.0
@@ -148,6 +148,22 @@ class Config:
     RATE_LIMIT_SOFT_HALT_SECONDS: int = _env_int("RATE_LIMIT_SOFT_HALT_SECONDS", 180)
     REST_IP_REQUEST_LIMIT_MAINNET: int = _env_int("REST_IP_REQUEST_LIMIT_MAINNET", 2400)
     REST_IP_REQUEST_LIMIT_TESTNET: int = _env_int("REST_IP_REQUEST_LIMIT_TESTNET", 6000)
+    REST_USED_WEIGHT_LIMIT: int = _env_int("REST_USED_WEIGHT_LIMIT", 6000)
+    REST_USED_WEIGHT_THROTTLE_THRESHOLD: int = _env_int(
+        "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 4500
+    )
+    REST_USED_WEIGHT_HARD_THRESHOLD: int = _env_int(
+        "REST_USED_WEIGHT_HARD_THRESHOLD", 5400
+    )
+    REST_WEIGHT_THROTTLE_SECONDS: float = _env_float(
+        "REST_WEIGHT_THROTTLE_SECONDS", 12.0
+    )
+    REST_WEIGHT_HARD_THROTTLE_SECONDS: float = _env_float(
+        "REST_WEIGHT_HARD_THROTTLE_SECONDS", 30.0
+    )
+    REST_WEIGHT_OVER_LIMIT_PAUSE_SECONDS: float = _env_float(
+        "REST_WEIGHT_OVER_LIMIT_PAUSE_SECONDS", 60.0
+    )
     ENABLE_STRICT_RATE_LIMIT: bool = _env_bool("ENABLE_STRICT_RATE_LIMIT", True)
     API_BACKOFF_MAX_SECONDS: int = _env_int("API_BACKOFF_MAX_SECONDS", 60)
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
@@ -176,7 +192,7 @@ class Config:
     POSITION_RECONCILE_MISS_THRESHOLD: int = _env_int(
         "POSITION_RECONCILE_MISS_THRESHOLD", 3
     )
-    MONITOR_INTERVAL_SECONDS: int = _env_int("MONITOR_INTERVAL_SECONDS", 7)
+    MONITOR_INTERVAL_SECONDS: int = _env_int("MONITOR_INTERVAL_SECONDS", 20)
     RECONCILIATION_INTERVAL_SECONDS: int = _env_int("RECONCILIATION_INTERVAL_SECONDS", 900)
     MAX_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", 12)
     MAX_LEVERAGE: int = _env_int("MAX_LEVERAGE", 25)
@@ -193,7 +209,7 @@ class Config:
     BALANCE_CACHE_TTL_SECONDS: int = _env_int("BALANCE_CACHE_TTL_SECONDS", 600)
     BALANCE_REST_POLL_SECONDS: int = _env_int("BALANCE_REST_POLL_SECONDS", 600)
     ACCOUNT_REST_MIN_INTERVAL_SECONDS: int = _env_int(
-        "ACCOUNT_REST_MIN_INTERVAL_SECONDS", 300
+        "ACCOUNT_REST_MIN_INTERVAL_SECONDS", 600
     )
     IP_BAN_HALT_SECONDS: int = _env_int("IP_BAN_HALT_SECONDS", 600)
     REST_BUDGET_ACCOUNT_RESERVE_FRACTION: float = _env_float(
@@ -241,7 +257,7 @@ class Config:
         "POSITION_REST_VERIFY_MIN_INTERVAL_SECONDS", 30.0
     )
     POSITION_REST_FULL_MIN_INTERVAL_SECONDS: float = _env_float(
-        "POSITION_REST_FULL_MIN_INTERVAL_SECONDS", 120.0
+        "POSITION_REST_FULL_MIN_INTERVAL_SECONDS", 180.0
     )
     WS_KLINE_BOOTSTRAP_WARMUP_SECONDS: float = _env_float(
         "WS_KLINE_BOOTSTRAP_WARMUP_SECONDS", 3.0
@@ -293,7 +309,7 @@ class Config:
         "MONITOR_WATCHDOG_INTERVAL_SECONDS", 5.0
     )
     MONITOR_REST_MARK_INTERVAL_SECONDS: float = _env_float(
-        "MONITOR_REST_MARK_INTERVAL_SECONDS", 8.0
+        "MONITOR_REST_MARK_INTERVAL_SECONDS", 30.0
     )
     NATIVE_TP_WORKING_TYPE: str = os.getenv("NATIVE_TP_WORKING_TYPE", "MARK_PRICE")
     CONFLICT_REJECT_LOG_INTERVAL_SECONDS: int = _env_int(
@@ -731,6 +747,24 @@ class Config:
         if cls.USE_TESTNET:
             return max(int(cls.REST_IP_REQUEST_LIMIT_TESTNET), 1)
         return max(int(cls.REST_IP_REQUEST_LIMIT_MAINNET), 1)
+
+    @classmethod
+    def rest_used_weight_limit(cls) -> int:
+        """Binance USD-M request-weight cap per minute (X-MBX-USED-WEIGHT-1M)."""
+        return max(int(cls.REST_USED_WEIGHT_LIMIT), 1)
+
+    @classmethod
+    def rest_weight_throttle_threshold(cls) -> int:
+        """Pause background REST when used weight reaches this value."""
+        limit = cls.rest_used_weight_limit()
+        return min(max(int(cls.REST_USED_WEIGHT_THROTTLE_THRESHOLD), 1), limit)
+
+    @classmethod
+    def rest_weight_hard_threshold(cls) -> int:
+        """Longer REST pause when used weight is near the Binance cap."""
+        limit = cls.rest_used_weight_limit()
+        throttle = cls.rest_weight_throttle_threshold()
+        return min(max(int(cls.REST_USED_WEIGHT_HARD_THRESHOLD), throttle), limit)
 
     @classmethod
     def testnet_strategy_relax(cls) -> bool:

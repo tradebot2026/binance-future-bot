@@ -272,11 +272,11 @@ class MarketDataHub:
         if not Config.ENABLE_REST_TICKER_FALLBACK and not Config.STARTUP_TICKER_REST_SEED:
             return False
         if self.is_ticker_cache_usable(min_symbols=30):
-            threshold = max(Config.TICKER_REST_FALLBACK_AFTER_SECONDS, 60.0)
+            threshold = max(Config.TICKER_REST_FALLBACK_AFTER_SECONDS, 120.0)
             if self._last_ticker_event_at > 0:
                 return (time.monotonic() - self._last_ticker_event_at) >= threshold
             return self.ticker_cache_age_seconds() >= threshold
-        threshold = max(Config.TICKER_REST_FALLBACK_AFTER_SECONDS, 30.0)
+        threshold = max(Config.TICKER_REST_FALLBACK_AFTER_SECONDS, 90.0)
         if not self._tickers:
             return self.ticker_cache_age_seconds() >= threshold
         if self._last_ticker_event_at <= 0:
@@ -305,7 +305,7 @@ class MarketDataHub:
         now = time.monotonic()
         min_interval = max(
             Config.TICKER_REST_MIN_INTERVAL_SECONDS,
-            15.0 if silent else 30.0,
+            60.0 if silent else 90.0,
         )
         if (
             not force

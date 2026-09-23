@@ -105,11 +105,11 @@ def _build_exchange_position_map(
 
 
 def _fetch_live_account(exchange: Any):
-    """Always request a fresh REST account snapshot for Telegram display."""
+    """Account snapshot for Telegram — WS/cache first, background REST if allowed."""
     if hasattr(exchange, "fetch_live_account_snapshot"):
         return exchange.fetch_live_account_snapshot(
             include_today_income=True,
-            force_refresh=True,
+            force_refresh=False,
         )
     return None
 
@@ -124,8 +124,8 @@ def format_live_account_header(
     """Wallet/margin/unrealized/realized block sourced from Binance fapi/v2/account."""
     snap = _fetch_live_account(exchange)
     if snap is None or snap.wallet_balance <= 0:
-        balance = safe_float(exchange.get_futures_balance(force_refresh=True))
-        unrealized = safe_float(exchange.get_unrealized_pnl_total(force_refresh=True))
+        balance = safe_float(exchange.get_futures_balance(force_refresh=False))
+        unrealized = safe_float(exchange.get_unrealized_pnl_total(force_refresh=False))
         if balance <= 0 and unrealized == 0:
             return (
                 "💵 <b>Wallet:</b> unavailable\n"
@@ -170,15 +170,15 @@ def _resolve_live_wallet_unrealized(exchange: Any) -> tuple[float, float]:
     if hasattr(exchange, "fetch_live_account_snapshot"):
         snap = exchange.fetch_live_account_snapshot(
             include_today_income=False,
-            force_refresh=True,
+            force_refresh=False,
         )
         if snap.wallet_balance > 0:
             return snap.wallet_balance, snap.unrealized_pnl
     snap = _fetch_live_account(exchange)
     if snap is not None and snap.wallet_balance > 0:
         return snap.wallet_balance, snap.unrealized_pnl
-    wallet = safe_float(exchange.get_futures_balance(force_refresh=True))
-    unrealized = safe_float(exchange.get_unrealized_pnl_total(force_refresh=True))
+    wallet = safe_float(exchange.get_futures_balance(force_refresh=False))
+    unrealized = safe_float(exchange.get_unrealized_pnl_total(force_refresh=False))
     return wallet, unrealized
 
 

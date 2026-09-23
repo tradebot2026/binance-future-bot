@@ -16,7 +16,7 @@ from core.symbol_conflict_guard import SymbolConflictGuard
 from core.types import CandleCloseEvent, SignalCandidate
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
-from executor import log_execution_rejected
+from executor import log_execution_rejected, log_scan_rejected
 from logger import log_trade_approved, scanner_logger
 from pipeline.snapshot_factory import SnapshotFactory
 from pipeline.universe_builder import UniverseBuilder
@@ -387,7 +387,7 @@ class EventScanOrchestrator:
             and not self.priority_queue.is_priority(symbol)
             and not self.assignment_manager.is_hot(symbol)
         ):
-            log_execution_rejected(
+            log_scan_rejected(
                 symbol, "rotation evaluated-memory cooldown — skipped rescan"
             )
             if mark_event is not None:
@@ -411,7 +411,7 @@ class EventScanOrchestrator:
             volume_rank=volume_rank,
         )
         if snapshot is None:
-            log_execution_rejected(
+            log_scan_rejected(
                 symbol, "snapshot unavailable (WS kline cache miss)"
             )
             if mark_event is not None:
@@ -426,7 +426,7 @@ class EventScanOrchestrator:
             timeframe=timeframe,
         )
         if not scores:
-            log_execution_rejected(symbol, "no strategy scores produced after scan")
+            log_scan_rejected(symbol, "no strategy scores produced after scan")
             if mark_event is not None:
                 self.event_scheduler.mark_evaluated(
                     symbol, mark_event.timeframe, mark_event.bar_open_ms
@@ -464,7 +464,7 @@ class EventScanOrchestrator:
             )
 
         if best is None:
-            log_execution_rejected(
+            log_scan_rejected(
                 symbol,
                 f"pick_best produced no valid winner from {len(scores)} scored setup(s)",
             )
@@ -476,7 +476,7 @@ class EventScanOrchestrator:
             if row.strategy != best.strategy and row.score > 0
         ]
         if losers:
-            log_execution_rejected(
+            log_scan_rejected(
                 symbol,
                 (
                     f"Lower score than winner {best.strategy} {best.action} "
@@ -490,7 +490,7 @@ class EventScanOrchestrator:
             )
 
         if best.score < best.min_score:
-            log_execution_rejected(
+            log_scan_rejected(
                 symbol,
                 f"score {best.score:.1f} below strategy minimum {best.min_score:.1f}",
                 strategy=best.strategy,
@@ -592,7 +592,7 @@ class EventScanOrchestrator:
                 order.append(key)
                 continue
             if candidate.adjusted_score > existing.adjusted_score:
-                log_execution_rejected(
+                log_scan_rejected(
                     existing.symbol,
                     (
                         f"Lower score than winner {candidate.strategy} "

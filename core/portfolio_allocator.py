@@ -65,6 +65,9 @@ class PortfolioAllocator:
         self.db = db
 
     def approve(self, candidate: SignalCandidate) -> AllocationResult:
+        hydrated = getattr(self.exchange, "wallet_is_hydrated", None)
+        if callable(hydrated) and not hydrated():
+            return AllocationResult(False, reason="wallet_not_ready")
         balance = self.exchange.get_futures_balance(force_refresh=False)
         if balance <= 0:
             return AllocationResult(False, reason="balance_unavailable")

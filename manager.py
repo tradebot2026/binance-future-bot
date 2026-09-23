@@ -111,9 +111,14 @@ class TradeManager:
         from core.ops_heartbeat import touch_monitor_loop
 
         touch_monitor_loop(source="manager_init")
+        rest_refresh = max(
+            float(Config.MONITOR_INTERVAL_SECONDS),
+            float(Config.MONITOR_REST_MARK_INTERVAL_SECONDS),
+            15.0,
+        )
         system_logger.info(
-            "Position monitor started (ws_eval=1s, rest_refresh=%ss).",
-            Config.MONITOR_INTERVAL_SECONDS,
+            "Position monitor started (ws_eval=1s, rest_refresh=%.0fs).",
+            rest_refresh,
         )
 
     @property
@@ -182,13 +187,16 @@ class TradeManager:
         from core.ops_heartbeat import touch_monitor_loop
 
         last_rest_refresh = 0.0
+        rest_interval = max(
+            float(Config.MONITOR_INTERVAL_SECONDS),
+            float(Config.MONITOR_REST_MARK_INTERVAL_SECONDS),
+            15.0,
+        )
         while not self._monitor_stop.wait(1.0):
             try:
                 now = time.monotonic()
-                rest_due = (now - last_rest_refresh) >= max(
-                    Config.MONITOR_INTERVAL_SECONDS, 1
-                )
-                if rest_due:
+                rest_due = (now - last_rest_refresh) >= rest_interval
+                if rest_due and not self.exchange.is_rest_blocked()[0]:
                     self._prefetch_live_prices_for_open_trades()
                     self.monitor_open_trades(ws_only=False)
                     last_rest_refresh = now
@@ -737,6 +745,8 @@ class TradeManager:
     def _prefetch_live_prices_for_open_trades(self) -> None:
         """REST mark refresh for open symbols whose WS miniTicker is stale."""
         if self.exchange.is_rest_blocked()[0]:
+            return
+        if not self.exchange.can_make_background_rest_call(1):
             return
         hub = getattr(self.exchange, "_market_data", None)
         max_age = Config.VIRTUAL_TP_TICKER_MAX_AGE_SECONDS

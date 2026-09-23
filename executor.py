@@ -42,8 +42,10 @@ from utils import (
 _REJECT_LOG_AT: dict[str, float] = {}
 
 
-def log_execution_rejected(symbol: str, reason: str, *, strategy: str = "") -> None:
-    """Explicit WARNING when an approved signal fails at execution gates."""
+def _log_reject(
+    tag: str, symbol: str, reason: str, *, strategy: str = ""
+) -> None:
+    """Rate-limited WARNING for scan or execution rejects."""
     symbol_key = symbol.upper()
     reason_lower = reason.lower()
     blocked_patterns = (
@@ -60,9 +62,9 @@ def log_execution_rejected(symbol: str, reason: str, *, strategy: str = "") -> N
         "max daily entries",
     )
     if any(pattern in reason_lower for pattern in blocked_patterns):
-        suppress_key = symbol_key
+        suppress_key = f"{tag}:{symbol_key}"
     else:
-        suppress_key = f"{symbol_key}:{reason}"
+        suppress_key = f"{tag}:{symbol_key}:{reason}"
     now = time.monotonic()
     interval = max(Config.CONFLICT_REJECT_LOG_INTERVAL_SECONDS, 60)
     last = _REJECT_LOG_AT.get(suppress_key, 0.0)
@@ -72,11 +74,22 @@ def log_execution_rejected(symbol: str, reason: str, *, strategy: str = "") -> N
 
     suffix = f" | strategy={strategy}" if strategy else ""
     trade_logger.warning(
-        "[EXECUTION_REJECTED] %s - Reason: %s%s",
+        "[%s] %s - Reason: %s%s",
+        tag,
         symbol,
         reason,
         suffix,
     )
+
+
+def log_scan_rejected(symbol: str, reason: str, *, strategy: str = "") -> None:
+    """Scan-time drop (pick_best loser, no setup) — not an order failure."""
+    _log_reject("SCAN_REJECTED", symbol, reason, strategy=strategy)
+
+
+def log_execution_rejected(symbol: str, reason: str, *, strategy: str = "") -> None:
+    """Explicit WARNING when an approved signal fails at execution gates."""
+    _log_reject("EXECUTION_REJECTED", symbol, reason, strategy=strategy)
 
 
 class TradeExecutor:
