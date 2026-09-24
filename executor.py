@@ -42,6 +42,16 @@ from utils import (
 _REJECT_LOG_AT: dict[str, float] = {}
 
 
+def _positive_price(value: object) -> float:
+    """Accept only a real finite price. Mocks and strings must not become 1.0."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0.0
+    price = float(value)
+    if price <= 0 or price != price or price == float("inf"):
+        return 0.0
+    return price
+
+
 def _log_reject(
     tag: str, symbol: str, reason: str, *, strategy: str = ""
 ) -> None:
@@ -763,7 +773,7 @@ class TradeExecutor:
             if not callable(fn):
                 continue
             try:
-                price = safe_float(fn(symbol))
+                price = _positive_price(fn(symbol))
             except Exception as exc:
                 trade_logger.debug(
                     "Execution REST %s failed for %s: %s", name, symbol, exc
@@ -773,7 +783,7 @@ class TradeExecutor:
                 return price
         if hasattr(self.exchange, "get_live_mark_price"):
             try:
-                mark = safe_float(
+                mark = _positive_price(
                     self.exchange.get_live_mark_price(symbol, allow_rest=True)
                 )
             except Exception:
@@ -788,7 +798,7 @@ class TradeExecutor:
             hub = self.exchange.get_market_data_hub()
         if hub is not None and hasattr(hub, "get_price"):
             try:
-                cached = safe_float(hub.get_price(symbol))
+                cached = _positive_price(hub.get_price(symbol))
             except Exception:
                 cached = 0.0
             if cached > 0:
@@ -828,29 +838,59 @@ class TradeExecutor:
                 pass
         return False
 
-    def _resolve_live_execution_price(self, symbol: str, current_price: float) -> float:
-        """Fresh WS price only. REST fallback must not rescue a stale/warming entry."""
-        if self._market_data_blocks_new_entry(symbol):
-            return 0.0
-        if not self._ws_needs_execution_rest_price(symbol, current_price):
-            return current_price
+    def _execution_rest_halted(self) -> bool:
+        """True only for a real Binance halt — not the used-weight governor."""
+        snap_fn = getattr(self.exchange, "rest_usage_snapshot", None)
+        if callable(snap_fn):
+            try:
+                snap = snap_fn() or {}
+            except Exception:
+                snap = {}
+            if str(snap.get("state") or "") in {"IP_BANNED", "API_RATE_LIMITED"}:
+                return True
+        return False
 
-        rest_block = (
-            self.exchange.is_rest_blocked()
-            if hasattr(self.exchange, "is_rest_blocked")
-            else (False, "")
-        )
-        if isinstance(rest_block, tuple) and rest_block and rest_block[0] is True:
-            return 0.0
-        rest_price = self._fetch_execution_rest_price(symbol)
-        if rest_price > 0:
+    def _resolve_live_execution_price(self, symbol: str, current_price: float) -> float:
+        """WS first, then one execution-lane REST ticker, then cached/signal price."""
+        hub = None
+        if hasattr(self.exchange, "get_market_data_hub"):
+            hub = self.exchange.get_market_data_hub()
+        if hub is not None:
+            fresh_fn = getattr(hub, "get_fresh_ticker_price", None)
+            if callable(fresh_fn):
+                try:
+                    fresh = _positive_price(fresh_fn(symbol))
+                except Exception:
+                    fresh = 0.0
+                if fresh > 0:
+                    return fresh
+
+        if not self._execution_rest_halted():
+            rest_price = self._fetch_execution_rest_price(symbol)
+            if rest_price > 0:
+                if hub is not None and hasattr(hub, "seed_tickers_from_rest"):
+                    try:
+                        hub.seed_tickers_from_rest(
+                            {symbol.upper(): {"lastPrice": rest_price}}
+                        )
+                    except Exception:
+                        pass
+                trade_logger.info(
+                    "Execution price REST fallback %s | signal=%.6f rest=%.6f",
+                    symbol,
+                    current_price,
+                    rest_price,
+                )
+                return rest_price
+
+        cached = self._cached_execution_price(symbol, current_price)
+        if cached > 0:
             trade_logger.info(
-                "Execution price REST fallback %s | signal=%.6f rest=%.6f",
+                "Execution price cache/signal fallback %s | price=%.6f",
                 symbol,
-                current_price,
-                rest_price,
+                cached,
             )
-            return rest_price
+            return cached
         return 0.0
 
     def _execute_trade_inner(

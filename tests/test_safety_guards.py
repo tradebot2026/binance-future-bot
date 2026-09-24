@@ -70,6 +70,7 @@ class TestDryRunGuard(unittest.TestCase):
         hub._reconnect_in_progress = False
         hub.is_ws_warming_up.return_value = True
         hub.get_ws_health_snapshot.return_value = {"state": "WARMING"}
+        hub.get_fresh_ticker_price.return_value = None
         exchange.get_market_data_hub.return_value = hub
         exchange.fetch_ticker.return_value = 123.45
         exchange.get_symbol_price.return_value = 123.45
@@ -86,9 +87,9 @@ class TestDryRunGuard(unittest.TestCase):
                 strategy="SMC_TREND",
                 score=80.0,
             )
-        self.assertIsNone(result)
-        inner.assert_not_called()
-        exchange.execute_futures_order.assert_not_called()
+        self.assertEqual(result, {"ok": True})
+        inner.assert_called_once()
+        self.assertEqual(inner.call_args.args[3], 123.45)
 
     def test_stale_ws_uses_rest_ticker_and_still_places(self) -> None:
         exchange = MagicMock()
@@ -116,9 +117,9 @@ class TestDryRunGuard(unittest.TestCase):
                 strategy="SMC_TREND",
                 score=80.0,
             )
-        self.assertIsNone(result)
-        inner.assert_not_called()
-        exchange.execute_futures_order.assert_not_called()
+        self.assertEqual(result, {"ok": True})
+        inner.assert_called_once()
+        self.assertEqual(inner.call_args.args[3], 250.0)
 
     def test_stale_rest_failure_still_places_with_signal_price(self) -> None:
         exchange = MagicMock()
@@ -127,6 +128,7 @@ class TestDryRunGuard(unittest.TestCase):
         hub._reconnect_in_progress = False
         hub.execution_requires_rest_price.return_value = True
         hub.get_price.return_value = 0.0
+        hub.get_fresh_ticker_price.return_value = None
         exchange.get_market_data_hub.return_value = hub
         exchange.fetch_ticker.return_value = None
         exchange.get_symbol_price.return_value = None
@@ -144,9 +146,9 @@ class TestDryRunGuard(unittest.TestCase):
                 strategy="SMC_TREND",
                 score=80.0,
             )
-        self.assertIsNone(result)
-        inner.assert_not_called()
-        exchange.execute_futures_order.assert_not_called()
+        self.assertEqual(result, {"ok": True})
+        inner.assert_called_once()
+        self.assertEqual(inner.call_args.args[3], 100.0)
 
 
 class TestForceResumeMainnetLock(unittest.TestCase):

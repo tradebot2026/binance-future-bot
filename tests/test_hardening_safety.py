@@ -373,6 +373,17 @@ class TestWatchdogAndWs(unittest.TestCase):
         self.assertEqual(seeded, 0)
         self.assertEqual(called, [])
 
+    def test_kline_cache_miss_is_queued_without_duplicates(self) -> None:
+        from pipeline.event_scan_orchestrator import EventScanOrchestrator
+
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch._kline_cache_misses = []
+        orch.note_kline_cache_miss("ENAUSDT")
+        orch.note_kline_cache_miss("enausdt")
+        orch.note_kline_cache_miss("BBUSDT")
+        self.assertEqual(orch.take_kline_cache_misses(2), ["ENAUSDT", "BBUSDT"])
+        self.assertEqual(orch.take_kline_cache_misses(1), [])
+
 
 class TestStrategiesAndArbitration(unittest.TestCase):
     def test_drop_forming_bar(self) -> None:

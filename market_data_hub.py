@@ -168,6 +168,9 @@ class MarketDataHub:
         self._pending_order_fills: list[dict[str, Any]] = []
         self._bootstrap_series_window: deque[float] = deque()
         self._last_user_event_at: float = 0.0
+        self._last_user_socket_at: float = 0.0
+        self._listen_key: str = ""
+        self._last_listen_keepalive_at: float = 0.0
         self._positions: list[dict[str, Any]] = []
         self._unrealized_pnl_total: float = 0.0
         self._wallet_balances: dict[str, float] = {}
@@ -580,6 +583,8 @@ class MarketDataHub:
             self._last_ticker_event_at = now
         if stream in ("book", "all"):
             self._last_book_event_at = now
+        if stream in ("user", "all"):
+            self._last_user_socket_at = now
 
     def execution_requires_rest_price(self, symbol: str = "") -> bool:
         """True when execution must not trust WS last price (stale/warming/no fresh tick)."""
@@ -659,6 +664,7 @@ class MarketDataHub:
             self._user_conn_key = manager.start_futures_user_socket(
                 callback=self._wrap_ws_callback(self._on_user_message, stream="user"),
             )
+            self._capture_listen_key()
             self._ws_running = True
             self._ws_started_at = time.monotonic()
             self._resubscribe_kline_streams()
@@ -668,6 +674,74 @@ class MarketDataHub:
                 streams += " + bookTicker"
             system_logger.info("[WS_CONNECTED] streams started (%s).", streams)
             system_logger.info("[WS_SUBSCRIPTION_READY] miniTicker/userData subscribed.")
+
+    def _capture_listen_key(self) -> None:
+        """Remember the user-data listen-key so we can keepalive it without reconnects."""
+        manager = self._ws_manager
+        candidates = (
+            manager,
+            getattr(manager, "_bsm", None) if manager is not None else None,
+            getattr(manager, "_client", None) if manager is not None else None,
+            self.client,
+        )
+        for obj in candidates:
+            if obj is None:
+                continue
+            for attr in ("_listen_key", "listen_key", "_user_listen_key"):
+                raw = getattr(obj, attr, None)
+                if isinstance(raw, str) and raw:
+                    self._listen_key = raw
+                    self._last_listen_keepalive_at = time.monotonic()
+                    return
+            keys = getattr(obj, "_listen_keys", None)
+            if isinstance(keys, dict) and keys:
+                first = next(iter(keys.values()), None)
+                if first:
+                    self._listen_key = str(first)
+                    self._last_listen_keepalive_at = time.monotonic()
+                    return
+
+    def _maybe_keepalive_user_listen_key(self) -> None:
+        """PUT listenKey about every 30 minutes (Binance expires at 60). Weight 1.
+
+        This is not background market-data REST. Skip only on a real IP/HTTP
+        halt so the used-weight governor cannot silently expire the stream.
+        """
+        if self._reconnect_in_progress or not self._ws_running:
+            return
+        if self._rest_quiet_mode():
+            return
+        if not self._listen_key:
+            self._capture_listen_key()
+        if not self._listen_key:
+            getter = getattr(self.client, "futures_stream_get_listen_key", None)
+            if callable(getter):
+                try:
+                    created = getter()
+                    if isinstance(created, str) and created:
+                        self._listen_key = created
+                    elif isinstance(created, dict):
+                        self._listen_key = str(created.get("listenKey") or "")
+                except Exception as exc:
+                    if self._ws_log.should_log(f"listen_key_create:{exc}"):
+                        system_logger.debug("Listen-key capture skipped: %s", exc)
+        if not self._listen_key:
+            return
+        if (
+            self._last_listen_keepalive_at > 0
+            and (time.monotonic() - self._last_listen_keepalive_at) < 1800.0
+        ):
+            return
+        keepalive = getattr(self.client, "futures_stream_keepalive", None)
+        if not callable(keepalive):
+            return
+        try:
+            keepalive(listenKey=self._listen_key)
+            self._last_listen_keepalive_at = time.monotonic()
+            system_logger.debug("User-data listen-key keepalive sent.")
+        except Exception as exc:
+            if self._ws_log.should_log(f"listen_keepalive:{exc}"):
+                system_logger.debug("Listen-key keepalive skipped: %s", exc)
 
     def _start_watchdog(self) -> None:
         if not Config.WS_RECONNECT_ENABLED:
@@ -689,6 +763,7 @@ class MarketDataHub:
                 continue
             if self._reconnect_in_progress or self.is_ws_warming_up():
                 continue
+            self._maybe_keepalive_user_listen_key()
             self._check_kline_sockets_health()
             blocked, _ = self.is_rest_blocked()
             if (
@@ -711,26 +786,25 @@ class MarketDataHub:
                 )
 
     def _should_reconnect_for_stale_user_stream(self) -> bool:
-        if not self.user_stream_is_stale():
-            return False
+        """Reconnect user-data only when we need ACCOUNT_UPDATE and the socket died.
+
+        Testnet often sends no account events when flat. A quiet listen-key is not
+        a stale multiplex manager — do not tear down miniTicker/klines for that.
+        """
         if self._rest_quiet_mode():
             return False
         if not self.user_stream_has_account_data():
-            # A live miniTicker feed means the WS manager is up; listen-key can be quiet.
-            if not self.ws_is_stale() and self._last_ticker_event_at > 0:
-                return False
-            return True
+            return False
+        if not self.user_stream_is_stale():
+            return False
         with self._lock:
             has_open_positions = any(
                 safe_float(p.get("quantity")) > 0 for p in self._positions
             )
         if has_open_positions:
             return True
-        if not self.ws_is_stale() and self._last_ticker_event_at > 0:
-            idle = time.monotonic() - self._last_user_event_at
-            if idle < Config.WS_USER_IDLE_RECONNECT_SECONDS:
-                return False
-        return True
+        idle = time.monotonic() - self._last_user_event_at
+        return idle >= float(Config.WS_USER_IDLE_RECONNECT_SECONDS)
 
     @staticmethod
     def _kline_socket_chunk_size() -> int:
@@ -1926,13 +2000,14 @@ class MarketDataHub:
     def user_stream_is_stale(self) -> bool:
         if not self._ws_running:
             return True
-        if self._ws_started_at > 0 and self._last_user_event_at <= 0:
-            warming = (time.monotonic() - self._ws_started_at) < Config.WS_WARMUP_SECONDS
-            if warming:
+        now = time.monotonic()
+        socket_stamp = max(self._last_user_socket_at, self._last_user_event_at)
+        if socket_stamp <= 0:
+            if self._ws_started_at > 0 and (now - self._ws_started_at) < Config.WS_WARMUP_SECONDS:
                 return False
-        if self._last_user_event_at <= 0:
-            return True
-        return (time.monotonic() - self._last_user_event_at) > Config.WS_USER_STALE_SECONDS
+            # Quiet listen-key (no ACCOUNT_UPDATE yet) is not a dead socket.
+            return False
+        return (now - socket_stamp) > Config.WS_USER_STALE_SECONDS
 
     def get_book_ticker_map(
         self,

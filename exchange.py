@@ -2626,17 +2626,26 @@ class BinanceExchangeManager:
             needs_rest = True
         if not needs_rest:
             return None
-        if self.is_rest_blocked()[0] and not self._is_execution_priority():
-            return None
-        if not self._is_execution_priority() and not self.can_make_background_rest_call(1):
-            return None
+        exec_lane = self._is_execution_priority()
+        if not exec_lane:
+            if self.is_rest_blocked()[0]:
+                return None
+            if not self.can_make_background_rest_call(1):
+                return None
         try:
             ticker = self._throttled_call(
                 self.client.futures_symbol_ticker,
                 symbol=symbol,
-                execution_priority=self._is_execution_priority(),
+                execution_priority=exec_lane,
             )
             price = safe_float(ticker.get("price"))
+            if price > 0 and self._market_data is not None:
+                try:
+                    self._market_data.seed_tickers_from_rest(
+                        {symbol: {"lastPrice": price}}
+                    )
+                except Exception:
+                    pass
             return price if price > 0 else None
         except ExchangeRateLimitError:
             return None

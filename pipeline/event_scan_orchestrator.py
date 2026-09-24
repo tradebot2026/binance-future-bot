@@ -51,10 +51,24 @@ class EventScanOrchestrator:
         self._volume_ranks: dict[str, int] = {}
         self._last_catchup_at: float = 0.0
         self._last_universe_refresh_at: float = 0.0
+        self._kline_cache_misses: list[str] = []
 
     @property
     def tier1_symbols(self) -> list[str]:
         return list(self._tier1_symbols)
+
+    def note_kline_cache_miss(self, symbol: str) -> None:
+        """Queue a symbol for paced REST kline bootstrap after this scan cycle."""
+        sym = str(symbol or "").upper()
+        if not sym or sym in self._kline_cache_misses:
+            return
+        self._kline_cache_misses.append(sym)
+
+    def take_kline_cache_misses(self, count: int = 1) -> list[str]:
+        n = max(int(count), 1)
+        taken = self._kline_cache_misses[:n]
+        self._kline_cache_misses = self._kline_cache_misses[n:]
+        return taken
 
     def refresh_tier1_universe(self, *, force: bool = False) -> list[str]:
         """Rebuild Tier-1 watchlist and subscribe WS klines."""
@@ -411,6 +425,7 @@ class EventScanOrchestrator:
             volume_rank=volume_rank,
         )
         if snapshot is None:
+            self.note_kline_cache_miss(symbol)
             log_scan_rejected(
                 symbol, "snapshot unavailable (WS kline cache miss)"
             )

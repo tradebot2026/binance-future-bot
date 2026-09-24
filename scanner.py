@@ -154,17 +154,20 @@ class MarketScanner:
         if not self.exchange.can_make_background_rest_call(5):
             return 0
 
-        symbols = self.orchestrator.priority_queue.next_background_bootstrap_symbols(1)
+        symbols = self.orchestrator.take_kline_cache_misses(2)
+        if not symbols:
+            symbols = self.orchestrator.priority_queue.next_background_bootstrap_symbols(1)
         if not symbols:
             return 0
 
         timeframes = Config.get_scan_kline_intervals()
+        self._hub.subscribe_kline_streams(symbols)
         with self.exchange.bootstrap_context():
             return self._hub.bootstrap_klines_for_symbols(
                 symbols,
                 timeframes,
                 self.exchange.fetch_bootstrap_klines_df,
-                max_pairs=len(timeframes),
+                max_pairs=len(timeframes) * len(symbols),
             )
 
     def get_tier2_summary(self) -> list[tuple[str, str, float]]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from config import Config
@@ -230,6 +231,39 @@ class TestWsStaleReconnect(unittest.TestCase):
         self.assertTrue(hub.is_ws_warming_up())
         self.assertEqual(hub.refresh_ticker_cache_from_rest(silent=True), 12)
         fetcher.assert_not_called()
+
+    def test_quiet_user_stream_does_not_reconnect_when_flat(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._last_user_event_at = 0.0
+        hub._last_user_socket_at = 0.0
+        hub._ws_started_at = time.monotonic() - 600.0
+        hub._positions = []
+        with patch.object(Config, "USE_TESTNET", True):
+            self.assertFalse(hub.user_stream_has_account_data())
+            self.assertFalse(hub.user_stream_is_stale())
+            self.assertFalse(hub._should_reconnect_for_stale_user_stream())
+
+    def test_listen_key_keepalive_runs_even_if_governor_blocks(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._listen_key = "test-listen-key"
+        hub._last_listen_keepalive_at = time.monotonic() - 1900.0
+        hub._rest_governor = SimpleNamespace(
+            can_make_background_rest_call=lambda _weight: False
+        )
+        keepalive = MagicMock()
+        hub.client.futures_stream_keepalive = keepalive
+        hub._maybe_keepalive_user_listen_key()
+        keepalive.assert_called_once_with(listenKey="test-listen-key")
+
+    def test_listen_key_keepalive_skips_during_rest_ban(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._listen_key = "test-listen-key"
+        hub._last_listen_keepalive_at = time.monotonic() - 1900.0
+        hub._rest_blocked_until = time.time() + 60.0
+        keepalive = MagicMock()
+        hub.client.futures_stream_keepalive = keepalive
+        hub._maybe_keepalive_user_listen_key()
+        keepalive.assert_not_called()
 
     def test_cache_miss_does_not_rest_during_reconnect(self) -> None:
         hub = _hub_with_running_ws()
