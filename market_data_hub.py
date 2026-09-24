@@ -146,7 +146,9 @@ class MarketDataHub:
         self._ticker_rest_fetcher: Optional[
             Callable[[], dict[str, dict[str, Any]]]
         ] = None
+        self._rest_governor: Any = None
         self._last_ticker_rest_at: float = 0.0
+        self._cache_miss_rest_at: dict[tuple[str, str], float] = {}
         self._ticker_rest_seeded: bool = False
         self._ticker_conn_key: Optional[str] = None
         self._book_ticker_conn_key: Optional[str] = None
@@ -240,6 +242,32 @@ class MarketDataHub:
     ) -> None:
         self._ticker_rest_fetcher = fetcher
 
+    def set_rest_governor(self, governor: Any) -> None:
+        """Attach exchange used-weight governor so hub fallbacks honor it."""
+        self._rest_governor = governor
+
+    def ws_is_degraded(self) -> bool:
+        """True during reconnect or warmup — REST fallbacks must not storm."""
+        return bool(self._reconnect_in_progress or self.is_ws_warming_up())
+
+    def _governor_blocks_background_rest(self, weight: int = 40) -> bool:
+        gov = self._rest_governor
+        if gov is None:
+            return False
+        check = getattr(gov, "can_make_background_rest_call", None)
+        if callable(check):
+            try:
+                return not bool(check(weight))
+            except Exception:
+                return True
+        blocked_fn = getattr(gov, "is_rest_blocked", None)
+        if callable(blocked_fn):
+            try:
+                return bool(blocked_fn()[0])
+            except Exception:
+                return True
+        return False
+
     def ticker_cache_age_seconds(self) -> float:
         """Seconds since last WS ticker event (or since WS start if none yet)."""
         if self._last_ticker_event_at > 0:
@@ -294,11 +322,25 @@ class MarketDataHub:
         if fetcher is None:
             return len(self._tickers)
 
+        if self.ws_is_degraded():
+            if self._ws_log.should_log("ticker_rest_skip_degraded"):
+                system_logger.debug(
+                    "Ticker REST skipped — WS reconnect/warmup (cache only)."
+                )
+            return len(self._tickers)
+
         blocked, reason = self.is_rest_blocked()
         if blocked:
             if self._ws_log.should_log(f"ticker_rest_blocked:{reason}"):
                 system_logger.debug(
                     "Ticker REST fallback skipped — REST blocked: %s", reason
+                )
+            return len(self._tickers)
+
+        if self._governor_blocks_background_rest(40):
+            if self._ws_log.should_log("ticker_rest_governor"):
+                system_logger.debug(
+                    "Ticker REST skipped — used-weight governor (cache only)."
                 )
             return len(self._tickers)
 
@@ -383,8 +425,6 @@ class MarketDataHub:
         if not self.ws_is_stale() and not self._book_stream_is_stale():
             return False
         if self._kline_feeds_healthy() or self._stale_reconnect_on_cooldown():
-            if not self._rest_quiet_mode():
-                self.refresh_ticker_cache_from_rest(silent=True)
             return False
         return True
 
@@ -420,7 +460,10 @@ class MarketDataHub:
                 return True
             time.sleep(0.25)
 
-        if self.refresh_ticker_cache_from_rest(force=True) >= min_syms:
+        if self.ws_is_degraded() or self._governor_blocks_background_rest(40):
+            count = len(self.get_ticker_map())
+            return count > 0
+        if self.refresh_ticker_cache_from_rest(force=False) >= min_syms:
             return True
 
         count = len(self.get_ticker_map())
@@ -466,17 +509,32 @@ class MarketDataHub:
             return False, "WS_RECONNECTING"
         if not self._ws_running:
             return False, "WS_DISCONNECTED"
-        if self.is_ws_warming_up() or self._last_real_ticker_at <= 0:
+        if self.is_ws_warming_up():
             return False, "WS_WARMUP"
+
         stale_after = self._effective_ticker_stale_seconds()
-        if (time.monotonic() - self._last_real_ticker_at) > stale_after:
+        cache_ok = self.is_ticker_cache_usable()
+        real_ok = (
+            self._last_real_ticker_at > 0
+            and (time.monotonic() - self._last_real_ticker_at) <= stale_after
+        )
+        # Testnet miniTicker is often idle; cached lastPrice is usable once WS
+        # is running and not in warmup/reconnect. Mainnet still requires ticks.
+        if not real_ok and not (Config.USE_TESTNET and cache_ok):
+            if self._last_real_ticker_at <= 0:
+                return False, "WS_WARMUP"
             return False, "STALE_DATA"
-        if not self.is_ticker_cache_usable():
+        if not cache_ok:
             return False, "RESYNC"
         if symbol:
             fresh = self.get_fresh_ticker_price(symbol, max_age_seconds=stale_after)
             if fresh is None or fresh <= 0:
-                return False, "STALE_DATA"
+                if Config.USE_TESTNET:
+                    cached = self.get_price(symbol)
+                    if cached is None or cached <= 0:
+                        return False, "STALE_DATA"
+                else:
+                    return False, "STALE_DATA"
         return True, ""
 
     def drain_pending_order_fills(self) -> list[dict[str, Any]]:
@@ -629,17 +687,16 @@ class MarketDataHub:
         while not self._watchdog_stop.wait(interval):
             if not self._ws_running:
                 continue
-            if self._reconnect_in_progress:
-                if not self._rest_quiet_mode():
-                    self.refresh_ticker_cache_from_rest(silent=True)
-                continue
-            if self.is_ws_warming_up():
-                if not self._rest_quiet_mode():
-                    self.refresh_ticker_cache_from_rest(silent=True)
+            if self._reconnect_in_progress or self.is_ws_warming_up():
                 continue
             self._check_kline_sockets_health()
             blocked, _ = self.is_rest_blocked()
-            if not blocked and not self._rest_quiet_mode() and self.needs_ticker_rest_fallback():
+            if (
+                not blocked
+                and not self._rest_quiet_mode()
+                and not self._governor_blocks_background_rest(40)
+                and self.needs_ticker_rest_fallback()
+            ):
                 self.refresh_ticker_cache_from_rest()
             if self._should_reconnect_for_stale_ticker():
                 age = self.ticker_cache_age_seconds()
@@ -812,8 +869,6 @@ class MarketDataHub:
             time.sleep(delay)
 
             preserve_cache = self._preserve_cache_on_reconnect()
-            if not self._rest_quiet_mode():
-                self.refresh_ticker_cache_from_rest(silent=True)
             self._stop_ws_internal(
                 preserve_kline_subscriptions=True,
                 blocking=False,
@@ -827,9 +882,7 @@ class MarketDataHub:
                 reason,
             )
             system_logger.info("[WS_SUBSCRIPTION_READY] post-reconnect subscriptions active.")
-            if not self._rest_quiet_mode():
-                self.refresh_ticker_cache_from_rest(silent=True)
-            elif preserve_cache and self._ws_log.should_log("ws_reconnect_quiet"):
+            if preserve_cache and self._ws_log.should_log("ws_reconnect_quiet"):
                 system_logger.debug(
                     "WebSocket reconnected — continuing with cached tickers/klines."
                 )
@@ -2067,6 +2120,17 @@ class MarketDataHub:
         blocked, _ = self.is_rest_blocked()
         if blocked or not allow_rest or rest_fetcher is None:
             return cached
+        if self.ws_is_degraded() or self._governor_blocks_background_rest(5):
+            return cached
+
+        miss_key = (symbol.upper(), timeframe)
+        last_miss = self._cache_miss_rest_at.get(miss_key, 0.0)
+        if cached.empty and (time.monotonic() - last_miss) < max(
+            float(Config.WS_DEGRADED_REST_MIN_INTERVAL_SECONDS), 60.0
+        ):
+            return cached
+        if cached.empty:
+            self._cache_miss_rest_at[miss_key] = time.monotonic()
 
         df = rest_fetcher()
         if df.empty:

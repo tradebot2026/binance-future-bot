@@ -149,6 +149,8 @@ class MarketScanner:
             return 0
         if self.exchange.in_scan_mode:
             return 0
+        if getattr(self.exchange, "_ws_reconnect_or_warmup", lambda: False)():
+            return 0
         if not self.exchange.can_make_background_rest_call(5):
             return 0
 

@@ -105,19 +105,36 @@ class TestMarketDataEntryGate(unittest.TestCase):
     def test_ws_warming_blocks_entry(self) -> None:
         hub = _ready_hub()
         hub._last_real_ticker_at = 0.0
-        ready, detail = hub.is_market_data_ready_for_entry("ETHUSDT")
+        hub._last_ticker_event_at = 0.0
+        hub._ws_started_at = time.monotonic()
+        with patch.object(Config, "USE_TESTNET", False):
+            ready, detail = hub.is_market_data_ready_for_entry("ETHUSDT")
         self.assertFalse(ready)
         self.assertEqual(detail, "WS_WARMUP")
-        state, _ = _exchange_with_hub(hub).get_execution_safety("ETHUSDT")
+        with patch.object(Config, "USE_TESTNET", False):
+            state, _ = _exchange_with_hub(hub).get_execution_safety("ETHUSDT")
         self.assertEqual(state, "WS_WARMING")
+
+    def test_testnet_idle_miniticker_allows_entry_from_cache(self) -> None:
+        hub = _ready_hub()
+        hub._last_real_ticker_at = 0.0
+        with patch.object(Config, "USE_TESTNET", True):
+            ready, detail = hub.is_market_data_ready_for_entry("ETHUSDT")
+        self.assertTrue(ready)
+        self.assertEqual(detail, "")
+        with patch.object(Config, "USE_TESTNET", True):
+            state, _ = _exchange_with_hub(hub).get_execution_safety("ETHUSDT")
+        self.assertEqual(state, "EXECUTION_SAFE")
 
     def test_stale_data_blocks_entry(self) -> None:
         hub = _ready_hub()
         hub._last_real_ticker_at = time.monotonic() - 10_000
-        ready, detail = hub.is_market_data_ready_for_entry("ETHUSDT")
+        with patch.object(Config, "USE_TESTNET", False):
+            ready, detail = hub.is_market_data_ready_for_entry("ETHUSDT")
         self.assertFalse(ready)
         self.assertEqual(detail, "STALE_DATA")
-        state, _ = _exchange_with_hub(hub).get_execution_safety("ETHUSDT")
+        with patch.object(Config, "USE_TESTNET", False):
+            state, _ = _exchange_with_hub(hub).get_execution_safety("ETHUSDT")
         self.assertEqual(state, "STALE_DATA")
 
     def test_healthy_fresh_data_allows_entry(self) -> None:

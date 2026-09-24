@@ -229,6 +229,7 @@ class BinanceExchangeManager:
         self._cold_start_balance_rest_done: bool = False
         self._last_balance_rest_at: float = 0.0
         self._last_account_rest_at: float = 0.0
+        self._last_degraded_rest_at: dict[str, float] = {}
         self._account_rest_cache = AccountRestCache()
         self._position_cache = PositionCache()
         self._position_refresh_lock = threading.Lock()
@@ -287,6 +288,8 @@ class BinanceExchangeManager:
         self._market_data = hub
         if hub is not None:
             hub.set_ticker_rest_fetcher(self.fetch_futures_ticker_map_rest)
+            if hasattr(hub, "set_rest_governor"):
+                hub.set_rest_governor(self)
         if hub and hasattr(self, "_startup_ban") and self._startup_ban.is_banned:
             hub.apply_startup_ban(self._startup_ban)
 
@@ -408,10 +411,6 @@ class BinanceExchangeManager:
             reason = usage.get("reason") or f"REST safety mode ({remaining}s)"
             self._log_entry_block("RATE_LIMITED", reason, symbol)
             return state, reason
-        if state == "RATE_LIMIT_WARNING":
-            reason = usage.get("reason") or "REST usage near IP cap — new entries paused"
-            self._log_entry_block("RATE_LIMITED", reason, symbol)
-            return "EXECUTION_PAUSED", reason
         hub = self._market_data
         if hub is not None:
             ready_fn = getattr(hub, "is_market_data_ready_for_entry", None)
@@ -635,6 +634,36 @@ class BinanceExchangeManager:
             return False
         if not self._rest_usage.allows_background_rest():
             return False
+        if not self._degraded_rest_allowed("account", consume=False):
+            return False
+        return True
+
+    def _ws_reconnect_or_warmup(self) -> bool:
+        hub = self._market_data
+        if hub is None:
+            return False
+        degraded = getattr(hub, "ws_is_degraded", None)
+        if callable(degraded):
+            try:
+                return bool(degraded())
+            except Exception:
+                return False
+        return bool(
+            getattr(hub, "_reconnect_in_progress", False)
+            or (getattr(hub, "is_ws_warming_up", lambda: False)())
+        )
+
+    def _degraded_rest_allowed(self, kind: str = "account", *, consume: bool = True) -> bool:
+        """During WS reconnect/warmup, at most one REST of this kind per 60s."""
+        if not self._ws_reconnect_or_warmup():
+            return True
+        interval = max(float(Config.WS_DEGRADED_REST_MIN_INTERVAL_SECONDS), 60.0)
+        now = time.monotonic()
+        last = self._last_degraded_rest_at.get(kind, 0.0)
+        if last > 0 and (now - last) < interval:
+            return False
+        if consume:
+            self._last_degraded_rest_at[kind] = now
         return True
 
     def wallet_is_hydrated(self) -> bool:
@@ -646,6 +675,8 @@ class BinanceExchangeManager:
 
     def can_make_background_rest_call(self, weight: int = 1) -> bool:
         """True when a non-execution REST call is allowed (ban, hard-stop, budget)."""
+        if self._ws_reconnect_or_warmup():
+            return False
         if self._market_data and self._market_data.is_rest_blocked()[0]:
             return False
         if self._rest_token_bucket.is_hard_stopped():
@@ -951,6 +982,8 @@ class BinanceExchangeManager:
         """True when bootstrap may issue another futures_klines REST call."""
         if self._kline_bootstrap_halted:
             return False
+        if self._ws_reconnect_or_warmup():
+            return False
         if self._market_data and self._market_data.is_rest_blocked()[0]:
             return False
         if self._rest_token_bucket.is_hard_stopped():
@@ -1003,6 +1036,10 @@ class BinanceExchangeManager:
         if blocked:
             return reason
         if name in ("futures_account", "futures_account_balance"):
+            if not execution_priority and not self._degraded_rest_allowed(
+                "account", consume=False
+            ):
+                return "ws_degraded_rest_interval"
             if not execution_priority and not self._account_rest_interval_elapsed():
                 return "account_rest_interval"
             if Config.ENABLE_STRICT_RATE_LIMIT:
@@ -1012,6 +1049,10 @@ class BinanceExchangeManager:
         elif name == "futures_position_information":
             if not Config.ENABLE_REST_POSITION_POLL:
                 return "rest_position_poll_disabled"
+            if not execution_priority and not self._degraded_rest_allowed(
+                "position", consume=False
+            ):
+                return "ws_degraded_rest_interval"
             if not execution_priority and not self._account_rest_interval_elapsed():
                 return "account_rest_interval"
             if Config.ENABLE_STRICT_RATE_LIMIT:
@@ -1455,6 +1496,9 @@ class BinanceExchangeManager:
         ):
             return self._position_cache.positions
 
+        if not self._degraded_rest_allowed("position"):
+            return self._position_cache.positions
+
         if not Config.ENABLE_REST_POSITION_POLL or not self._rest_reads_allowed():
             return self._position_cache.positions
 
@@ -1496,6 +1540,11 @@ class BinanceExchangeManager:
                 return cached.as_dict()
 
         if self.in_scan_mode and Config.SCAN_WS_ONLY:
+            if cached:
+                return cached.as_dict()
+            return {}
+
+        if self._ws_reconnect_or_warmup() or not self.can_make_background_rest_call(3):
             if cached:
                 return cached.as_dict()
             return {}
@@ -1874,6 +1923,8 @@ class BinanceExchangeManager:
         Falls back to fapi/v2/balance, then WS/cache.
         """
         attempts = max(max_attempts or Config.STARTUP_BALANCE_MAX_ATTEMPTS, 1)
+        if self._ws_reconnect_or_warmup():
+            attempts = 1
         delay = max(Config.STARTUP_BALANCE_RETRY_SECONDS, 0.5)
         quote = Config.QUOTE_ASSET
         last_exc: Optional[Exception] = None
@@ -1881,6 +1932,7 @@ class BinanceExchangeManager:
         for attempt in range(1, attempts + 1):
             if not self.background_account_rest_allowed():
                 break
+            self._degraded_rest_allowed("account")
             try:
                 raw = self._throttled_call(
                     self.client.futures_account,
@@ -2458,17 +2510,20 @@ class BinanceExchangeManager:
         return None
 
     def fetch_mark_price_rest(self, symbol: str) -> Optional[float]:
-        """REST mark price — used by watchdog when WS hub is unavailable."""
+        """REST mark price — background only; never bypasses the weight governor."""
         if self.is_rest_blocked()[0]:
             return None
+        if not self.can_make_background_rest_call(1) and not self._is_execution_priority():
+            return None
+        if not self._degraded_rest_allowed("mark"):
+            return None
         try:
-            with self.execution_context():
-                data = self._throttled_call(
-                    self.client.futures_mark_price,
-                    symbol=symbol.upper(),
-                    **self.recv_window_param,
-                    execution_priority=True,
-                )
+            data = self._throttled_call(
+                self.client.futures_mark_price,
+                symbol=symbol.upper(),
+                **self.recv_window_param,
+                execution_priority=self._is_execution_priority(),
+            )
             mark = safe_float(data.get("markPrice"))
             return mark if mark > 0 else None
         except Exception as exc:
@@ -2573,11 +2628,13 @@ class BinanceExchangeManager:
             return None
         if self.is_rest_blocked()[0] and not self._is_execution_priority():
             return None
+        if not self._is_execution_priority() and not self.can_make_background_rest_call(1):
+            return None
         try:
             ticker = self._throttled_call(
                 self.client.futures_symbol_ticker,
                 symbol=symbol,
-                execution_priority=True,
+                execution_priority=self._is_execution_priority(),
             )
             price = safe_float(ticker.get("price"))
             return price if price > 0 else None
@@ -2670,7 +2727,7 @@ class BinanceExchangeManager:
             if cached and self._market_data.is_ticker_cache_usable(min_symbols=10):
                 if not self._market_data.needs_ticker_rest_fallback():
                     return cached
-            if self.is_rest_blocked()[0]:
+            if self.is_rest_blocked()[0] or self._ws_reconnect_or_warmup():
                 return cached
             if (
                 Config.ENABLE_REST_TICKER_FALLBACK
@@ -2837,23 +2894,34 @@ class BinanceExchangeManager:
         symbol = symbol.upper()
         if self.is_rest_blocked()[0]:
             return None
+        if not self._is_execution_priority() and not self._degraded_rest_allowed(
+            "position", consume=False
+        ):
+            cached = self._symbol_position_rest_cache.get(symbol)
+            return cached[1] if cached else None
 
         now = time.monotonic()
         min_interval = max(Config.POSITION_REST_VERIFY_MIN_INTERVAL_SECONDS, 5.0)
-        if not force:
+        if self._ws_reconnect_or_warmup():
+            min_interval = max(min_interval, float(Config.WS_DEGRADED_REST_MIN_INTERVAL_SECONDS), 60.0)
+        if not force or self._ws_reconnect_or_warmup():
             cached = self._symbol_position_rest_cache.get(symbol)
             if cached and (now - cached[0]) < min_interval:
                 return cached[1]
 
+        if not self._is_execution_priority() and not self._degraded_rest_allowed(
+            "position"
+        ):
+            cached = self._symbol_position_rest_cache.get(symbol)
+            return cached[1] if cached else None
+
         try:
-            with self.execution_context():
-                raw = self._throttled_call(
-                    self.client.futures_position_information,
-                    symbol=symbol,
-                    execution_priority=True,
-                    allow_during_scan=True,
-                    bypass_account_cache=True,
-                )
+            raw = self._throttled_call(
+                self.client.futures_position_information,
+                symbol=symbol,
+                execution_priority=self._is_execution_priority(),
+                bypass_account_cache=self._is_execution_priority(),
+            )
         except ExchangeRateLimitError as exc:
             error_logger.warning(
                 "REST position verification rate-limited for %s: %s", symbol, exc
@@ -2912,24 +2980,35 @@ class BinanceExchangeManager:
         """Full REST snapshot of open positions; None when REST unavailable."""
         if self.is_rest_blocked()[0]:
             return None
+        if not self._is_execution_priority() and not self._degraded_rest_allowed(
+            "position", consume=False
+        ):
+            return self._all_positions_rest_data
 
         now = time.monotonic()
         min_interval = max(Config.POSITION_REST_FULL_MIN_INTERVAL_SECONDS, 30.0)
+        if self._ws_reconnect_or_warmup():
+            min_interval = max(
+                min_interval, float(Config.WS_DEGRADED_REST_MIN_INTERVAL_SECONDS), 60.0
+            )
         if (
-            not force
+            (not force or self._ws_reconnect_or_warmup())
             and self._all_positions_rest_data is not None
             and (now - self._all_positions_rest_at) < min_interval
         ):
             return self._all_positions_rest_data
 
+        if not self._is_execution_priority() and not self._degraded_rest_allowed(
+            "position"
+        ):
+            return self._all_positions_rest_data
+
         try:
-            with self.execution_context():
-                raw = self._throttled_call(
-                    self.client.futures_position_information,
-                    execution_priority=True,
-                    allow_during_scan=True,
-                    bypass_account_cache=True,
-                )
+            raw = self._throttled_call(
+                self.client.futures_position_information,
+                execution_priority=self._is_execution_priority(),
+                bypass_account_cache=self._is_execution_priority(),
+            )
         except ExchangeRateLimitError as exc:
             error_logger.warning("REST open-positions fetch rate-limited: %s", exc)
             return self._all_positions_rest_data

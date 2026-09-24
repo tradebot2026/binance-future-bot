@@ -202,7 +202,7 @@ class TestWsStaleReconnect(unittest.TestCase):
         ) as rest:
             self.assertTrue(hub._kline_feeds_healthy())
             self.assertFalse(hub._should_reconnect_for_stale_ticker())
-            rest.assert_called()
+            rest.assert_not_called()
             self.assertEqual(hub.get_ws_health_snapshot()["state"], "DEGRADED")
 
     def test_stale_reconnect_cooldown_skips_repeat(self) -> None:
@@ -216,6 +216,28 @@ class TestWsStaleReconnect(unittest.TestCase):
         ), patch.object(hub, "refresh_ticker_cache_from_rest", return_value=12):
             self.assertTrue(hub._stale_reconnect_on_cooldown())
             self.assertFalse(hub._should_reconnect_for_stale_ticker())
+
+    def test_reconnect_and_warmup_skip_ticker_rest(self) -> None:
+        hub = _hub_with_running_ws()
+        fetcher = MagicMock(return_value={"BTCUSDT": {"lastPrice": "1"}})
+        hub.set_ticker_rest_fetcher(fetcher)
+        hub._reconnect_in_progress = True
+        self.assertEqual(hub.refresh_ticker_cache_from_rest(silent=True), 12)
+        fetcher.assert_not_called()
+        hub._reconnect_in_progress = False
+        hub._last_ticker_event_at = 0.0
+        hub._ws_started_at = time.monotonic()
+        self.assertTrue(hub.is_ws_warming_up())
+        self.assertEqual(hub.refresh_ticker_cache_from_rest(silent=True), 12)
+        fetcher.assert_not_called()
+
+    def test_cache_miss_does_not_rest_during_reconnect(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._reconnect_in_progress = True
+        rest_fetcher = MagicMock(return_value=None)
+        df = hub.get_candles("ETHUSDT", "5m", 50, rest_fetcher, allow_rest=True)
+        self.assertTrue(df.empty)
+        rest_fetcher.assert_not_called()
 
 
 if __name__ == "__main__":
