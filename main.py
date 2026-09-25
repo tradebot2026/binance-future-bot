@@ -27,6 +27,8 @@ from logger import error_logger, system_logger
 from manager import TradeManager
 from risk_manager import RiskManager
 from core.instance_lock import acquire_main_lock, release_main_lock
+from core.minute_clock import MinuteScanClock
+from core.scan_warmup import ScanWarmupGate
 from reconciliation import (
     reconcile_positions,
     reconcile_positions_at_startup,
@@ -132,9 +134,16 @@ def _startup_banner() -> None:
         system_logger.warning(
             "Unified/legacy scan flags are ignored — main loop is event-driven only."
         )
+    if Config.SCAN_ALIGN_TO_MINUTE:
+        loop_note = f"1m-aligned (:{int(Config.SCAN_MINUTE_OFFSET_SECONDS):02d})"
+    else:
+        loop_note = f"{Config.SCAN_INTERVAL_SECONDS}s"
+    warmup_s = Config.scan_warmup_seconds()
+    if warmup_s > 0:
+        loop_note += f" | warmup {int(warmup_s)}s"
     system_logger.info(
-        "Loop interval=%ss | max_positions=%s | scan=%s (event-driven) | reporter=%s",
-        Config.SCAN_INTERVAL_SECONDS,
+        "Loop %s | max_positions=%s | scan=%s | reporter=%s",
+        loop_note,
         Config.MAX_POSITIONS,
         "ready" if SCANNER_AVAILABLE else "MISSING",
         "ready" if REPORTER_AVAILABLE else "MISSING",
@@ -652,8 +661,18 @@ def main(controller: Optional[BotController] = None) -> str:
         except Exception as exc:
             error_logger.error("Startup reconciliation failed (continuing): %s", exc)
 
+        scan_warmup = ScanWarmupGate(Config.scan_warmup_seconds())
+        if scan_warmup.in_warmup() and tg is not None:
+            tg.send_message(
+                f"⏳ <b>WARMUP_MODE</b> — populating cache "
+                f"({int(scan_warmup.remaining_seconds())}s). "
+                "Scanner idle; exits stay live."
+            )
+        if scanner is not None and scanner.orchestrator is not None:
+            scanner.subscribe_watchlist_ws_only()
         if (
             scanner is not None
+            and not scan_warmup.in_warmup()
             and Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
             and not market_data.is_rest_blocked()[0]
         ):
@@ -670,6 +689,10 @@ def main(controller: Optional[BotController] = None) -> str:
         last_maintenance = time.monotonic()
         cycle = 0
         consecutive_errors = 0
+        scan_clock = MinuteScanClock(
+            offset_seconds=Config.SCAN_MINUTE_OFFSET_SECONDS,
+            enabled=Config.SCAN_ALIGN_TO_MINUTE,
+        )
 
         while not controller.is_shutdown_requested():
             cycle += 1
@@ -681,7 +704,11 @@ def main(controller: Optional[BotController] = None) -> str:
                     continue
 
                 # Step 0b — One-time deferred REST init (never retried aggressively in loop)
-                if not exchange._full_init_done and not market_data.is_rest_blocked()[0]:
+                if (
+                    not scan_warmup.in_warmup()
+                    and not exchange._full_init_done
+                    and not market_data.is_rest_blocked()[0]
+                ):
                     exchange.ensure_initialized()
 
                 # Step 1 — Periodic DB/exchange reconciliation (every 15 min)
@@ -700,7 +727,11 @@ def main(controller: Optional[BotController] = None) -> str:
                             "Late-fill reconcile confirmed %s position(s).", late
                         )
                     last_uncertain_reconcile = now_mono
-                if now_mono - last_reconciliation >= Config.RECONCILIATION_INTERVAL_SECONDS:
+                if (
+                    not scan_warmup.in_warmup()
+                    and now_mono - last_reconciliation
+                    >= Config.RECONCILIATION_INTERVAL_SECONDS
+                ):
                     if not market_data.is_rest_blocked()[0]:
                         reconcile_positions(
                             exchange, db, tg, manager=manager, context="periodic"
@@ -713,13 +744,18 @@ def main(controller: Optional[BotController] = None) -> str:
                     db.run_maintenance(retention_days=Config.DB_RETENTION_DAYS, vacuum=True)
                     last_maintenance = now_mono
 
-                # Step 2 — Scan and execute only when entries are allowed
-                if scanner is None:
+                # Step 2 — Scan only after warm-up, once per 1m close
+                if scan_warmup.in_warmup():
+                    scan_warmup.maybe_log_progress()
+                elif scanner is None:
                     if cycle == 1:
                         system_logger.warning(
                             "scanner.py not found — entries disabled until scanner is added."
                         )
                 else:
+                    if scan_warmup.just_finished():
+                        scanner.subscribe_watchlist_ws_only()
+                        scan_clock.skip_current_minute()
                     allowed, gate_reason = _entries_allowed(scheduler, risk, db)
                     if allowed:
                         if scanner.orchestrator is None:
@@ -729,24 +765,30 @@ def main(controller: Optional[BotController] = None) -> str:
                                     "entries skipped (legacy scan loops removed)."
                                 )
                         else:
-                            if cycle == 1:
-                                scanner.refresh_event_universe()
-                            candidates = scanner.process_priority_scan_cycle()
-                            if (
-                                Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
-                                and not market_data.is_rest_blocked()[0]
-                            ):
-                                scanner.bootstrap_background_klines()
-                            _execute_candidates(
-                                candidates=candidates,
-                                executor=executor,
-                                risk=risk,
-                                scheduler=scheduler,
-                                db=db,
-                                tg=tg,
-                                critical_alerts=critical_alerts,
-                                manager=manager,
-                            )
+                            if scan_clock.due():
+                                candidates = scanner.process_priority_scan_cycle()
+                                _execute_candidates(
+                                    candidates=candidates,
+                                    executor=executor,
+                                    risk=risk,
+                                    scheduler=scheduler,
+                                    db=db,
+                                    tg=tg,
+                                    critical_alerts=critical_alerts,
+                                    manager=manager,
+                                )
+                                warmed = scanner.warmup_and_evaluate_kline_misses()
+                                if warmed:
+                                    _execute_candidates(
+                                        candidates=warmed,
+                                        executor=executor,
+                                        risk=risk,
+                                        scheduler=scheduler,
+                                        db=db,
+                                        tg=tg,
+                                        critical_alerts=critical_alerts,
+                                        manager=manager,
+                                    )
                     elif gate_reason:
                         system_logger.info("Entries paused: %s", gate_reason)
 
@@ -758,9 +800,15 @@ def main(controller: Optional[BotController] = None) -> str:
                 if now - last_heartbeat >= Config.HEARTBEAT_SECONDS:
                     snap = risk.get_risk_snapshot()
                     is_paused, _ = scheduler.is_entry_paused()
+                    scan_mode = (
+                        ScanWarmupGate.MODE_WARMUP
+                        if scan_warmup.in_warmup()
+                        else ScanWarmupGate.MODE_ACTIVE
+                    )
                     system_logger.info(
-                        "Heartbeat | cycle=%s | exchange_open=%s | paused=%s | "
+                        "Heartbeat | mode=%s | cycle=%s | exchange_open=%s | paused=%s | "
                         "realized_pnl=$%.2f (%.2f%%) | unrealized=$%.2f | drawdown=%.2f%%",
+                        scan_mode,
                         cycle,
                         snap.exchange_open_positions,
                         is_paused,
@@ -786,10 +834,15 @@ def main(controller: Optional[BotController] = None) -> str:
                 break
 
             elapsed = time.monotonic() - loop_started
-            sleep_for = max(Config.SCAN_INTERVAL_SECONDS - elapsed, 0.5)
+            idle = max(float(Config.LOOP_IDLE_SECONDS), 0.2)
+            if Config.SCAN_ALIGN_TO_MINUTE:
+                until_mark = scan_clock.seconds_until_due()
+                sleep_for = min(idle, max(until_mark, 0.05))
+            else:
+                sleep_for = max(Config.SCAN_INTERVAL_SECONDS - elapsed, idle)
             slept = 0.0
             while slept < sleep_for and not controller.is_shutdown_requested():
-                chunk = min(1.0, sleep_for - slept)
+                chunk = min(0.25, sleep_for - slept)
                 time.sleep(chunk)
                 slept += chunk
 

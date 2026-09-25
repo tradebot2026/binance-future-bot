@@ -87,6 +87,16 @@ class EventScheduler:
         with self._lock:
             return len(self._heap)
 
+    def requeue(self, event: CandleCloseEvent, *, delay_seconds: float = 2.0) -> None:
+        """Put a drained event back on the heap after a kline-cache miss."""
+        symbol = event.symbol.upper()
+        key = (symbol, event.timeframe, event.bar_open_ms)
+        with self._lock:
+            self._seq += 1
+            due_at = time.monotonic() + max(float(delay_seconds), 0.0)
+            self._seen[key] = time.monotonic()
+            heapq.heappush(self._heap, (due_at, self._seq, event))
+
     def mark_evaluated(self, symbol: str, timeframe: str, bar_open_ms: int) -> None:
         symbol = symbol.upper()
         with self._lock:

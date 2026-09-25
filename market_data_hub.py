@@ -765,6 +765,13 @@ class MarketDataHub:
                 continue
             self._maybe_keepalive_user_listen_key()
             self._check_kline_sockets_health()
+            scan_warm = Config.scan_warmup_seconds()
+            if (
+                scan_warm > 0
+                and self._ws_started_at > 0
+                and (time.monotonic() - self._ws_started_at) < scan_warm
+            ):
+                continue
             blocked, _ = self.is_rest_blocked()
             if (
                 not blocked

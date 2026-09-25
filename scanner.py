@@ -110,6 +110,12 @@ class MarketScanner:
             return []
         return self.orchestrator.refresh_tier1_universe(force=True)
 
+    def subscribe_watchlist_ws_only(self) -> list[str]:
+        """Subscribe kline streams from the current WS ticker cache — no REST."""
+        if self.orchestrator is None:
+            return []
+        return self.orchestrator.refresh_tier1_universe(force=True, allow_rest=False)
+
     def process_event_scan_cycle(self) -> List[Dict[str, Any]]:
         """Drain candle-close queue and return execution candidates."""
         if self.orchestrator is None:
@@ -140,35 +146,25 @@ class MarketScanner:
         return self.ensure_scan_klines_ready(symbols)
 
     def bootstrap_background_klines(self) -> int:
-        """Paced REST bootstrap for one background symbol per call."""
+        """Paced REST bootstrap for queued scan misses / one background symbol."""
         if (
             not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
             or not self._hub
             or self.orchestrator is None
         ):
             return 0
-        if self.exchange.in_scan_mode:
-            return 0
-        if getattr(self.exchange, "_ws_reconnect_or_warmup", lambda: False)():
-            return 0
-        if not self.exchange.can_make_background_rest_call(5):
-            return 0
-
-        symbols = self.orchestrator.take_kline_cache_misses(2)
+        symbols = self.orchestrator.take_kline_cache_misses(8)
         if not symbols:
             symbols = self.orchestrator.priority_queue.next_background_bootstrap_symbols(1)
         if not symbols:
             return 0
+        return self.orchestrator._bootstrap_missing_scan_klines(symbols)
 
-        timeframes = Config.get_scan_kline_intervals()
-        self._hub.subscribe_kline_streams(symbols)
-        with self.exchange.bootstrap_context():
-            return self._hub.bootstrap_klines_for_symbols(
-                symbols,
-                timeframes,
-                self.exchange.fetch_bootstrap_klines_df,
-                max_pairs=len(timeframes) * len(symbols),
-            )
+    def warmup_and_evaluate_kline_misses(self) -> List[Dict[str, Any]]:
+        """WS-subscribe queued misses; evaluate only if the cache filled organically."""
+        if self.orchestrator is None:
+            return []
+        return self.orchestrator.warmup_and_evaluate_kline_misses()
 
     def get_tier2_summary(self) -> list[tuple[str, str, float]]:
         """Return Tier-2 active coins: (symbol, strategy, score)."""

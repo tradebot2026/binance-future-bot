@@ -17,6 +17,7 @@ from core.types import CandleCloseEvent, SignalCandidate
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from executor import log_execution_rejected, log_scan_rejected
+from indicators.market_analyzer import MIN_ANALYZER_BARS
 from logger import log_trade_approved, scanner_logger
 from pipeline.snapshot_factory import SnapshotFactory
 from pipeline.universe_builder import UniverseBuilder
@@ -52,6 +53,7 @@ class EventScanOrchestrator:
         self._last_catchup_at: float = 0.0
         self._last_universe_refresh_at: float = 0.0
         self._kline_cache_misses: list[str] = []
+        self._kline_pending_log_at: dict[str, float] = {}
 
     @property
     def tier1_symbols(self) -> list[str]:
@@ -70,7 +72,218 @@ class EventScanOrchestrator:
         self._kline_cache_misses = self._kline_cache_misses[n:]
         return taken
 
-    def refresh_tier1_universe(self, *, force: bool = False) -> list[str]:
+    def _log_kline_warmup_pending(self, symbol: str) -> None:
+        """Rate-limited notice — not SCAN_REJECTED. Cache is warming, not a setup fail."""
+        key = str(symbol or "").upper()
+        if not key:
+            return
+        now = time.monotonic()
+        last = self._kline_pending_log_at.get(key, 0.0)
+        if (now - last) < 60.0:
+            return
+        self._kline_pending_log_at[key] = now
+        scanner_logger.info(
+            "[SCAN_KLINE_WARMUP] %s — snapshot deferred, REST/WS kline bootstrap queued",
+            key,
+        )
+
+    def _partition_kline_ready(
+        self, symbols: list[str]
+    ) -> tuple[list[str], list[str]]:
+        ready: list[str] = []
+        missing: list[str] = []
+        for raw in symbols:
+            symbol = str(raw or "").upper()
+            if not symbol:
+                continue
+            if self.snapshot_factory.has_complete_klines(symbol):
+                ready.append(symbol)
+            else:
+                missing.append(symbol)
+        return ready, missing
+
+    def _note_missing_scan_klines(
+        self,
+        symbols: list[str],
+        *,
+        events: Optional[dict[str, CandleCloseEvent]] = None,
+    ) -> None:
+        for symbol in symbols:
+            self.note_kline_cache_miss(symbol)
+            self._log_kline_warmup_pending(symbol)
+            event = (events or {}).get(symbol)
+            if event is not None:
+                self.event_scheduler.requeue(event, delay_seconds=2.0)
+
+    def _bootstrap_missing_scan_klines(self, symbols: list[str]) -> int:
+        """Governor-gated REST backfill for scanned symbols. Never runs in scan_context."""
+        if not symbols or self._hub is None:
+            return 0
+        if self.exchange.in_scan_mode:
+            return 0
+        if not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP:
+            return 0
+        if getattr(self.exchange, "_ws_reconnect_or_warmup", lambda: False)():
+            return 0
+        can_boot = getattr(self.exchange, "can_bootstrap_klines_rest", None)
+        if callable(can_boot) and not can_boot():
+            return 0
+        can_rest = getattr(self.exchange, "can_make_background_rest_call", None)
+        if callable(can_rest) and not can_rest(2):
+            return 0
+
+        missing = [
+            symbol
+            for symbol in symbols
+            if not self.snapshot_factory.has_complete_klines(symbol)
+        ]
+        if not missing:
+            return 0
+
+        timeframes = Config.get_scan_kline_intervals()
+        self._hub.subscribe_kline_streams(missing)
+        with self.exchange.bootstrap_context():
+            return self._hub.bootstrap_klines_for_symbols(
+                missing,
+                timeframes,
+                self.exchange.fetch_bootstrap_klines_df,
+            )
+
+    def _evaluate_symbols_ws(
+        self,
+        symbols: list[str],
+        *,
+        timeframe: str,
+        open_symbols: set[str],
+        ticker_map: dict[str, Any],
+        book_map: dict[str, Any],
+        event_by_symbol: Optional[dict[str, CandleCloseEvent]] = None,
+    ) -> list[SignalCandidate]:
+        if not symbols:
+            return []
+        candidates: list[SignalCandidate] = []
+        with self.exchange.scan_context():
+            for symbol in symbols:
+                event = (event_by_symbol or {}).get(symbol)
+                bar_open_ms = 0
+                eval_tf = timeframe
+                if event is not None:
+                    bar_open_ms = event.bar_open_ms
+                    eval_tf = event.timeframe
+                elif self._hub:
+                    closed = self._hub.get_last_closed_bar_open_ms(symbol, timeframe)
+                    if closed:
+                        bar_open_ms = closed
+                signal = self._evaluate_symbol(
+                    symbol,
+                    bar_open_ms=bar_open_ms,
+                    timeframe=eval_tf,
+                    open_symbols=open_symbols,
+                    ticker_map=ticker_map,
+                    book_map=book_map,
+                    mark_event=event,
+                )
+                if signal is not None:
+                    candidates.append(signal)
+        return candidates
+
+    def warmup_and_evaluate_kline_misses(self) -> list[dict[str, Any]]:
+        """WS-subscribe queued misses. No REST bootstrap. Rescan if cache filled."""
+        halted, reason = self._scan_gate_open()
+        if halted:
+            scanner_logger.debug("Kline warmup skipped — %s", reason)
+            return []
+
+        symbols = self.take_kline_cache_misses(16)
+        if not symbols:
+            return []
+
+        if self._hub is not None:
+            self._hub.subscribe_kline_streams(symbols)
+        self._maybe_fetch_single_closed_kline(symbols)
+
+        ready, still = self._partition_kline_ready(symbols)
+        for symbol in still:
+            self.note_kline_cache_miss(symbol)
+        if not ready:
+            return []
+
+        open_symbols = self._open_symbols()
+        ticker_map = self._ws_ticker_map()
+        book_map = self._ws_book_map(ticker_map)
+        trigger_tfs = Config.get_scan_trigger_timeframes()
+        primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
+        candidates = self._evaluate_symbols_ws(
+            ready,
+            timeframe=primary_tf,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+        )
+        dict_results = [c.to_dict() for c in candidates]
+        if dict_results:
+            self.db.update_watchlist(dict_results)
+            scanner_logger.info(
+                "Kline warmup scan dispatching %s execution candidate(s) from %s warmed symbol(s).",
+                len(dict_results),
+                len(ready),
+            )
+        return dict_results
+
+    def _maybe_fetch_single_closed_kline(self, symbols: list[str]) -> None:
+        """At most one limit=2 REST kline for a nearly-complete hot symbol."""
+        if not symbols or self._hub is None or self.exchange.in_scan_mode:
+            return
+        if getattr(self.exchange, "_ws_reconnect_or_warmup", lambda: False)():
+            return
+        can_boot = getattr(self.exchange, "can_bootstrap_klines_rest", None)
+        if callable(can_boot) and not can_boot():
+            return
+        can_rest = getattr(self.exchange, "can_make_background_rest_call", None)
+        if callable(can_rest) and not can_rest(2):
+            return
+
+        try:
+            hot = {str(s).upper() for s in (self.priority_queue.hot_symbols or [])}
+        except Exception:
+            hot = set()
+        target = next((s for s in symbols if s.upper() in hot), "")
+        if not target:
+            return
+
+        timeframes = Config.get_scan_kline_intervals()
+        need_tf = ""
+        for tf in timeframes:
+            cached = self._hub.get_candles_cached_only(
+                target, tf, Config.CANDLE_FETCH_LIMIT
+            )
+            n = 0 if cached is None or getattr(cached, "empty", True) else len(cached)
+            if MIN_ANALYZER_BARS - 2 <= n < MIN_ANALYZER_BARS:
+                need_tf = tf
+                break
+        if not need_tf:
+            return
+
+        try:
+            with self.exchange.bootstrap_context():
+                df = self.exchange.fetch_bootstrap_klines_df(target, need_tf, 2)
+        except Exception:
+            return
+        if df is None or getattr(df, "empty", True):
+            return
+        try:
+            self._hub.seed_klines_from_dataframe(target, need_tf, df)
+        except Exception:
+            return
+        scanner_logger.info(
+            "[SCAN_KLINE_TOPUP] %s %s — fetched latest closed bar (limit=2)",
+            target,
+            need_tf,
+        )
+
+    def refresh_tier1_universe(
+        self, *, force: bool = False, allow_rest: bool = True
+    ) -> list[str]:
         """Rebuild Tier-1 watchlist and subscribe WS klines."""
         now = time.monotonic()
         if (
@@ -82,12 +295,16 @@ class EventScanOrchestrator:
             return self._tier1_symbols
 
         if self._hub:
-            ready = self._hub.ensure_ticker_cache_ready(
-                rest_seeder=self.exchange.fetch_futures_ticker_map_rest,
-            )
+            if allow_rest:
+                ready = self._hub.ensure_ticker_cache_ready(
+                    rest_seeder=self.exchange.fetch_futures_ticker_map_rest,
+                )
+            else:
+                ready = bool(self._hub.get_ticker_map())
             if not ready:
                 scanner_logger.warning(
-                    "Tier1 refresh skipped — ticker cache unavailable (WS+REST)."
+                    "Tier1 refresh skipped — ticker cache unavailable%s.",
+                    "" if allow_rest else " (WS-only warm-up)",
                 )
                 return self._tier1_symbols
 
@@ -207,10 +424,10 @@ class EventScanOrchestrator:
 
     def process_priority_scan_cycle(self) -> list[dict[str, Any]]:
         """
-        Tiered scan cycle:
-        - Hot watchlist: WS-only poll every HOT_SCAN_INTERVAL_SECONDS
-        - Background queue: rotate small batches with pacing
-        - Candle-close events: existing event-driven path
+        One aligned scan tick (normally once per 1m close):
+        - Hot watchlist: WS-only
+        - Background queue: one rotating batch
+        - Candle-close events drained since the previous tick
         """
         halted, reason = self._scan_gate_open()
         if halted:
@@ -270,25 +487,15 @@ class EventScanOrchestrator:
         book_map = self._ws_book_map(ticker_map)
         trigger_tfs = Config.get_scan_trigger_timeframes()
         primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
-        candidates: list[SignalCandidate] = []
-
-        with self.exchange.scan_context():
-            for symbol in symbols:
-                bar_open_ms = 0
-                if self._hub:
-                    closed = self._hub.get_last_closed_bar_open_ms(symbol, primary_tf)
-                    if closed:
-                        bar_open_ms = closed
-                signal = self._evaluate_symbol(
-                    symbol,
-                    bar_open_ms=bar_open_ms,
-                    timeframe=primary_tf,
-                    open_symbols=open_symbols,
-                    ticker_map=ticker_map,
-                    book_map=book_map,
-                )
-                if signal is not None:
-                    candidates.append(signal)
+        ready, missing = self._partition_kline_ready(symbols)
+        self._note_missing_scan_klines(missing)
+        candidates = self._evaluate_symbols_ws(
+            ready,
+            timeframe=primary_tf,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+        )
 
         if run_hot:
             self.priority_queue.mark_hot_scan_complete()
@@ -320,25 +527,15 @@ class EventScanOrchestrator:
         book_map = self._ws_book_map(ticker_map)
         trigger_tfs = Config.get_scan_trigger_timeframes()
         primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
-        candidates: list[SignalCandidate] = []
-
-        with self.exchange.scan_context():
-            for symbol in batch:
-                bar_open_ms = 0
-                if self._hub:
-                    closed = self._hub.get_last_closed_bar_open_ms(symbol, primary_tf)
-                    if closed:
-                        bar_open_ms = closed
-                signal = self._evaluate_symbol(
-                    symbol,
-                    bar_open_ms=bar_open_ms,
-                    timeframe=primary_tf,
-                    open_symbols=open_symbols,
-                    ticker_map=ticker_map,
-                    book_map=book_map,
-                )
-                if signal is not None:
-                    candidates.append(signal)
+        ready, missing = self._partition_kline_ready(batch)
+        self._note_missing_scan_klines(missing)
+        candidates = self._evaluate_symbols_ws(
+            ready,
+            timeframe=primary_tf,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+        )
 
         self.priority_queue.mark_last_background_batch_evaluated()
         if candidates:
@@ -358,21 +555,24 @@ class EventScanOrchestrator:
         open_symbols = self._open_symbols()
         ticker_map = self._ws_ticker_map()
         book_map = self._ws_book_map(ticker_map)
-        candidates: list[SignalCandidate] = []
-
-        with self.exchange.scan_context():
-            for event in events:
-                signal = self._evaluate_symbol(
-                    event.symbol,
-                    bar_open_ms=event.bar_open_ms,
-                    timeframe=event.timeframe,
-                    open_symbols=open_symbols,
-                    ticker_map=ticker_map,
-                    book_map=book_map,
-                    mark_event=event,
-                )
-                if signal is not None:
-                    candidates.append(signal)
+        event_by_symbol: dict[str, CandleCloseEvent] = {}
+        symbols: list[str] = []
+        for event in events:
+            key = event.symbol.upper()
+            if key in event_by_symbol:
+                continue
+            event_by_symbol[key] = event
+            symbols.append(key)
+        ready, missing = self._partition_kline_ready(symbols)
+        self._note_missing_scan_klines(missing, events=event_by_symbol)
+        candidates = self._evaluate_symbols_ws(
+            ready,
+            timeframe=events[0].timeframe,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+            event_by_symbol=event_by_symbol,
+        )
 
         if candidates:
             scanner_logger.info(
@@ -426,13 +626,9 @@ class EventScanOrchestrator:
         )
         if snapshot is None:
             self.note_kline_cache_miss(symbol)
-            log_scan_rejected(
-                symbol, "snapshot unavailable (WS kline cache miss)"
-            )
+            self._log_kline_warmup_pending(symbol)
             if mark_event is not None:
-                self.event_scheduler.mark_evaluated(
-                    symbol, mark_event.timeframe, mark_event.bar_open_ms
-                )
+                self.event_scheduler.requeue(mark_event, delay_seconds=2.0)
             return None
 
         scores, first_pass = self.scoring_engine.evaluate_symbol_detailed(

@@ -189,6 +189,10 @@ class Config:
         os.getenv("TREND_TIMEFRAME", "1h"),
     ]
     SCAN_INTERVAL_SECONDS: int = _env_int("SCAN_INTERVAL_SECONDS", 15)
+    SCAN_ALIGN_TO_MINUTE: bool = _env_bool("SCAN_ALIGN_TO_MINUTE", True)
+    SCAN_MINUTE_OFFSET_SECONDS: float = _env_float("SCAN_MINUTE_OFFSET_SECONDS", 1.0)
+    LOOP_IDLE_SECONDS: float = _env_float("LOOP_IDLE_SECONDS", 0.5)
+    SCAN_WARMUP_SECONDS: float = _env_float("SCAN_WARMUP_SECONDS", 240.0)
     POSITION_GRACE_PERIOD_SECONDS: float = _env_float(
         "POSITION_GRACE_PERIOD_SECONDS", 45.0
     )
@@ -801,6 +805,21 @@ class Config:
                 min(cls.TIER2_PROMOTE_NORMALIZED, cls.TIER2_PROMOTE_NORMALIZED_TESTNET)
             )
         return float(cls.TIER2_PROMOTE_NORMALIZED)
+
+    @classmethod
+    def scan_cycle_seconds(cls) -> float:
+        """Effective scan cadence: 60s when aligned to the 1m close."""
+        if cls.SCAN_ALIGN_TO_MINUTE:
+            return 60.0
+        return float(max(cls.SCAN_INTERVAL_SECONDS, 1))
+
+    @classmethod
+    def scan_warmup_seconds(cls) -> float:
+        """Startup scanner idle window (3–5 minutes) so WS caches can fill."""
+        raw = float(cls.SCAN_WARMUP_SECONDS)
+        if raw <= 0:
+            return 0.0
+        return min(max(raw, 180.0), 300.0)
 
     @classmethod
     def get_scan_kline_intervals(cls) -> list[str]:

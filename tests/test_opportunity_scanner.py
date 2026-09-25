@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
+
+import pandas as pd
 
 from config import Config
 from core.opportunity_tracker import (
@@ -15,8 +18,10 @@ from core.opportunity_tracker import (
     build_score_context,
     composite_opportunity_score,
 )
+from core.minute_clock import MinuteScanClock
 from core.scan_priority_queue import ScanPriorityQueue
-from core.types import CoinLifecycle, SignalCandidate
+from core.scan_warmup import ScanWarmupGate
+from core.types import CandleCloseEvent, CoinLifecycle, SignalCandidate
 from database import DatabaseManager
 from exceptions import DatabaseError
 from pipeline.event_scan_orchestrator import EventScanOrchestrator
@@ -413,6 +418,157 @@ class TestRegimeRouterMapping(unittest.TestCase):
         self.assertIn("SMC_TREND", tags)
         self.assertIn("RANGE_REVERSION", tags)
         self.assertNotIn("VWAP_MEAN_REVERSION", tags)
+
+
+class TestMinuteScanClock(unittest.TestCase):
+    def test_fires_once_per_minute_after_offset(self) -> None:
+        clock = MinuteScanClock(offset_seconds=1.0, enabled=True)
+        minute = 1_700_000_000 // 60 * 60
+        self.assertFalse(clock.due(minute + 0.2))
+        self.assertTrue(clock.due(minute + 1.05))
+        self.assertFalse(clock.due(minute + 15.0))
+        self.assertTrue(clock.due(minute + 61.1))
+
+    def test_disabled_clock_is_always_due(self) -> None:
+        clock = MinuteScanClock(offset_seconds=1.0, enabled=False)
+        self.assertTrue(clock.due(100.0))
+        self.assertTrue(clock.due(100.0))
+
+    def test_skip_current_minute_waits_for_next_close(self) -> None:
+        clock = MinuteScanClock(offset_seconds=1.0, enabled=True)
+        minute = 1_700_000_060
+        clock.skip_current_minute(minute + 10.0)
+        self.assertFalse(clock.due(minute + 15.0))
+        self.assertTrue(clock.due(minute + 61.1))
+
+    def test_aligned_queue_does_not_wait_on_hot_timer(self) -> None:
+        queue = ScanPriorityQueue()
+        queue._hot = ["ETHUSDT"]
+        queue._last_hot_scan_at = time.monotonic()
+        with patch.object(Config, "SCAN_ALIGN_TO_MINUTE", True):
+            self.assertTrue(queue.should_run_hot_scan())
+        with patch.object(Config, "SCAN_ALIGN_TO_MINUTE", False), patch.object(
+            Config, "HOT_SCAN_INTERVAL_SECONDS", 20.0
+        ):
+            self.assertFalse(queue.should_run_hot_scan())
+
+
+class TestScanWarmupGate(unittest.TestCase):
+    def test_warmup_holds_then_announces_active(self) -> None:
+        gate = ScanWarmupGate(180.0)
+        gate._started_at = time.monotonic() - 10.0
+        self.assertTrue(gate.in_warmup())
+        self.assertFalse(gate.just_finished())
+        gate._started_at = time.monotonic() - 181.0
+        self.assertFalse(gate.in_warmup())
+        self.assertTrue(gate.just_finished())
+        self.assertFalse(gate.just_finished())
+
+    def test_zero_duration_skips_warmup(self) -> None:
+        gate = ScanWarmupGate(0.0)
+        self.assertFalse(gate.in_warmup())
+        self.assertFalse(gate.just_finished())
+
+    def test_config_clamps_warmup_to_3_5_minutes(self) -> None:
+        with patch.object(Config, "SCAN_WARMUP_SECONDS", 60.0):
+            self.assertEqual(Config.scan_warmup_seconds(), 180.0)
+        with patch.object(Config, "SCAN_WARMUP_SECONDS", 400.0):
+            self.assertEqual(Config.scan_warmup_seconds(), 300.0)
+        with patch.object(Config, "SCAN_WARMUP_SECONDS", 0.0):
+            self.assertEqual(Config.scan_warmup_seconds(), 0.0)
+
+
+class TestKlineWarmupScan(unittest.TestCase):
+    def test_has_complete_klines_requires_analyzer_bars(self) -> None:
+        from pipeline.snapshot_factory import SnapshotFactory
+
+        exchange = MagicMock()
+        factory = SnapshotFactory(exchange)
+        exchange.fetch_historical_candles.return_value = pd.DataFrame(
+            {"close": [1.0] * 40}
+        )
+        self.assertFalse(factory.has_complete_klines("ENAUSDT"))
+        exchange.fetch_historical_candles.return_value = pd.DataFrame(
+            {"close": [1.0] * 250}
+        )
+        self.assertTrue(factory.has_complete_klines("ENAUSDT"))
+
+    def test_cache_miss_is_queued_without_scan_rejected(self) -> None:
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch.snapshot_factory = MagicMock()
+        orch.snapshot_factory.build.return_value = None
+        orch._kline_cache_misses = []
+        orch._kline_pending_log_at = {}
+        orch._price_map = {"ENAUSDT": 1.0}
+        orch._volume_ranks = {}
+        orch._hub = None
+        orch.priority_queue = MagicMock()
+        orch.priority_queue.rotation.is_in_evaluated_memory.return_value = False
+        orch.priority_queue.is_priority.return_value = True
+        orch.assignment_manager = MagicMock()
+        orch.event_scheduler = MagicMock()
+        event = CandleCloseEvent(
+            symbol="ENAUSDT", timeframe="5m", bar_open_ms=1
+        )
+        with patch(
+            "pipeline.event_scan_orchestrator.log_scan_rejected"
+        ) as rejected:
+            out = orch._evaluate_symbol(
+                "ENAUSDT",
+                bar_open_ms=1,
+                timeframe="5m",
+                open_symbols=set(),
+                ticker_map={"ENAUSDT": {"lastPrice": 1.0, "quoteVolume": 1.0}},
+                book_map={},
+                mark_event=event,
+            )
+        self.assertIsNone(out)
+        rejected.assert_not_called()
+        orch.event_scheduler.mark_evaluated.assert_not_called()
+        orch.event_scheduler.requeue.assert_called_once()
+        self.assertEqual(orch.take_kline_cache_misses(1), ["ENAUSDT"])
+
+    def test_warmup_skips_rest_when_governor_blocks(self) -> None:
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch._hub = MagicMock()
+        orch.exchange = MagicMock()
+        orch.exchange.in_scan_mode = False
+        orch.exchange._ws_reconnect_or_warmup.return_value = False
+        orch.exchange.can_bootstrap_klines_rest.return_value = False
+        orch.snapshot_factory = MagicMock()
+        orch.snapshot_factory.has_complete_klines.return_value = False
+        seeded = orch._bootstrap_missing_scan_klines(["ENAUSDT"])
+        self.assertEqual(seeded, 0)
+        orch.exchange.bootstrap_context.assert_not_called()
+        orch.exchange.fetch_bootstrap_klines_df.assert_not_called()
+
+    def test_warmup_evaluates_only_symbols_that_filled(self) -> None:
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch._hub = MagicMock()
+        orch.exchange = MagicMock()
+        orch.exchange.in_scan_mode = False
+        orch.db = MagicMock()
+        orch.priority_queue = MagicMock()
+        orch.priority_queue.hot_symbols = []
+        orch._kline_cache_misses = ["ENAUSDT", "BBUSDT"]
+        orch._kline_pending_log_at = {}
+        orch._scan_gate_open = MagicMock(return_value=(False, ""))
+        orch._bootstrap_missing_scan_klines = MagicMock(return_value=3)
+        orch._partition_kline_ready = MagicMock(
+            return_value=(["ENAUSDT"], ["BBUSDT"])
+        )
+        orch._open_symbols = MagicMock(return_value=set())
+        orch._ws_ticker_map = MagicMock(return_value={})
+        orch._ws_book_map = MagicMock(return_value={})
+        orch._evaluate_symbols_ws = MagicMock(
+            return_value=[_candidate("ENAUSDT", 80.0)]
+        )
+        out = orch.warmup_and_evaluate_kline_misses()
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]["symbol"], "ENAUSDT")
+        orch._bootstrap_missing_scan_klines.assert_not_called()
+        orch._hub.subscribe_kline_streams.assert_called()
+        self.assertEqual(orch._kline_cache_misses, ["BBUSDT"])
 
 
 if __name__ == "__main__":

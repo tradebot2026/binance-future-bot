@@ -83,6 +83,23 @@ class SnapshotFactory:
             )
         return snapshot
 
+    def has_complete_klines(
+        self,
+        symbol: str,
+        timeframes: Optional[tuple[str, ...]] = None,
+    ) -> bool:
+        """True when every scan timeframe already has enough WS/cache bars."""
+        tfs = timeframes or (
+            Config.ENTRY_TIMEFRAME,
+            Config.CONFIRM_TIMEFRAME,
+            Config.TREND_TIMEFRAME,
+        )
+        for tf in tfs:
+            df = self._fetch_candles(symbol, tf)
+            if df.empty:
+                return False
+        return True
+
     def _fetch_candles(self, symbol: str, timeframe: str) -> pd.DataFrame:
         try:
             df = self.exchange.fetch_historical_candles(

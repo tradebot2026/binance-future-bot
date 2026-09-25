@@ -802,7 +802,7 @@ class TelegramManager:
                 tier1_background=tiers.get("tier1_background", []),
                 tier1_full=tiers.get("tier1_full", []),
                 tier2_rows=tiers.get("tier2", []),
-                hot_scan_interval=Config.HOT_SCAN_INTERVAL_SECONDS,
+                hot_scan_interval=Config.scan_cycle_seconds(),
                 tier2_display_limit=Config.TIER2_HOT_SIZE,
                 tier2_near_miss=tiers.get("tier2_near_miss", []),
                 rotation_cycle=int(tiers.get("rotation_cycle") or 0),

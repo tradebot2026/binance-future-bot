@@ -252,6 +252,15 @@ class TestMainLoopIsEventDriven(unittest.TestCase):
 
         source = inspect.getsource(main_mod.main)
         self.assertIn("process_priority_scan_cycle", source)
+        self.assertIn("warmup_and_evaluate_kline_misses", source)
+        self.assertIn("MinuteScanClock", source)
+        self.assertIn("scan_clock.due", source)
+        self.assertIn("ScanWarmupGate", source)
+        self.assertIn("WARMUP_MODE", source)
+        from core.scan_warmup import ScanWarmupGate
+
+        self.assertEqual(ScanWarmupGate.MODE_WARMUP, "WARMUP_MODE")
+        self.assertEqual(ScanWarmupGate.MODE_ACTIVE, "ACTIVE_SCANNING_MODE")
         self.assertNotIn("scan_unified()", source)
         self.assertNotIn("scan_range_market()", source)
         self.assertNotIn("scan_market()", source)
