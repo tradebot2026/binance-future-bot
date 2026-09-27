@@ -115,8 +115,22 @@ class EventScanOrchestrator:
             if event is not None:
                 self.event_scheduler.requeue(event, delay_seconds=2.0)
 
+    def _next_bootstrap_symbol(self, queued: list[str]) -> str:
+        """Prefer a hot miss; otherwise the first queued not-ready symbol."""
+        if not queued:
+            return ""
+        try:
+            hot = {str(s).upper() for s in (self.priority_queue.hot_symbols or [])}
+        except Exception:
+            hot = set()
+        for raw in queued:
+            symbol = str(raw or "").upper()
+            if symbol and symbol in hot:
+                return symbol
+        return str(queued[0] or "").upper()
+
     def _bootstrap_missing_scan_klines(self, symbols: list[str]) -> int:
-        """Governor-gated REST backfill for scanned symbols. Never runs in scan_context."""
+        """Governor-gated REST backfill for one not-ready symbol. Never in scan_context."""
         if not symbols or self._hub is None:
             return 0
         if self.exchange.in_scan_mode:
@@ -135,19 +149,39 @@ class EventScanOrchestrator:
         missing = [
             symbol
             for symbol in symbols
-            if not self.snapshot_factory.has_complete_klines(symbol)
+            if symbol and not self.snapshot_factory.has_complete_klines(symbol)
         ]
         if not missing:
             return 0
 
+        target = self._next_bootstrap_symbol(missing)
+        if not target:
+            return 0
+
         timeframes = Config.get_scan_kline_intervals()
-        self._hub.subscribe_kline_streams(missing)
-        with self.exchange.bootstrap_context():
-            return self._hub.bootstrap_klines_for_symbols(
-                missing,
-                timeframes,
-                self.exchange.fetch_bootstrap_klines_df,
+        try:
+            self._hub.subscribe_kline_streams([target])
+            with self.exchange.bootstrap_context():
+                seeded = self._hub.bootstrap_klines_for_symbols(
+                    [target],
+                    timeframes,
+                    self.exchange.fetch_bootstrap_klines_df,
+                    max_pairs=len(timeframes),
+                )
+        except Exception as exc:
+            scanner_logger.warning(
+                "[SCAN_KLINE_BOOTSTRAP] %s failed — %s",
+                target,
+                exc,
             )
+            return 0
+
+        scanner_logger.info(
+            "[SCAN_KLINE_BOOTSTRAP] %s — seeded=%s series (missing TFs only)",
+            target,
+            seeded,
+        )
+        return int(seeded or 0)
 
     def _evaluate_symbols_ws(
         self,
@@ -188,21 +222,37 @@ class EventScanOrchestrator:
         return candidates
 
     def warmup_and_evaluate_kline_misses(self) -> list[dict[str, Any]]:
-        """WS-subscribe queued misses. No REST bootstrap. Rescan if cache filled."""
+        """Bootstrap one not-ready coin (REST missing TFs only), then evaluate if complete."""
         halted, reason = self._scan_gate_open()
         if halted:
             scanner_logger.debug("Kline warmup skipped — %s", reason)
             return []
 
-        symbols = self.take_kline_cache_misses(16)
-        if not symbols:
+        queued = self.take_kline_cache_misses(16)
+        if not queued:
+            return []
+
+        target = self._next_bootstrap_symbol(queued)
+        leftovers = [symbol for symbol in queued if symbol != target]
+        for symbol in leftovers:
+            self.note_kline_cache_miss(symbol)
+        if not target:
             return []
 
         if self._hub is not None:
-            self._hub.subscribe_kline_streams(symbols)
-        self._maybe_fetch_single_closed_kline(symbols)
+            self._hub.subscribe_kline_streams([target])
 
-        ready, still = self._partition_kline_ready(symbols)
+        if not self.snapshot_factory.has_complete_klines(target):
+            try:
+                self._bootstrap_missing_scan_klines([target])
+            except Exception as exc:
+                scanner_logger.warning(
+                    "[SCAN_KLINE_BOOTSTRAP] %s raised — %s",
+                    target,
+                    exc,
+                )
+
+        ready, still = self._partition_kline_ready([target])
         for symbol in still:
             self.note_kline_cache_miss(symbol)
         if not ready:

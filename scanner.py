@@ -161,7 +161,7 @@ class MarketScanner:
         return self.orchestrator._bootstrap_missing_scan_klines(symbols)
 
     def warmup_and_evaluate_kline_misses(self) -> List[Dict[str, Any]]:
-        """WS-subscribe queued misses; evaluate only if the cache filled organically."""
+        """Bootstrap one not-ready miss (missing TFs only), then evaluate if complete."""
         if self.orchestrator is None:
             return []
         return self.orchestrator.warmup_and_evaluate_kline_misses()

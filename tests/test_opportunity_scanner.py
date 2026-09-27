@@ -548,15 +548,15 @@ class TestKlineWarmupScan(unittest.TestCase):
         orch.exchange = MagicMock()
         orch.exchange.in_scan_mode = False
         orch.db = MagicMock()
+        orch.snapshot_factory = MagicMock()
+        orch.snapshot_factory.has_complete_klines.return_value = False
         orch.priority_queue = MagicMock()
-        orch.priority_queue.hot_symbols = []
+        orch.priority_queue.hot_symbols = ["ENAUSDT"]
         orch._kline_cache_misses = ["ENAUSDT", "BBUSDT"]
         orch._kline_pending_log_at = {}
         orch._scan_gate_open = MagicMock(return_value=(False, ""))
         orch._bootstrap_missing_scan_klines = MagicMock(return_value=3)
-        orch._partition_kline_ready = MagicMock(
-            return_value=(["ENAUSDT"], ["BBUSDT"])
-        )
+        orch._partition_kline_ready = MagicMock(return_value=(["ENAUSDT"], []))
         orch._open_symbols = MagicMock(return_value=set())
         orch._ws_ticker_map = MagicMock(return_value={})
         orch._ws_book_map = MagicMock(return_value={})
@@ -566,9 +566,81 @@ class TestKlineWarmupScan(unittest.TestCase):
         out = orch.warmup_and_evaluate_kline_misses()
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0]["symbol"], "ENAUSDT")
-        orch._bootstrap_missing_scan_klines.assert_not_called()
+        orch._bootstrap_missing_scan_klines.assert_called_once_with(["ENAUSDT"])
         orch._hub.subscribe_kline_streams.assert_called()
         self.assertEqual(orch._kline_cache_misses, ["BBUSDT"])
+        orch._evaluate_symbols_ws.assert_called_once()
+
+    def test_bootstrap_caps_one_incomplete_symbol(self) -> None:
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch._hub = MagicMock()
+        orch._hub.bootstrap_klines_for_symbols.return_value = 2
+        orch.exchange = MagicMock()
+        orch.exchange.in_scan_mode = False
+        orch.exchange._ws_reconnect_or_warmup.return_value = False
+        orch.exchange.can_bootstrap_klines_rest.return_value = True
+        orch.exchange.can_make_background_rest_call.return_value = True
+        orch.exchange.bootstrap_context.return_value.__enter__ = MagicMock()
+        orch.exchange.bootstrap_context.return_value.__exit__ = MagicMock(
+            return_value=False
+        )
+        orch.snapshot_factory = MagicMock()
+        orch.snapshot_factory.has_complete_klines.side_effect = (
+            lambda symbol: symbol == "BBUSDT"
+        )
+        orch.priority_queue = MagicMock()
+        orch.priority_queue.hot_symbols = ["ENAUSDT"]
+        seeded = orch._bootstrap_missing_scan_klines(["ENAUSDT", "BBUSDT", "CCUSDT"])
+        self.assertEqual(seeded, 2)
+        orch._hub.bootstrap_klines_for_symbols.assert_called_once()
+        args, kwargs = orch._hub.bootstrap_klines_for_symbols.call_args
+        self.assertEqual(args[0], ["ENAUSDT"])
+        self.assertEqual(kwargs.get("max_pairs"), 3)
+
+    def test_warmup_skips_bootstrap_when_target_already_complete(self) -> None:
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch._hub = MagicMock()
+        orch.exchange = MagicMock()
+        orch.db = MagicMock()
+        orch.snapshot_factory = MagicMock()
+        orch.snapshot_factory.has_complete_klines.return_value = True
+        orch.priority_queue = MagicMock()
+        orch.priority_queue.hot_symbols = ["ENAUSDT"]
+        orch._kline_cache_misses = ["ENAUSDT"]
+        orch._kline_pending_log_at = {}
+        orch._scan_gate_open = MagicMock(return_value=(False, ""))
+        orch._bootstrap_missing_scan_klines = MagicMock(return_value=0)
+        orch._partition_kline_ready = MagicMock(return_value=(["ENAUSDT"], []))
+        orch._open_symbols = MagicMock(return_value=set())
+        orch._ws_ticker_map = MagicMock(return_value={})
+        orch._ws_book_map = MagicMock(return_value={})
+        orch._evaluate_symbols_ws = MagicMock(return_value=[])
+        orch.warmup_and_evaluate_kline_misses()
+        orch._bootstrap_missing_scan_klines.assert_not_called()
+        orch._evaluate_symbols_ws.assert_called_once()
+
+    def test_warmup_failed_bootstrap_does_not_crash(self) -> None:
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch._hub = MagicMock()
+        orch.exchange = MagicMock()
+        orch.db = MagicMock()
+        orch.snapshot_factory = MagicMock()
+        orch.snapshot_factory.has_complete_klines.return_value = False
+        orch.priority_queue = MagicMock()
+        orch.priority_queue.hot_symbols = ["ENAUSDT"]
+        orch._kline_cache_misses = ["ENAUSDT"]
+        orch._kline_pending_log_at = {}
+        orch._scan_gate_open = MagicMock(return_value=(False, ""))
+        orch._bootstrap_missing_scan_klines = MagicMock(
+            side_effect=RuntimeError("rest down")
+        )
+        orch._partition_kline_ready = MagicMock(return_value=([], ["ENAUSDT"]))
+        orch._open_symbols = MagicMock(return_value=set())
+        orch._evaluate_symbols_ws = MagicMock()
+        out = orch.warmup_and_evaluate_kline_misses()
+        self.assertEqual(out, [])
+        self.assertEqual(orch._kline_cache_misses, ["ENAUSDT"])
+        orch._evaluate_symbols_ws.assert_not_called()
 
 
 if __name__ == "__main__":
