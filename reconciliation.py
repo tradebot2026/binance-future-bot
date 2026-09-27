@@ -384,16 +384,19 @@ def symbol_blocked_for_new_entry(
     exchange: "BinanceExchangeManager",
     db: "DatabaseManager",
     symbol: str,
+    *,
+    ignore_in_flight: bool = False,
 ) -> tuple[bool, str]:
     """
     True when a new entry must not be opened on this symbol.
     REST is authoritative; WS/cache used only when REST is unavailable.
+    ignore_in_flight=True when the caller already holds entry_in_flight_mutex.
     """
     symbol = symbol.upper()
 
     from core.entry_in_flight_mutex import is_symbol_entry_in_flight
 
-    if is_symbol_entry_in_flight(symbol):
+    if not ignore_in_flight and is_symbol_entry_in_flight(symbol):
         return True, f"Entry in flight for {symbol}"
 
     if db.get_open_trades_for_symbol(symbol):

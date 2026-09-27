@@ -360,7 +360,7 @@ class Config:
     MIN_SL_ATR_NOISE: float = _env_float("MIN_SL_ATR_NOISE", 0.35)
     SYMBOL_COOLDOWN_MINUTES: int = _env_int("SYMBOL_COOLDOWN_MINUTES", 60)
     POST_TRADE_COOLDOWN_MINUTES: int = _env_int("POST_TRADE_COOLDOWN_MINUTES", 60)
-    ENTRY_IN_FLIGHT_TTL_SECONDS: float = _env_float("ENTRY_IN_FLIGHT_TTL_SECONDS", 60.0)
+    ENTRY_IN_FLIGHT_TTL_SECONDS: float = _env_float("ENTRY_IN_FLIGHT_TTL_SECONDS", 20.0)
 
     # ---------------- Range regime ----------------
     ENABLE_RANGE_REGIME: bool = _env_bool("ENABLE_RANGE_REGIME", True)
@@ -604,7 +604,7 @@ class Config:
     )
     MIN_LIQUIDATION_BUFFER_PCT: float = _env_float("MIN_LIQUIDATION_BUFFER_PCT", 25.0)
     MAX_GROSS_EXPOSURE_PCT: float = _env_float("MAX_GROSS_EXPOSURE_PCT", 2.5)
-    MAX_NET_LONG_EXPOSURE_PCT: float = _env_float("MAX_NET_LONG_EXPOSURE_PCT", 1.5)
+    MAX_NET_LONG_EXPOSURE_PCT: float = _env_float("MAX_NET_LONG_EXPOSURE_PCT", 2.25)
     MAX_NET_SHORT_EXPOSURE_PCT: float = _env_float("MAX_NET_SHORT_EXPOSURE_PCT", 1.5)
 
     SMC_DAILY_MAX_LOSS_PERCENT: float = _env_float("SMC_DAILY_MAX_LOSS_PERCENT", 5.0)

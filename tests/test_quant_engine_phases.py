@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -253,6 +254,44 @@ class TestEntryInFlightMutex(unittest.TestCase):
             with entry_in_flight_mutex("BTCUSDT", blocking=False) as second:
                 self.assertFalse(second)
         self.assertFalse(is_symbol_entry_in_flight("BTCUSDT"))
+
+    def test_stale_in_flight_flag_times_out(self) -> None:
+        from core.entry_in_flight_mutex import (
+            _active_entries,
+            clear_entry_in_flight,
+            is_symbol_entry_in_flight,
+        )
+
+        clear_entry_in_flight("QNTUSDT")
+        with patch.object(Config, "ENTRY_IN_FLIGHT_TTL_SECONDS", 1.0):
+            _active_entries["QNTUSDT"] = time.monotonic() - 5.0
+            self.assertFalse(is_symbol_entry_in_flight("QNTUSDT"))
+
+    def test_symbol_block_ignores_own_in_flight_claim(self) -> None:
+        from core.entry_in_flight_mutex import (
+            clear_entry_in_flight,
+            entry_in_flight_mutex,
+        )
+        from reconciliation import symbol_blocked_for_new_entry
+
+        clear_entry_in_flight("QNTUSDT")
+        exchange = MagicMock()
+        exchange.symbol_has_open_position_rest.return_value = False
+        exchange.has_open_position.return_value = False
+        db = MagicMock()
+        db.get_open_trades_for_symbol.return_value = []
+        with entry_in_flight_mutex("QNTUSDT", blocking=False) as acquired:
+            self.assertTrue(acquired)
+            blocked, reason = symbol_blocked_for_new_entry(
+                exchange, db, "QNTUSDT", ignore_in_flight=True
+            )
+            self.assertFalse(blocked)
+            self.assertEqual(reason, "")
+            blocked_self, self_reason = symbol_blocked_for_new_entry(
+                exchange, db, "QNTUSDT"
+            )
+            self.assertTrue(blocked_self)
+            self.assertIn("in flight", self_reason.lower())
 
 
 class TestPhase1IdempotentClose(unittest.TestCase):

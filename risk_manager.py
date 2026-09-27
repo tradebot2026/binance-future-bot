@@ -244,6 +244,10 @@ class RiskManager:
                     )
 
         if symbol:
+            from core.entry_in_flight_mutex import is_symbol_entry_in_flight
+
+            if is_symbol_entry_in_flight(symbol):
+                return False, f"Entry already in flight for {symbol}."
             if self._has_active_trade_for_symbol(symbol):
                 return False, f"Active trade already tracked for {symbol}."
             on_cooldown, cooldown_reason = self.db.is_symbol_on_cooldown(symbol)
@@ -254,7 +258,33 @@ class RiskManager:
                     return False, (
                         f"Exchange position already open for {symbol} {side}."
                     )
+            long_ok, long_reason = self._net_long_exposure_allows_new()
+            if not long_ok:
+                return False, long_reason
 
+        return True, ""
+
+    def _net_long_exposure_allows_new(self) -> tuple[bool, str]:
+        """Reject only when current long notional already meets the net-long cap."""
+        balance = self.exchange.get_futures_balance(force_refresh=False)
+        if balance <= 0:
+            return True, ""
+        long_notional = 0.0
+        try:
+            positions = self.exchange.get_all_open_positions(force_refresh=False)
+        except Exception:
+            return True, ""
+        for pos in positions:
+            if str(pos.get("positionSide", "")).upper() != "LONG":
+                continue
+            qty = safe_float(pos.get("quantity"))
+            entry = safe_float(pos.get("entryPrice"))
+            long_notional += qty * entry
+        max_long = balance * Config.MAX_NET_LONG_EXPOSURE_PCT
+        if long_notional >= max_long:
+            return False, (
+                f"Net long exposure limit ({long_notional:.0f}>={max_long:.0f})."
+            )
         return True, ""
 
     def validate_minimum_order_floor(

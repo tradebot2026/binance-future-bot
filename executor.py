@@ -928,7 +928,10 @@ class TradeExecutor:
                 return None
 
             blocked, block_reason = symbol_blocked_for_new_entry(
-                self.exchange, self.db, symbol
+                self.exchange,
+                self.db,
+                symbol,
+                ignore_in_flight=True,
             )
             if blocked:
                 log_execution_rejected(symbol, block_reason, strategy=strategy)

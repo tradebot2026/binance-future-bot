@@ -28,6 +28,15 @@ def _ttl_seconds() -> float:
     return max(float(Config.ENTRY_IN_FLIGHT_TTL_SECONDS), 1.0)
 
 
+def clear_entry_in_flight(symbol: str) -> None:
+    """Drop a symbol's in-flight claim (TTL expiry or post-execution release)."""
+    sym = str(symbol or "").upper()
+    if not sym:
+        return
+    with _registry_lock:
+        _active_entries.pop(sym, None)
+
+
 def is_symbol_entry_in_flight(symbol: str) -> bool:
     """True when an entry for this symbol is active within the in-flight TTL."""
     sym = symbol.upper()
@@ -77,6 +86,5 @@ def entry_in_flight_mutex(symbol: str, *, blocking: bool = False) -> Iterator[bo
     finally:
         if acquired:
             if claimed:
-                with _registry_lock:
-                    _active_entries.pop(sym, None)
+                clear_entry_in_flight(sym)
             lock.release()
