@@ -124,10 +124,17 @@ def _simulate_trade(
     return None, len(df) - 1
 
 
+def backtest_min_bars() -> int:
+    """Accept 15m history with a 450-bar floor (fetch still requests 500)."""
+    limit = max(int(getattr(Config, "BACKTEST_CANDLE_LIMIT", 500)), 200)
+    floor = int(getattr(Config, "BACKTEST_MIN_BARS", 450))
+    return max(min(floor, limit), 200)
+
+
 def run_15m_backtest(df: Optional[pd.DataFrame]) -> BacktestResult:
     """Walk-forward 15m simulation. Fail-closed on thin or losing history."""
     result = BacktestResult()
-    min_bars = max(int(Config.BACKTEST_CANDLE_LIMIT), 200)
+    min_bars = backtest_min_bars()
     warmup = max(int(Config.BACKTEST_WARMUP_BARS), 150)
     min_wr = float(Config.BACKTEST_MIN_WIN_RATE)
     min_trades = max(int(Config.BACKTEST_MIN_TRADES), 1)

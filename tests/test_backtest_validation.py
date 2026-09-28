@@ -75,6 +75,10 @@ class TestFifteenMinuteBacktest(unittest.TestCase):
         self.assertFalse(result.passed)
         self.assertIn("insufficient_15m_bars", result.reason)
 
+    def test_accepts_450_closed_15m_bars(self) -> None:
+        result = run_15m_backtest(_ohlcv(451))
+        self.assertNotIn("insufficient_15m_bars", result.reason)
+
     def test_rejects_win_rate_below_60(self) -> None:
         df = _ohlcv(501)
 

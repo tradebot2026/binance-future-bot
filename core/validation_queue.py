@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from config import Config
-from core.candle_backtest import BacktestResult, run_15m_backtest
+from core.candle_backtest import backtest_min_bars, run_15m_backtest
 from logger import error_logger, scanner_logger, trade_logger
 from utils import safe_float
 
@@ -211,16 +211,17 @@ class AsyncBacktestValidator:
 
     def _fetch_15m_history(self, symbol: str) -> Optional[Any]:
         timeframe = str(Config.BACKTEST_TIMEFRAME or "15m")
-        limit = max(int(Config.BACKTEST_CANDLE_LIMIT), 200)
+        fetch_limit = max(int(Config.BACKTEST_CANDLE_LIMIT), 200)
+        min_bars = backtest_min_bars()
         hub = getattr(self.exchange, "_market_data", None)
         cached = None
         try:
             cached = self.exchange.fetch_historical_candles(
-                symbol, timeframe, limit=limit, allow_rest=False
+                symbol, timeframe, limit=fetch_limit, allow_rest=False
             )
         except Exception:
             cached = None
-        if cached is not None and not cached.empty and len(cached) >= limit:
+        if cached is not None and not cached.empty and len(cached) >= min_bars:
             return cached
 
         can_boot = getattr(self.exchange, "can_bootstrap_klines_rest", None)
@@ -228,7 +229,9 @@ class AsyncBacktestValidator:
             return cached
         try:
             with self.exchange.bootstrap_context():
-                df = self.exchange.fetch_bootstrap_klines_df(symbol, timeframe, limit)
+                df = self.exchange.fetch_bootstrap_klines_df(
+                    symbol, timeframe, fetch_limit
+                )
         except Exception as exc:
             error_logger.warning(
                 "Backtest 15m fetch failed for %s: %s", symbol, exc
