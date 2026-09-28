@@ -38,6 +38,7 @@ from scheduler import DailyScheduler
 from telegram_bot import TelegramManager
 from utils import safe_float, utc_today_str
 from core.monitor_watchdog import start_monitor_watchdog
+from core.validation_queue import AsyncBacktestValidator
 
 try:
     from reporter import ReportGenerator
@@ -211,6 +212,7 @@ def _validate_candidate(candidate: dict[str, Any]) -> tuple[bool, str, dict[str,
     if score < min_required:
         return False, f"score {score:.1f} below minimum {min_required:.1f}", {}
 
+    structure = candidate.get("structure_metadata") or {}
     normalized = {
         "symbol": symbol,
         "action": action,
@@ -218,7 +220,20 @@ def _validate_candidate(candidate: dict[str, Any]) -> tuple[bool, str, dict[str,
         "price": price,
         "score": score,
         "strategy": strategy,
-        "structure_metadata": candidate.get("structure_metadata") or {},
+        "structure_metadata": structure,
+        "backtest_validated": bool(
+            candidate.get("backtest_validated")
+            or structure.get("backtest_validated")
+        ),
+        "backtest_win_rate": safe_float(
+            candidate.get("backtest_win_rate", structure.get("backtest_win_rate"))
+        ),
+        "backtest_wins": int(
+            safe_float(candidate.get("backtest_wins", structure.get("backtest_wins")))
+        ),
+        "backtest_trades": int(
+            safe_float(candidate.get("backtest_trades", structure.get("backtest_trades")))
+        ),
     }
     return True, "", normalized
 
@@ -361,6 +376,13 @@ def _execute_candidates(
                         )
                         break
 
+            attach_native = bool(
+                Config.ENABLE_NATIVE_TP_SL
+                or (
+                    Config.ATTACH_NATIVE_TP_SL_AFTER_VALIDATION
+                    and normalized.get("backtest_validated")
+                )
+            )
             result: Optional[dict[str, Any]] = executor.execute_trade(
                 symbol=symbol,
                 action=action,
@@ -369,6 +391,7 @@ def _execute_candidates(
                 strategy=normalized["strategy"],
                 score=normalized["score"],
                 structure_metadata=normalized.get("structure_metadata"),
+                attach_native_exits=attach_native,
             )
             if not result:
                 continue
@@ -405,6 +428,9 @@ def _execute_candidates(
                     score=normalized["score"],
                     strategy=normalized["strategy"],
                     quantity=float(result.get("quantity", 0.0)),
+                    backtest_win_rate=float(normalized.get("backtest_win_rate") or 0.0),
+                    backtest_wins=int(normalized.get("backtest_wins") or 0),
+                    backtest_trades=int(normalized.get("backtest_trades") or 0),
                 )
 
             scheduler.notify_trade_event()
@@ -457,6 +483,7 @@ def _adopt_pending_user_fills(
         if manager is not None:
             manager.note_open_symbol(str(result.get("symbol", "")))
         if not result.get("orphan_fill"):
+            meta = result.get("metadata") or {}
             tg.send_trade_alert(
                 action=result["action"],
                 symbol=result["symbol"],
@@ -468,6 +495,9 @@ def _adopt_pending_user_fills(
                 score=float(result.get("score", 0.0)),
                 strategy=str(result.get("strategy", "")),
                 quantity=float(result.get("quantity", 0.0)),
+                backtest_win_rate=safe_float(meta.get("backtest_win_rate")),
+                backtest_wins=int(safe_float(meta.get("backtest_wins"))),
+                backtest_trades=int(safe_float(meta.get("backtest_trades"))),
             )
         scheduler.notify_trade_event()
         risk.notify_trade_event()
@@ -613,6 +643,7 @@ def main(controller: Optional[BotController] = None) -> str:
 
     tg: Optional[TelegramManager] = None
     manager: Optional[TradeManager] = None
+    validator: Optional[AsyncBacktestValidator] = None
     shutdown_done = False
     try:
         tg = TelegramManager(
@@ -639,6 +670,10 @@ def main(controller: Optional[BotController] = None) -> str:
         tg.scanner = scanner
         tg.market_data = market_data
         market_data.register_price_tick_listener(manager.on_price_tick)
+
+        validator = AsyncBacktestValidator(exchange)
+        if Config.ENABLE_ASYNC_BACKTEST_VALIDATION:
+            validator.start()
 
         tg.start_listening()
         mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
@@ -767,20 +802,16 @@ def main(controller: Optional[BotController] = None) -> str:
                         else:
                             if scan_clock.due():
                                 candidates = scanner.process_priority_scan_cycle()
-                                _execute_candidates(
-                                    candidates=candidates,
-                                    executor=executor,
-                                    risk=risk,
-                                    scheduler=scheduler,
-                                    db=db,
-                                    tg=tg,
-                                    critical_alerts=critical_alerts,
-                                    manager=manager,
-                                )
                                 warmed = scanner.warmup_and_evaluate_kline_misses()
-                                if warmed:
+                                incoming = list(candidates or []) + list(warmed or [])
+                                if (
+                                    Config.ENABLE_ASYNC_BACKTEST_VALIDATION
+                                    and validator is not None
+                                ):
+                                    validator.enqueue_many(incoming)
+                                elif incoming:
                                     _execute_candidates(
-                                        candidates=warmed,
+                                        candidates=incoming,
                                         executor=executor,
                                         risk=risk,
                                         scheduler=scheduler,
@@ -789,6 +820,24 @@ def main(controller: Optional[BotController] = None) -> str:
                                         critical_alerts=critical_alerts,
                                         manager=manager,
                                     )
+                        if (
+                            Config.ENABLE_ASYNC_BACKTEST_VALIDATION
+                            and validator is not None
+                        ):
+                            approved = validator.drain_approved(
+                                max_n=Config.MAX_ENTRIES_PER_CYCLE
+                            )
+                            if approved:
+                                _execute_candidates(
+                                    candidates=approved,
+                                    executor=executor,
+                                    risk=risk,
+                                    scheduler=scheduler,
+                                    db=db,
+                                    tg=tg,
+                                    critical_alerts=critical_alerts,
+                                    manager=manager,
+                                )
                     elif gate_reason:
                         system_logger.info("Entries paused: %s", gate_reason)
 
@@ -848,6 +897,8 @@ def main(controller: Optional[BotController] = None) -> str:
 
         # Graceful shutdown
         shutdown_done = True
+        if validator is not None:
+            validator.stop()
         if manager is not None:
             manager.stop()
         market_data.stop()
@@ -862,6 +913,8 @@ def main(controller: Optional[BotController] = None) -> str:
         return "stop"
     finally:
         if not shutdown_done:
+            if validator is not None:
+                validator.stop()
             if manager is not None:
                 manager.stop()
             market_data.stop()

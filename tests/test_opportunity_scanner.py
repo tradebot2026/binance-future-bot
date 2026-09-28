@@ -643,5 +643,129 @@ class TestKlineWarmupScan(unittest.TestCase):
         orch._evaluate_symbols_ws.assert_not_called()
 
 
+class TestIndicatorHistoryFloor(unittest.TestCase):
+    def _ohlcv(self, n: int) -> pd.DataFrame:
+        return pd.DataFrame(
+            {
+                "open": [1.0] * n,
+                "high": [1.1] * n,
+                "low": [0.9] * n,
+                "close": [1.0] * n,
+                "volume": [100.0] * n,
+            }
+        )
+
+    def test_prepare_df_rejects_thin_5m_history(self) -> None:
+        from core.candle_prep import prepare_df
+        from indicators.market_analyzer import MarketAnalyzer
+
+        analyzer = MarketAnalyzer()
+        self.assertIsNone(prepare_df(self._ohlcv(40), analyzer))
+        self.assertIsNone(prepare_df(self._ohlcv(150), analyzer))
+        self.assertIsNone(prepare_df(self._ohlcv(200), analyzer))
+
+    def test_prepare_df_accepts_200_closed_5m_bars(self) -> None:
+        from core.candle_prep import prepare_df
+        from indicators.market_analyzer import MarketAnalyzer
+
+        analyzer = MarketAnalyzer()
+        out = prepare_df(self._ohlcv(201), analyzer)
+        self.assertIsNotNone(out)
+        self.assertGreaterEqual(len(out), 150)
+
+    def test_snapshot_requires_200_closed_entry_bars(self) -> None:
+        from pipeline.snapshot_factory import SnapshotFactory
+
+        exchange = MagicMock()
+
+        def _candles(_symbol, timeframe, **_kwargs):
+            n = 201 if timeframe in ("5m", "15m") else 250
+            return pd.DataFrame({"close": [1.0] * n})
+
+        factory = SnapshotFactory(exchange)
+        exchange.fetch_historical_candles.side_effect = _candles
+        self.assertTrue(factory.has_complete_klines("ENAUSDT"))
+
+        def _thin_5m(_symbol, timeframe, **_kwargs):
+            n = 150 if timeframe == "5m" else 250
+            return pd.DataFrame({"close": [1.0] * n})
+
+        exchange.fetch_historical_candles.side_effect = _thin_5m
+        self.assertFalse(factory.has_complete_klines("ENAUSDT"))
+
+
+class TestPrematureCloseGuards(unittest.TestCase):
+    def test_monitor_timeouts_are_raised(self) -> None:
+        self.assertGreaterEqual(Config.MONITOR_LOOP_STALL_SECONDS, 45.0)
+        self.assertGreaterEqual(Config.POSITION_GRACE_PERIOD_SECONDS, 120.0)
+        self.assertGreaterEqual(Config.POSITION_RECONCILE_MISS_THRESHOLD, 8)
+        self.assertGreaterEqual(Config.WS_STALE_SECONDS, 90)
+        self.assertGreaterEqual(Config.WATCHDOG_MAIN_STALE_SECONDS, 180)
+        self.assertFalse(Config.ENABLE_RANGE_AUXILIARY_EXITS)
+        self.assertGreaterEqual(Config.INDICATOR_MIN_BARS, 200)
+
+    def test_reconcile_skips_without_rest_flat_confirm(self) -> None:
+        from manager import TradeManager
+
+        mgr = TradeManager.__new__(TradeManager)
+        mgr.exchange = MagicMock()
+        mgr.db = MagicMock()
+        mgr.telegram = None
+        mgr._cancel_all_native_orders = MagicMock()
+        mgr._mark_trade_closed = MagicMock()
+        trade = {"trade_id": "t1", "symbol": "QNTUSDT", "side": "LONG"}
+        with patch("manager.confirm_external_close_allowed", return_value=False):
+            ok = mgr._reconcile_exchange_flat(trade, "cache_qty_zero")
+        self.assertFalse(ok)
+        mgr._mark_trade_closed.assert_not_called()
+
+    def test_reconcile_skips_exchange_reject_until_rest_confirms_flat(self) -> None:
+        from manager import TradeManager
+
+        mgr = TradeManager.__new__(TradeManager)
+        mgr.exchange = MagicMock()
+        mgr.db = MagicMock()
+        mgr.telegram = None
+        mgr._cancel_all_native_orders = MagicMock()
+        mgr._mark_trade_closed = MagicMock()
+        trade = {"trade_id": "t1", "symbol": "QNTUSDT", "side": "LONG"}
+        with patch("manager.rest_position_quantity", return_value=1.25):
+            ok = mgr._reconcile_exchange_flat(
+                trade, "-2022", confirmed_by_exchange=True
+            )
+        self.assertFalse(ok)
+        mgr._mark_trade_closed.assert_not_called()
+
+    def test_range_time_and_adx_exits_are_disabled(self) -> None:
+        from manager import TradeManager
+
+        mgr = TradeManager.__new__(TradeManager)
+        mgr.exchange = MagicMock()
+        mgr.db = MagicMock()
+        trade = {"trade_id": "t1", "symbol": "QNTUSDT", "side": "LONG"}
+        with patch.object(Config, "ENABLE_RANGE_AUXILIARY_EXITS", False), patch.object(
+            mgr, "_check_range_boundary_breakout", return_value=False
+        ), patch.object(mgr, "_range_bars_elapsed", return_value=99), patch.object(
+            mgr, "_fetch_confirm_adx", return_value=80.0
+        ), patch.object(
+            mgr, "_close_position"
+        ) as close:
+            self.assertFalse(mgr._check_range_hard_exits(trade, 100.0))
+            close.assert_not_called()
+
+    def test_range_boundary_reversal_still_closes(self) -> None:
+        from manager import TradeManager
+
+        mgr = TradeManager.__new__(TradeManager)
+        mgr.exchange = MagicMock()
+        mgr.db = MagicMock()
+        trade = {"trade_id": "t1", "symbol": "QNTUSDT", "side": "LONG"}
+        with patch.object(
+            mgr, "_check_range_boundary_breakout", return_value=True
+        ), patch.object(mgr, "_close_position") as close:
+            self.assertTrue(mgr._check_range_hard_exits(trade, 100.0))
+            close.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

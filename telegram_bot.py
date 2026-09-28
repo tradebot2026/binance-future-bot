@@ -162,6 +162,9 @@ class TelegramManager:
         score: float = 0.0,
         strategy: str = "DEFAULT",
         quantity: float = 0.0,
+        backtest_win_rate: float = 0.0,
+        backtest_wins: int = 0,
+        backtest_trades: int = 0,
     ) -> None:
         emoji = "🟢" if action == "LONG" else "🔴"
         tp1_qty = quantity * TP1_PORTION if quantity > 0 else 0.0
@@ -188,8 +191,13 @@ class TelegramManager:
             f"🧠 <b>Strategy:</b> {escape_html(strategy_display_label(strategy))}\n"
             f"🏷 <b>Tag:</b> {escape_html(strategy)}\n"
             f"📊 <b>Score:</b> {score:.1f}\n"
-            f"💵 <b>Entry:</b> {price:.6f}\n"
         )
+        if backtest_trades > 0:
+            msg += (
+                f"📊 <b>Backtest WR:</b> {backtest_win_rate:.1f}% "
+                f"({int(backtest_wins)}/{int(backtest_trades)} Wins)\n"
+            )
+        msg += f"💵 <b>Entry:</b> {price:.6f}\n"
         if quantity > 0:
             msg += f"📦 <b>Size:</b> {quantity:.4f}\n"
 

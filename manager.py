@@ -40,6 +40,7 @@ from reconciliation import (
     is_within_position_grace_period,
     position_reconcile_guard,
     resolve_exchange_close_pnl,
+    rest_position_quantity,
 )
 from utils import escape_html, round_step_size, safe_float, utc_now, utc_today_str
 
@@ -546,8 +547,12 @@ class TradeManager:
         return False
 
     def _check_range_hard_exits(self, trade: dict[str, Any], price: float) -> bool:
-        """Range kill rules: ADX breakout, range boundary violation, time stop."""
-        metadata = self.db.parse_trade_metadata(trade)
+        """Range exits: boundary close = signal reversal. Time/ADX only if enabled."""
+        if self._check_range_boundary_breakout(trade):
+            return True
+
+        if not Config.ENABLE_RANGE_AUXILIARY_EXITS:
+            return False
 
         if self._range_bars_elapsed(trade) >= Config.RANGE_TIME_STOP_BARS:
             trade_logger.info(
@@ -560,9 +565,6 @@ class TradeManager:
                 quantity=self._remaining_close_quantity(trade),
                 reason="RANGE_TIME_STOP",
             )
-            return True
-
-        if self._check_range_boundary_breakout(trade):
             return True
 
         adx_15m = self._fetch_confirm_adx(trade["symbol"])
@@ -1127,10 +1129,29 @@ class TradeManager:
         reason: str,
         *,
         exit_reason: str = "RECONCILED_REDUCE_ONLY",
+        confirmed_by_exchange: bool = False,
     ) -> bool:
-        """Mark trade closed when the exchange has no open position."""
+        """Mark trade closed only after REST confirms the exchange is flat."""
         symbol = str(trade.get("symbol", ""))
         position_side = str(trade.get("side", "LONG")).upper()
+        if confirmed_by_exchange:
+            rest_qty = rest_position_quantity(self.exchange, symbol, position_side)
+            if rest_qty is None or rest_qty > 0:
+                trade_logger.warning(
+                    "[%s] Skip %s — REST did not confirm flat | trigger=%s",
+                    symbol,
+                    exit_reason,
+                    reason,
+                )
+                return False
+        elif not confirm_external_close_allowed(self.exchange, trade):
+            trade_logger.warning(
+                "[%s] Skip %s — transient miss, waiting for REST confirm | trigger=%s",
+                symbol,
+                exit_reason,
+                reason,
+            )
+            return False
         exit_price = safe_float(
             self.exchange.get_market_price(symbol, position_side)
         )
@@ -1283,10 +1304,14 @@ class TradeManager:
                         reason,
                         exc,
                     )
-                    return self._reconcile_exchange_flat(trade, reason)
+                    return self._reconcile_exchange_flat(
+                        trade, reason, confirmed_by_exchange=True
+                    )
                 except OrderExecutionError as exc:
                     if PositionAlreadyClosedError.matches(exc):
-                        return self._reconcile_exchange_flat(trade, reason)
+                        return self._reconcile_exchange_flat(
+                            trade, reason, confirmed_by_exchange=True
+                        )
                     if attempt >= self.CLOSE_ORDER_MAX_RETRIES - 1:
                         error_logger.error(
                             "Close order failed for %s (%s) after %s attempts: %s",
@@ -1314,10 +1339,14 @@ class TradeManager:
                 reason,
                 exc,
             )
-            return self._reconcile_exchange_flat(trade, reason)
+            return self._reconcile_exchange_flat(
+                trade, reason, confirmed_by_exchange=True
+            )
         except OrderExecutionError as exc:
             if PositionAlreadyClosedError.matches(exc):
-                return self._reconcile_exchange_flat(trade, reason)
+                return self._reconcile_exchange_flat(
+                    trade, reason, confirmed_by_exchange=True
+                )
             error_logger.error("Close order failed for %s (%s): %s", symbol, reason, exc)
             return False
 

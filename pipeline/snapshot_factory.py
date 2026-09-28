@@ -8,11 +8,20 @@ from typing import Any, Optional
 import pandas as pd
 
 from config import Config
+from core.candle_prep import indicator_min_bars
 from core.regime_router import RegimeRouter
 from core.types import MarketSnapshot, RegimeLabel
 from exchange import BinanceExchangeManager
 from indicators.market_analyzer import MIN_ANALYZER_BARS
 from utils import safe_float
+
+
+def _required_bars_for_timeframe(timeframe: str) -> int:
+    tf = str(timeframe or "").strip().lower()
+    if tf in {"5m", "15m"}:
+        # +1 so prepare_df still has INDICATOR_MIN_BARS after dropping the forming bar.
+        return max(indicator_min_bars(), 150) + 1
+    return MIN_ANALYZER_BARS
 
 
 class SnapshotFactory:
@@ -105,7 +114,7 @@ class SnapshotFactory:
             df = self.exchange.fetch_historical_candles(
                 symbol, timeframe, limit=self.candle_limit, allow_rest=False
             )
-            if df.empty or len(df) < MIN_ANALYZER_BARS:
+            if df.empty or len(df) < _required_bars_for_timeframe(timeframe):
                 return pd.DataFrame()
             return df
         except Exception:

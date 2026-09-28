@@ -87,7 +87,7 @@ class ScanPriorityQueue:
             self._hot.insert(0, sym)
             hot_set.add(sym)
             added.append(sym)
-        cap = max(Config.HOT_SCAN_SIZE, 1)
+        cap = max(Config.scan_watchlist_size(), 1)
         overflow = self._hot[cap:]
         self._hot = self._hot[:cap]
         if overflow:
@@ -125,10 +125,10 @@ class ScanPriorityQueue:
         if not self._background:
             return []
 
-        batch_size = max(
-            Config.ROTATING_SCAN_BATCH_SIZE,
-            Config.BACKGROUND_SCAN_BATCH_SIZE,
-            1,
+        batch_size = min(
+            max(Config.ROTATING_SCAN_BATCH_SIZE, 1),
+            max(Config.BACKGROUND_SCAN_BATCH_SIZE, 1),
+            Config.scan_watchlist_size(),
         )
         seen: set[str] = set()
         batch: list[str] = []

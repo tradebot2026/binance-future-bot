@@ -90,7 +90,7 @@ class Config:
     )
     INIT_REST_DELAY_SECONDS: float = _env_float("INIT_REST_DELAY_SECONDS", 0.5)
     ENABLE_WEBSOCKET_STREAMS: bool = _env_bool("ENABLE_WEBSOCKET_STREAMS", True)
-    WS_STALE_SECONDS: int = _env_int("WS_STALE_SECONDS", 30)
+    WS_STALE_SECONDS: int = _env_int("WS_STALE_SECONDS", 90)
     WS_STALE_SECONDS_TESTNET: int = _env_int("WS_STALE_SECONDS_TESTNET", 180)
     WS_STALE_RECONNECT_COOLDOWN_SECONDS: float = _env_float(
         "WS_STALE_RECONNECT_COOLDOWN_SECONDS", 180.0
@@ -194,10 +194,10 @@ class Config:
     LOOP_IDLE_SECONDS: float = _env_float("LOOP_IDLE_SECONDS", 0.5)
     SCAN_WARMUP_SECONDS: float = _env_float("SCAN_WARMUP_SECONDS", 240.0)
     POSITION_GRACE_PERIOD_SECONDS: float = _env_float(
-        "POSITION_GRACE_PERIOD_SECONDS", 45.0
+        "POSITION_GRACE_PERIOD_SECONDS", 120.0
     )
     POSITION_RECONCILE_MISS_THRESHOLD: int = _env_int(
-        "POSITION_RECONCILE_MISS_THRESHOLD", 3
+        "POSITION_RECONCILE_MISS_THRESHOLD", 8
     )
     MONITOR_INTERVAL_SECONDS: int = _env_int("MONITOR_INTERVAL_SECONDS", 20)
     RECONCILIATION_INTERVAL_SECONDS: int = _env_int("RECONCILIATION_INTERVAL_SECONDS", 900)
@@ -311,9 +311,9 @@ class Config:
     VIRTUAL_TP_TICKER_MAX_AGE_SECONDS: float = _env_float(
         "VIRTUAL_TP_TICKER_MAX_AGE_SECONDS", 15.0
     )
-    MONITOR_LOOP_STALL_SECONDS: float = _env_float("MONITOR_LOOP_STALL_SECONDS", 5.0)
+    MONITOR_LOOP_STALL_SECONDS: float = _env_float("MONITOR_LOOP_STALL_SECONDS", 45.0)
     MONITOR_WATCHDOG_INTERVAL_SECONDS: float = _env_float(
-        "MONITOR_WATCHDOG_INTERVAL_SECONDS", 5.0
+        "MONITOR_WATCHDOG_INTERVAL_SECONDS", 15.0
     )
     MONITOR_REST_MARK_INTERVAL_SECONDS: float = _env_float(
         "MONITOR_REST_MARK_INTERVAL_SECONDS", 30.0
@@ -373,6 +373,9 @@ class Config:
     RANGE_EXIT_ADX_15M: float = _env_float("RANGE_EXIT_ADX_15M", 25.0)
     RANGE_BREAKOUT_ATR_MULT: float = _env_float("RANGE_BREAKOUT_ATR_MULT", 0.3)
     RANGE_TIME_STOP_BARS: int = _env_int("RANGE_TIME_STOP_BARS", 16)
+    ENABLE_RANGE_AUXILIARY_EXITS: bool = _env_bool(
+        "ENABLE_RANGE_AUXILIARY_EXITS", False
+    )
     RANGE_EDGE_ATR_TOLERANCE: float = _env_float("RANGE_EDGE_ATR_TOLERANCE", 0.35)
     RANGE_LOOKBACK_BARS: int = _env_int("RANGE_LOOKBACK_BARS", 48)
     RANGE_MIN_SCORE: float = _env_float("RANGE_MIN_SCORE", 65.0)
@@ -508,13 +511,15 @@ class Config:
     ENABLE_EVENT_DRIVEN_SCAN: bool = _env_bool("ENABLE_EVENT_DRIVEN_SCAN", True)
     SCAN_TRIGGER_TIMEFRAMES: str = os.getenv("SCAN_TRIGGER_TIMEFRAMES", "5m,15m")
     TIER1_WATCHLIST_SIZE: int = _env_int("TIER1_WATCHLIST_SIZE", 100)
-    HOT_SCAN_SIZE: int = _env_int("HOT_SCAN_SIZE", 20)
+    SCAN_WATCHLIST_SIZE: int = _env_int("SCAN_WATCHLIST_SIZE", 10)
+    HOT_SCAN_SIZE: int = _env_int("HOT_SCAN_SIZE", 10)
+    ENABLE_LIGHTWEIGHT_SCANNER: bool = _env_bool("ENABLE_LIGHTWEIGHT_SCANNER", True)
     HOT_SCAN_INTERVAL_SECONDS: float = _env_float("HOT_SCAN_INTERVAL_SECONDS", 20.0)
-    BACKGROUND_SCAN_BATCH_SIZE: int = _env_int("BACKGROUND_SCAN_BATCH_SIZE", 16)
+    BACKGROUND_SCAN_BATCH_SIZE: int = _env_int("BACKGROUND_SCAN_BATCH_SIZE", 10)
     BACKGROUND_SCAN_BATCH_DELAY_SECONDS: float = _env_float(
         "BACKGROUND_SCAN_BATCH_DELAY_SECONDS", 1.0
     )
-    TIER2_HOT_SIZE: int = _env_int("TIER2_HOT_SIZE", 20)
+    TIER2_HOT_SIZE: int = _env_int("TIER2_HOT_SIZE", 10)
     TIER2_PROMOTE_SCORE: float = _env_float("TIER2_PROMOTE_SCORE", 80.0)
     TIER2_PROMOTE_SCORE_TESTNET: float = _env_float("TIER2_PROMOTE_SCORE_TESTNET", 65.0)
     TIER2_DEMOTE_SCORE: float = _env_float("TIER2_DEMOTE_SCORE", 70.0)
@@ -656,7 +661,23 @@ class Config:
     HOT_VOLUME_RATIO: float = _env_float("HOT_VOLUME_RATIO", 1.18)
     HOT_RANGE_EXPANSION_PCT: float = _env_float("HOT_RANGE_EXPANSION_PCT", 0.35)
     HOT_FAST_TRACK_MAX_PER_CYCLE: int = _env_int("HOT_FAST_TRACK_MAX_PER_CYCLE", 8)
-    ROTATING_SCAN_BATCH_SIZE: int = _env_int("ROTATING_SCAN_BATCH_SIZE", 20)
+    ROTATING_SCAN_BATCH_SIZE: int = _env_int("ROTATING_SCAN_BATCH_SIZE", 10)
+    ENABLE_ASYNC_BACKTEST_VALIDATION: bool = _env_bool(
+        "ENABLE_ASYNC_BACKTEST_VALIDATION", True
+    )
+    BACKTEST_VALIDATION_INTERVAL_SECONDS: float = _env_float(
+        "BACKTEST_VALIDATION_INTERVAL_SECONDS", 60.0
+    )
+    BACKTEST_CANDLE_LIMIT: int = _env_int("BACKTEST_CANDLE_LIMIT", 500)
+    BACKTEST_TIMEFRAME: str = os.getenv("BACKTEST_TIMEFRAME", "15m")
+    BACKTEST_MIN_WIN_RATE: float = _env_float("BACKTEST_MIN_WIN_RATE", 60.0)
+    BACKTEST_MIN_TRADES: int = _env_int("BACKTEST_MIN_TRADES", 5)
+    BACKTEST_WARMUP_BARS: int = _env_int("BACKTEST_WARMUP_BARS", 200)
+    BACKTEST_QUEUE_TTL_SECONDS: float = _env_float("BACKTEST_QUEUE_TTL_SECONDS", 180.0)
+    BACKTEST_QUEUE_MAX: int = _env_int("BACKTEST_QUEUE_MAX", 8)
+    ATTACH_NATIVE_TP_SL_AFTER_VALIDATION: bool = _env_bool(
+        "ATTACH_NATIVE_TP_SL_AFTER_VALIDATION", True
+    )
     MIN_24H_VOLUME_USDT: float = _env_float("MIN_24H_VOLUME_USDT", 10_000_000.0)
     MAX_SPREAD_PERCENT: float = _env_float("MAX_SPREAD_PERCENT", 0.08)
     MIN_SCAN_UNIVERSE: int = _env_int("MIN_SCAN_UNIVERSE", 50)
@@ -696,6 +717,7 @@ class Config:
     SCAN_PAIR_DELAY_SECONDS: float = _env_float("SCAN_PAIR_DELAY_SECONDS", 0.25)
     SCAN_TIMEFRAME_DELAY_SECONDS: float = _env_float("SCAN_TIMEFRAME_DELAY_SECONDS", 0.05)
     CANDLE_FETCH_LIMIT: int = _env_int("CANDLE_FETCH_LIMIT", 280)
+    INDICATOR_MIN_BARS: int = _env_int("INDICATOR_MIN_BARS", 200)
 
     # ---------------- Ops / VPS ----------------
     HEARTBEAT_SECONDS: int = _env_int("HEARTBEAT_SECONDS", 30)
@@ -704,7 +726,7 @@ class Config:
     # ---------------- Watchdog (watchdog.py) ----------------
     WATCHDOG_INTERVAL_SECONDS: int = _env_int("WATCHDOG_INTERVAL_SECONDS", 30)
     WATCHDOG_BREACH_GRACE_SECONDS: int = _env_int("WATCHDOG_BREACH_GRACE_SECONDS", 60)
-    WATCHDOG_MAIN_STALE_SECONDS: int = _env_int("WATCHDOG_MAIN_STALE_SECONDS", 60)
+    WATCHDOG_MAIN_STALE_SECONDS: int = _env_int("WATCHDOG_MAIN_STALE_SECONDS", 180)
     WATCHDOG_AUTO_RESTART_MAIN: bool = _env_bool("WATCHDOG_AUTO_RESTART_MAIN", True)
     WATCHDOG_EMERGENCY_ONLY_WHEN_MAIN_DOWN: bool = _env_bool(
         "WATCHDOG_EMERGENCY_ONLY_WHEN_MAIN_DOWN", True
@@ -812,6 +834,12 @@ class Config:
         if cls.SCAN_ALIGN_TO_MINUTE:
             return 60.0
         return float(max(cls.SCAN_INTERVAL_SECONDS, 1))
+
+    @classmethod
+    @classmethod
+    def scan_watchlist_size(cls) -> int:
+        """Per-cycle lightweight scan cap (top volume/volatility coins)."""
+        return max(min(int(cls.HOT_SCAN_SIZE), int(cls.SCAN_WATCHLIST_SIZE)), 1)
 
     @classmethod
     def scan_warmup_seconds(cls) -> float:

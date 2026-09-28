@@ -7,9 +7,15 @@ from typing import Optional
 import pandas as pd
 import ta
 
+from config import Config
 from core.types import MarketSnapshot
 from indicators.market_analyzer import MIN_ANALYZER_BARS, MarketAnalyzer
 from utils import safe_float
+
+
+def indicator_min_bars() -> int:
+    """Minimum closed bars for Stoch/Trend/VWAP-style indicators (5m/15m)."""
+    return max(int(getattr(Config, "INDICATOR_MIN_BARS", 200)), 150)
 
 
 def drop_forming_bar(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
@@ -22,9 +28,10 @@ def drop_forming_bar(df: Optional[pd.DataFrame]) -> Optional[pd.DataFrame]:
 
 
 def prepare_df(df: Optional[pd.DataFrame], analyzer: MarketAnalyzer) -> Optional[pd.DataFrame]:
-    """Apply full or light indicators depending on bar count."""
+    """Apply indicators only when 5m/15m-class history is complete enough."""
     df = drop_forming_bar(df)
-    if df is None or df.empty or len(df) < 40:
+    min_bars = indicator_min_bars()
+    if df is None or df.empty or len(df) < min_bars:
         return None
     if len(df) >= MIN_ANALYZER_BARS:
         enriched = analyzer.apply_all_indicators(df)

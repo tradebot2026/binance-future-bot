@@ -142,7 +142,7 @@ class MarketScanner:
             return self.ensure_scan_klines_ready()
         symbols = self.orchestrator.priority_queue.hot_symbols
         if not symbols:
-            symbols = self.orchestrator.tier1_symbols[: Config.HOT_SCAN_SIZE]
+            symbols = self.orchestrator.tier1_symbols[: Config.scan_watchlist_size()]
         return self.ensure_scan_klines_ready(symbols)
 
     def bootstrap_background_klines(self) -> int:

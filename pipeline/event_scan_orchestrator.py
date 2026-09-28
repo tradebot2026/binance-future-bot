@@ -518,7 +518,7 @@ class EventScanOrchestrator:
         else:
             scanner_logger.info(
                 "Priority scan produced 0 execution candidates "
-                "(tier2=%s hot=%s background=%s).",
+                "(tier2=%s top10_hot=%s rotating=%s).",
                 self.assignment_manager.tier2_size,
                 hot_count,
                 len(self.priority_queue.background_symbols),
@@ -910,7 +910,7 @@ class EventScanOrchestrator:
         )
 
     def _execution_scan_symbols(self, *, include_hot: bool) -> list[str]:
-        """Hot queue plus already-promoted Tier-2 names (execution, not a 4th scanner)."""
+        """Top volume/volatility coins only — lightweight Stage-1 watchlist."""
         symbols: list[str] = []
         seen: set[str] = set()
         rows: list[str] = []
@@ -923,7 +923,8 @@ class EventScanOrchestrator:
                 continue
             seen.add(key)
             symbols.append(key)
-        return symbols
+        symbols.sort(key=lambda sym: int(self._volume_ranks.get(sym, 10_000)))
+        return symbols[: Config.scan_watchlist_size()]
 
     def _resolve_eval_price(self, symbol: str, ticker: dict[str, Any]) -> float:
         """Prefer cached last price; never REST inside scan_context."""

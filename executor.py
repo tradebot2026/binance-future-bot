@@ -604,6 +604,7 @@ class TradeExecutor:
         strategy: str = "DEFAULT",
         score: float = 0.0,
         structure_metadata: Optional[dict[str, Any]] = None,
+        attach_native_exits: bool = False,
     ) -> Optional[dict[str, Any]]:
         """
         Execute a market entry after structural SL / R:R validation.
@@ -722,6 +723,7 @@ class TradeExecutor:
                 score,
                 structure_metadata,
                 record=record,
+                attach_native_exits=attach_native_exits,
             )
 
     def _ws_needs_execution_rest_price(self, symbol: str, current_price: float) -> bool:
@@ -903,6 +905,7 @@ class TradeExecutor:
         score: float = 0.0,
         structure_metadata: Optional[dict[str, Any]] = None,
         record: Optional[ExecutionRecord] = None,
+        attach_native_exits: bool = False,
     ) -> Optional[dict[str, Any]]:
         """Execute entry under high-priority REST path (not blocked by scan loops)."""
         if Config.is_mega_cap_blacklisted(symbol):
@@ -1049,6 +1052,11 @@ class TradeExecutor:
         else:
             metadata["size_multiplier"] = size_multiplier_for_score(score)
         metadata["r_distance"] = abs(current_price - sl)
+        if structure.get("backtest_validated"):
+            metadata["backtest_validated"] = True
+            metadata["backtest_win_rate"] = safe_float(structure.get("backtest_win_rate"))
+            metadata["backtest_wins"] = int(safe_float(structure.get("backtest_wins")))
+            metadata["backtest_trades"] = int(safe_float(structure.get("backtest_trades")))
 
         try:
             leverage = self.exchange.optimize_and_set_leverage(symbol)
@@ -1170,6 +1178,7 @@ class TradeExecutor:
             leverage=leverage,
             metadata=metadata,
             rules=rules,
+            attach_native_exits=attach_native_exits,
         )
 
     def adopt_confirmed_fill(self, fill: dict[str, Any]) -> Optional[dict[str, Any]]:
@@ -1245,6 +1254,7 @@ class TradeExecutor:
         leverage: int,
         metadata: dict[str, Any],
         rules: SymbolRules,
+        attach_native_exits: bool = False,
     ) -> Optional[dict[str, Any]]:
         position_side = action
         order_status = str(response.get("status") or "").upper()
@@ -1356,7 +1366,8 @@ class TradeExecutor:
                 symbol, position_side, quantity, fill_price
             )
 
-            if Config.ENABLE_NATIVE_TP_SL:
+            place_native = bool(Config.ENABLE_NATIVE_TP_SL or attach_native_exits)
+            if place_native:
                 self._place_native_exit_orders(
                     trade_id=trade_id,
                     symbol=symbol,
@@ -1400,7 +1411,7 @@ class TradeExecutor:
                             tp3=tp3,
                             metadata=metadata,
                         )
-                        if Config.ENABLE_NATIVE_TP_SL:
+                        if place_native:
                             self._place_native_exit_orders(
                                 trade_id=trade_id,
                                 symbol=symbol,
