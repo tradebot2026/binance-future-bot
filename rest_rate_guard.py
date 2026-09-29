@@ -88,6 +88,12 @@ def _weight_pause_seconds(used_weight: int) -> float:
     return 0.0
 
 
+def kline_rest_delay_seconds(used_weight: int = 0) -> float:
+    """Strict 1.0s gap between kline REST calls (rate-limit safety)."""
+    del used_weight
+    return max(float(getattr(Config, "KLINE_REST_MIN_INTERVAL_SECONDS", 1.0)), 1.0)
+
+
 class RestUsageTracker:
     """
     Sliding 60s HTTP request counter + last used-weight header.
@@ -107,6 +113,7 @@ class RestUsageTracker:
         self._reason: str = ""
         self._retry_after_seconds: float = 0.0
         self._logged_state: ApiHealthState = ApiHealthState.HEALTHY
+        self._local_weight_window: deque[tuple[float, int]] = deque()
 
     def requests_last_minute(self) -> int:
         self._purge()
@@ -116,6 +123,8 @@ class RestUsageTracker:
     def snapshot(self) -> dict[str, Any]:
         self._purge()
         with self._lock:
+            self._decay_used_weight_locked()
+            self._purge_local_weight_locked()
             remaining = max(self._safety_until - time.monotonic(), 0.0)
             state = self._effective_state_locked(remaining)
             throttle_remaining = max(self._weight_throttle_until - time.monotonic(), 0.0)
@@ -123,9 +132,13 @@ class RestUsageTracker:
                 "state": state.value,
                 "reason": self._reason,
                 "requests_1m": len(self._window),
-                "used_weight_1m": self._used_weight_1m,
+                "used_weight_1m": max(
+                    int(self._used_weight_1m), self._local_weight_sum_locked()
+                ),
+                "header_used_weight_1m": int(self._used_weight_1m),
                 "ip_limit": Config.rest_ip_request_limit(),
                 "weight_limit": Config.rest_used_weight_limit(),
+                "operational_weight_cap": Config.rest_operational_weight_cap(),
                 "weight_throttle_remaining_seconds": throttle_remaining,
                 "safety_remaining_seconds": remaining,
                 "last_http_status": self._last_http_status,
@@ -142,6 +155,34 @@ class RestUsageTracker:
             ApiHealthState.HEALTHY.value,
             ApiHealthState.HIGH_USAGE.value,
         }
+
+    def projected_used_weight(self) -> int:
+        """Max of Binance header and locally reserved weight in the last 60s."""
+        self._purge()
+        with self._lock:
+            self._decay_used_weight_locked()
+            self._purge_local_weight_locked()
+            return max(int(self._used_weight_1m), self._local_weight_sum_locked())
+
+    def try_reserve_background(self, weight: int) -> bool:
+        """Atomically reserve weight for a background REST call, or skip it."""
+        weight = max(int(weight), 1)
+        throttle = Config.rest_weight_throttle_threshold()
+        with self._lock:
+            self._decay_used_weight_locked()
+            self._purge_local_weight_locked()
+            projected = max(int(self._used_weight_1m), self._local_weight_sum_locked())
+            if projected >= throttle or projected + weight > throttle:
+                return False
+            self._local_weight_window.append((time.monotonic(), weight))
+            return True
+
+    def note_outgoing_weight(self, weight: int) -> None:
+        """Record sent REST weight (execution lane — never blocks)."""
+        weight = max(int(weight), 1)
+        with self._lock:
+            self._purge_local_weight_locked()
+            self._local_weight_window.append((time.monotonic(), weight))
 
     def allows_new_entries(self) -> bool:
         """Orders may proceed unless Binance has halted the IP (429/418/-1003)."""
@@ -260,6 +301,7 @@ class RestUsageTracker:
             while self._window and self._window[0] < cutoff:
                 self._window.popleft()
             self._decay_used_weight_locked()
+            self._purge_local_weight_locked()
 
     def _decay_used_weight_locked(self) -> None:
         """Drop stale used-weight headers after Binance's rolling 60s window."""
@@ -268,6 +310,14 @@ class RestUsageTracker:
         if time.monotonic() - self._used_weight_updated_at >= 60.0:
             self._used_weight_1m = 0
             self._used_weight_updated_at = 0.0
+
+    def _purge_local_weight_locked(self) -> None:
+        cutoff = time.monotonic() - 60.0
+        while self._local_weight_window and self._local_weight_window[0][0] < cutoff:
+            self._local_weight_window.popleft()
+
+    def _local_weight_sum_locked(self) -> int:
+        return int(sum(weight for _, weight in self._local_weight_window))
 
     def _effective_state_locked(self, remaining: float) -> ApiHealthState:
         self._decay_used_weight_locked()
@@ -280,7 +330,8 @@ class RestUsageTracker:
         ip_limit = max(Config.rest_ip_request_limit(), 1)
         count = len(self._window)
         throttle_at, _hard_at, weight_limit = _weight_thresholds()
-        used_weight = int(self._used_weight_1m)
+        self._purge_local_weight_locked()
+        used_weight = max(int(self._used_weight_1m), self._local_weight_sum_locked())
         throttle_remaining = max(self._weight_throttle_until - time.monotonic(), 0.0)
 
         if used_weight >= throttle_at:

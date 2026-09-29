@@ -7,6 +7,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+import pandas as pd
+
 from config import Config
 from market_data_hub import MarketDataHub
 
@@ -264,6 +266,27 @@ class TestWsStaleReconnect(unittest.TestCase):
         hub.client.futures_stream_keepalive = keepalive
         hub._maybe_keepalive_user_listen_key()
         keepalive.assert_not_called()
+
+    def test_full_ws_kline_buffer_skips_rest(self) -> None:
+        hub = _hub_with_running_ws()
+        rows = []
+        for i in range(260):
+            rows.append(
+                {
+                    "timestamp": pd.Timestamp("2026-01-01") + pd.Timedelta(minutes=5 * i),
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.2,
+                    "volume": 1_000.0,
+                }
+            )
+        hub.seed_klines_from_dataframe("ETHUSDT", "5m", pd.DataFrame(rows))
+        rest_fetcher = MagicMock(return_value=pd.DataFrame(rows[:50]))
+        with patch.object(Config, "WS_KLINE_BOOTSTRAP_MIN_BARS", 250):
+            df = hub.get_candles("ETHUSDT", "5m", 280, rest_fetcher, allow_rest=True)
+        self.assertGreaterEqual(len(df), 250)
+        rest_fetcher.assert_not_called()
 
     def test_cache_miss_does_not_rest_during_reconnect(self) -> None:
         hub = _hub_with_running_ws()

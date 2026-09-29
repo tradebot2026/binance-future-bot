@@ -23,6 +23,7 @@ from binance.exceptions import BinanceAPIException
 from config import Config
 from kline_bootstrap import run_batched_kline_bootstrap
 from logger import error_logger, system_logger
+from rest_rate_guard import kline_rest_delay_seconds
 from utils import safe_float
 from core.fill_pnl_tracker import FillPnlRecord, FillPnlTracker
 from ws_reconnect import (
@@ -1820,12 +1821,7 @@ class MarketDataHub:
             seed_fn=self.seed_klines_from_dataframe,
             mark_bootstrapped=_mark_bootstrapped,
             can_fetch=can_fetch,
-            request_delay_seconds=max(
-                Config.KLINE_REST_MIN_INTERVAL_SECONDS,
-                Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
-                Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
-                0.3,
-            ),
+            request_delay_seconds=kline_rest_delay_seconds(0),
         )
         if result.aborted:
             system_logger.warning(
@@ -1891,12 +1887,7 @@ class MarketDataHub:
             mark_bootstrapped=_mark_bootstrapped,
             can_fetch=can_fetch,
             max_pairs=max_pairs,
-            request_delay_seconds=max(
-                Config.KLINE_REST_MIN_INTERVAL_SECONDS,
-                Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
-                Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
-                0.3,
-            ),
+            request_delay_seconds=kline_rest_delay_seconds(0),
         )
         return result.seeded
 
@@ -2185,8 +2176,15 @@ class MarketDataHub:
         *,
         allow_rest: bool = True,
     ) -> pd.DataFrame:
-        """Return cached candles; optional REST refresh when allowed and not banned."""
+        """Return cached candles; REST only when the WS kline buffer is too thin."""
         cached = self.get_candles_cached_only(symbol, timeframe, limit)
+        min_bars = max(int(getattr(Config, "WS_KLINE_BOOTSTRAP_MIN_BARS", 250)), 10)
+        if not cached.empty:
+            if int(limit) < min_bars:
+                if len(cached) >= min_bars:
+                    return cached
+            elif len(cached) >= min(int(limit), min_bars):
+                return cached
         bar_open_ms = self._current_bar_open_ms(timeframe)
         key = (symbol.upper(), timeframe, int(limit))
 

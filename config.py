@@ -149,11 +149,12 @@ class Config:
     REST_IP_REQUEST_LIMIT_MAINNET: int = _env_int("REST_IP_REQUEST_LIMIT_MAINNET", 2400)
     REST_IP_REQUEST_LIMIT_TESTNET: int = _env_int("REST_IP_REQUEST_LIMIT_TESTNET", 6000)
     REST_USED_WEIGHT_LIMIT: int = _env_int("REST_USED_WEIGHT_LIMIT", 6000)
+    REST_OPERATIONAL_WEIGHT_CAP: int = _env_int("REST_OPERATIONAL_WEIGHT_CAP", 1000)
     REST_USED_WEIGHT_THROTTLE_THRESHOLD: int = _env_int(
-        "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1800
+        "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1000
     )
     REST_USED_WEIGHT_HARD_THRESHOLD: int = _env_int(
-        "REST_USED_WEIGHT_HARD_THRESHOLD", 2400
+        "REST_USED_WEIGHT_HARD_THRESHOLD", 1200
     )
     WS_DEGRADED_REST_MIN_INTERVAL_SECONDS: float = _env_float(
         "WS_DEGRADED_REST_MIN_INTERVAL_SECONDS", 60.0
@@ -192,7 +193,7 @@ class Config:
     SCAN_ALIGN_TO_MINUTE: bool = _env_bool("SCAN_ALIGN_TO_MINUTE", True)
     SCAN_MINUTE_OFFSET_SECONDS: float = _env_float("SCAN_MINUTE_OFFSET_SECONDS", 1.0)
     LOOP_IDLE_SECONDS: float = _env_float("LOOP_IDLE_SECONDS", 0.5)
-    SCAN_WARMUP_SECONDS: float = _env_float("SCAN_WARMUP_SECONDS", 240.0)
+    SCAN_WARMUP_SECONDS: float = _env_float("SCAN_WARMUP_SECONDS", 300.0)
     POSITION_GRACE_PERIOD_SECONDS: float = _env_float(
         "POSITION_GRACE_PERIOD_SECONDS", 120.0
     )
@@ -258,8 +259,9 @@ class Config:
         "KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS", 3.0
     )
     KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS: float = _env_float(
-        "KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS", 0.3
+        "KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS", 1.0
     )
+    SCAN_SYMBOL_DELAY_SECONDS: float = _env_float("SCAN_SYMBOL_DELAY_SECONDS", 1.0)
     POSITION_REST_VERIFY_MIN_INTERVAL_SECONDS: float = _env_float(
         "POSITION_REST_VERIFY_MIN_INTERVAL_SECONDS", 30.0
     )
@@ -784,10 +786,25 @@ class Config:
         return max(int(cls.REST_USED_WEIGHT_LIMIT), 1)
 
     @classmethod
+    def rest_operational_weight_cap(cls) -> int:
+        """Background REST target: stay well below Binance, never above 1800."""
+        return min(
+            max(int(getattr(cls, "REST_OPERATIONAL_WEIGHT_CAP", 1000)), 1),
+            1800,
+            cls.rest_used_weight_limit(),
+        )
+
+    @classmethod
     def rest_weight_throttle_threshold(cls) -> int:
         """Pause background REST when used weight reaches this value."""
         limit = cls.rest_used_weight_limit()
-        return min(max(int(cls.REST_USED_WEIGHT_THROTTLE_THRESHOLD), 1), limit)
+        cap = cls.rest_operational_weight_cap()
+        return min(
+            max(int(cls.REST_USED_WEIGHT_THROTTLE_THRESHOLD), 1),
+            cap,
+            1800,
+            limit,
+        )
 
     @classmethod
     def rest_weight_hard_threshold(cls) -> int:
@@ -844,11 +861,16 @@ class Config:
 
     @classmethod
     def scan_warmup_seconds(cls) -> float:
-        """Startup scanner idle window (3–5 minutes) so WS caches can fill."""
+        """Startup scanner idle window (5 minutes) so WS caches can fill."""
         raw = float(cls.SCAN_WARMUP_SECONDS)
         if raw <= 0:
             return 0.0
         return min(max(raw, 180.0), 300.0)
+
+    @classmethod
+    def scan_symbol_delay_seconds(cls) -> float:
+        """Pause between scanner/bootstrap symbol steps (never below 1.0s)."""
+        return max(float(getattr(cls, "SCAN_SYMBOL_DELAY_SECONDS", 1.0)), 1.0)
 
     @classmethod
     def get_scan_kline_intervals(cls) -> list[str]:

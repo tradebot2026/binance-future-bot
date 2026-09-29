@@ -22,6 +22,7 @@ from rest_rate_guard import (
     RestBlockLogSuppressor,
     RestUsageTracker,
     build_default_token_bucket,
+    kline_rest_delay_seconds,
     weight_for_call,
 )
 from config import Config
@@ -683,6 +684,9 @@ class BinanceExchangeManager:
             return False
         if self._rest_usage.in_safety_mode() or not self._rest_usage.allows_background_rest():
             return False
+        throttle = Config.rest_weight_throttle_threshold()
+        if self._rest_usage.projected_used_weight() + max(weight, 1) > throttle:
+            return False
         if not Config.ENABLE_STRICT_RATE_LIMIT:
             return True
         lane = RestLane.BOOTSTRAP if self._is_bootstrap_priority() else RestLane.BACKGROUND
@@ -996,12 +1000,8 @@ class BinanceExchangeManager:
         return self._rest_budget.remaining_fraction() >= reserve
 
     def _enforce_kline_rest_pace(self) -> None:
-        """Minimum gap between consecutive futures_klines REST calls."""
-        min_gap = max(
-            Config.KLINE_REST_MIN_INTERVAL_SECONDS,
-            Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
-            0.3,
-        )
+        """Strict 1.0s gap between consecutive futures_klines REST calls."""
+        min_gap = kline_rest_delay_seconds(self._rest_usage.projected_used_weight())
         with self._kline_rest_lock:
             elapsed = time.monotonic() - self._last_kline_rest_at
             if elapsed < min_gap:
@@ -1010,12 +1010,7 @@ class BinanceExchangeManager:
 
     @staticmethod
     def _default_kline_request_delay() -> float:
-        return max(
-            Config.KLINE_REST_MIN_INTERVAL_SECONDS,
-            Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
-            Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
-            0.2,
-        )
+        return kline_rest_delay_seconds(0)
 
     def _account_endpoint_gate_reason(
         self,
@@ -1206,7 +1201,42 @@ class BinanceExchangeManager:
                     raise ExchangeRateLimitError(
                         "REST budget below reserve threshold"
                     )
+                if not self._rest_usage.try_reserve_background(call_weight):
+                    if self._is_account_rest_call(func):
+                        if bypass_account_cache and priority:
+                            raise ExchangeRateLimitError(
+                                "REST weight cap — background call skipped"
+                            )
+                        return self._return_cached_account_call(func)
+                    if is_bootstrap_kline:
+                        self.halt_kline_bootstrap("operational_weight_cap")
+                        return []
+                    if self._rest_block_log.should_log("operational_weight_cap"):
+                        error_logger.warning(
+                            "REST call skipped — approaching used-weight cap "
+                            "(projected=%s/%s, endpoint=%s).",
+                            self._rest_usage.projected_used_weight(),
+                            Config.rest_weight_throttle_threshold(),
+                            getattr(func, "__name__", "unknown"),
+                        )
+                    raise ExchangeRateLimitError(
+                        "REST weight cap — background call skipped"
+                    )
+            else:
+                self._rest_usage.note_outgoing_weight(call_weight)
             self._rest_token_bucket.acquire(call_weight)
+        elif lane != RestLane.EXECUTION:
+            if not self._rest_usage.try_reserve_background(call_weight):
+                if self._is_account_rest_call(func):
+                    return self._return_cached_account_call(func)
+                if is_bootstrap_kline:
+                    self.halt_kline_bootstrap("operational_weight_cap")
+                    return []
+                raise ExchangeRateLimitError(
+                    "REST weight cap — background call skipped"
+                )
+        else:
+            self._rest_usage.note_outgoing_weight(call_weight)
 
         limiter = self._execution_rate_limiter if priority else self._rate_limiter
         func_name = getattr(func, "__name__", "")
@@ -2421,6 +2451,16 @@ class BinanceExchangeManager:
             )
         if not self.can_bootstrap_klines_rest():
             return pd.DataFrame()
+
+        if self._market_data:
+            cached = self._market_data.get_candles_cached_only(symbol, timeframe, limit)
+            min_bars = max(int(Config.WS_KLINE_BOOTSTRAP_MIN_BARS), 10)
+            if cached is not None and not cached.empty:
+                if limit < min_bars:
+                    if len(cached) >= min_bars:
+                        return cached
+                elif len(cached) >= min(limit, min_bars):
+                    return cached
 
         try:
             klines = self._throttled_call(

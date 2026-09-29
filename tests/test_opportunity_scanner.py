@@ -476,6 +476,31 @@ class TestScanWarmupGate(unittest.TestCase):
             self.assertEqual(Config.scan_warmup_seconds(), 300.0)
         with patch.object(Config, "SCAN_WARMUP_SECONDS", 0.0):
             self.assertEqual(Config.scan_warmup_seconds(), 0.0)
+        with patch.object(Config, "SCAN_WARMUP_SECONDS", 300.0):
+            self.assertEqual(Config.scan_warmup_seconds(), 300.0)
+        self.assertGreaterEqual(Config.scan_symbol_delay_seconds(), 1.0)
+
+    def test_evaluate_symbols_ws_sleeps_one_second_between_symbols(self) -> None:
+        from pipeline.event_scan_orchestrator import EventScanOrchestrator
+
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch.exchange = MagicMock()
+        orch.exchange.scan_context.return_value.__enter__ = MagicMock()
+        orch.exchange.scan_context.return_value.__exit__ = MagicMock(return_value=False)
+        orch._hub = None
+        orch._evaluate_symbol = MagicMock(return_value=None)
+        with patch.object(Config, "SCAN_SYMBOL_DELAY_SECONDS", 1.0), patch(
+            "pipeline.event_scan_orchestrator.time.sleep"
+        ) as sleeper:
+            orch._evaluate_symbols_ws(
+                ["AAAUSDT", "BBBUSDT"],
+                timeframe="5m",
+                open_symbols=set(),
+                ticker_map={},
+                book_map={},
+            )
+        sleeper.assert_called_once_with(1.0)
+        self.assertEqual(orch._evaluate_symbol.call_count, 2)
 
 
 class TestKlineWarmupScan(unittest.TestCase):

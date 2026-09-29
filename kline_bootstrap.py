@@ -13,6 +13,7 @@ import pandas as pd
 from config import Config
 from exceptions import ExchangeRateLimitError
 from logger import error_logger, system_logger
+from rest_rate_guard import kline_rest_delay_seconds
 
 
 class KlineBootstrapAborted(Exception):
@@ -122,11 +123,7 @@ def run_parallel_kline_bootstrap(
     concurrency = Config.WS_KLINE_BOOTSTRAP_CONCURRENCY
     request_timeout = Config.WS_KLINE_BOOTSTRAP_REQUEST_TIMEOUT_SECONDS
     overall_timeout = Config.WS_KLINE_BOOTSTRAP_OVERALL_TIMEOUT_SECONDS
-    inter_request_delay = max(
-        Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
-        Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
-        0.3,
-    )
+    inter_request_delay = kline_rest_delay_seconds(0)
     started = time.monotonic()
 
     system_logger.info(
@@ -223,7 +220,7 @@ def run_batched_kline_bootstrap(
     max_pairs: int | None = None,
 ) -> BootstrapResult:
     """
-    REST bootstrap in symbol batches — min 1s between requests, cooldown between batches.
+    REST bootstrap in symbol batches — 0.1–0.2s between requests, cooldown between batches.
     Aborts cleanly when can_fetch() returns False (ban / budget circuit breaker).
     """
     if not pairs:
@@ -234,15 +231,10 @@ def run_batched_kline_bootstrap(
         batch_cooldown_seconds or Config.KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS,
         0.0,
     )
-    default_delay = max(
-        Config.KLINE_REST_MIN_INTERVAL_SECONDS,
-        Config.WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS,
-        Config.KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS,
-        0.3,
-    )
-    delay = max(
-        request_delay_seconds if request_delay_seconds is not None else default_delay,
-        0.3,
+    delay = (
+        kline_rest_delay_seconds(0)
+        if request_delay_seconds is None
+        else max(float(request_delay_seconds), 1.0)
     )
 
     by_symbol: dict[str, list[str]] = defaultdict(list)
@@ -291,7 +283,9 @@ def run_batched_kline_bootstrap(
             break
 
         batch_symbols = symbol_order[batch_idx : batch_idx + batch_size]
-        for sym in batch_symbols:
+        for sym_index, sym in enumerate(batch_symbols):
+            if sym_index > 0:
+                time.sleep(max(delay, Config.scan_symbol_delay_seconds()))
             for interval in by_symbol[sym]:
                 if can_fetch is not None and not can_fetch():
                     aborted = True
@@ -387,7 +381,7 @@ def run_paced_kline_bootstrap(
 ) -> BootstrapResult:
     """Legacy paced bootstrap — delegates to batched runner (1 symbol per batch)."""
     delay = max(
-        delay_seconds if delay_seconds is not None else Config.KLINE_REST_MIN_INTERVAL_SECONDS,
+        delay_seconds if delay_seconds is not None else kline_rest_delay_seconds(0),
         1.0,
     )
     return run_batched_kline_bootstrap(

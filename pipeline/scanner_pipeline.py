@@ -119,7 +119,10 @@ class StrategyScannerPipeline:
         cap = max_results or Config.MAX_POSITIONS
 
         with self.exchange.scan_context():
-            for symbol in symbols:
+            delay = Config.scan_symbol_delay_seconds()
+            for index, symbol in enumerate(symbols):
+                if index > 0 and delay > 0:
+                    time.sleep(delay)
                 if time.time() - started > Config.SCAN_TIMEOUT_SEC:
                     scanner_logger.warning(
                         "Scan timeout after %ss — partial results (%s/%s).",

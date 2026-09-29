@@ -8,7 +8,7 @@ from logger import system_logger
 
 
 class ScanWarmupGate:
-    """Hold the scanner idle while WebSocket caches fill (3–5 minutes)."""
+    """Hold the scanner idle while WebSocket caches fill (5 minutes)."""
 
     MODE_WARMUP = "WARMUP_MODE"
     MODE_ACTIVE = "ACTIVE_SCANNING_MODE"

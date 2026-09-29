@@ -197,7 +197,10 @@ class EventScanOrchestrator:
             return []
         candidates: list[SignalCandidate] = []
         with self.exchange.scan_context():
-            for symbol in symbols:
+            delay = Config.scan_symbol_delay_seconds()
+            for index, symbol in enumerate(symbols):
+                if index > 0 and delay > 0:
+                    time.sleep(delay)
                 event = (event_by_symbol or {}).get(symbol)
                 bar_open_ms = 0
                 eval_tf = timeframe

@@ -10,7 +10,7 @@ from unittest.mock import MagicMock, patch
 
 from config import Config, _env_use_testnet
 from core.execution_ledger import ExecutionLedger, ExecutionPhase
-from rest_rate_guard import RestUsageTracker, weight_for_call
+from rest_rate_guard import RestUsageTracker, kline_rest_delay_seconds, weight_for_call
 
 
 class TestEnvFailClosed(unittest.TestCase):
@@ -84,6 +84,43 @@ class TestRestUsageTracker(unittest.TestCase):
         self.assertFalse(tracker.in_safety_mode())
         self.assertGreater(tracker.weight_throttle_remaining(), 0)
         self.assertEqual(snap["used_weight_1m"], 4500)
+
+    def test_used_weight_1000_freezes_background_rest(self) -> None:
+        tracker = RestUsageTracker()
+        tracker.note_http_response(
+            SimpleNamespace(
+                status_code=200,
+                headers={"X-MBX-USED-WEIGHT-1M": "1000"},
+            )
+        )
+        snap = tracker.snapshot()
+        self.assertEqual(snap["state"], "RATE_LIMIT_WARNING")
+        self.assertFalse(tracker.allows_background_rest())
+        self.assertTrue(tracker.allows_new_entries())
+        self.assertFalse(tracker.in_safety_mode())
+        self.assertEqual(snap["used_weight_1m"], 1000)
+
+    def test_operational_cap_keeps_1800_env_at_1000(self) -> None:
+        with patch.object(Config, "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1800), patch.object(
+            Config, "REST_OPERATIONAL_WEIGHT_CAP", 1000
+        ):
+            self.assertEqual(Config.rest_weight_throttle_threshold(), 1000)
+
+    def test_local_weight_reserve_blocks_before_binance_header(self) -> None:
+        tracker = RestUsageTracker()
+        reserved = 0
+        while tracker.try_reserve_background(5):
+            reserved += 5
+            if reserved > 2000:
+                self.fail("local reserve did not stop at the operational cap")
+        self.assertGreaterEqual(reserved, 995)
+        self.assertLessEqual(reserved, 1000)
+        self.assertFalse(tracker.try_reserve_background(5))
+        self.assertFalse(tracker.allows_background_rest())
+
+    def test_kline_rest_delay_is_one_second(self) -> None:
+        self.assertGreaterEqual(kline_rest_delay_seconds(0), 1.0)
+        self.assertGreaterEqual(kline_rest_delay_seconds(1000), 1.0)
 
     def test_used_weight_1800_freezes_background_rest(self) -> None:
         with patch.object(Config, "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1800), patch.object(
