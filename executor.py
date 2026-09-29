@@ -541,6 +541,22 @@ class TradeExecutor:
         except OSError as exc:
             error_logger.error("Failed to write orphan fill recovery file: %s", exc)
 
+    def _should_attach_native_exits(
+        self,
+        attach_native_exits: bool = False,
+        metadata: Optional[dict[str, Any]] = None,
+        structure: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Resolve native TP/SL without relying on a caller-only local name."""
+        if Config.ENABLE_NATIVE_TP_SL or bool(attach_native_exits):
+            return True
+        meta = metadata or {}
+        struct = structure or {}
+        return bool(
+            Config.ATTACH_NATIVE_TP_SL_AFTER_VALIDATION
+            and (meta.get("backtest_validated") or struct.get("backtest_validated"))
+        )
+
     def _place_native_exit_orders(
         self,
         *,
@@ -949,6 +965,7 @@ class TradeExecutor:
                 score=score,
                 structure_metadata=structure_metadata,
                 record=record,
+                attach_native_exits=attach_native_exits,
             )
 
     def _place_entry_order(
@@ -962,6 +979,7 @@ class TradeExecutor:
         score: float = 0.0,
         structure_metadata: Optional[dict[str, Any]] = None,
         record: Optional[ExecutionRecord] = None,
+        attach_native_exits: bool = False,
     ) -> Optional[dict[str, Any]]:
         """Place entry order — caller must hold entry_in_flight_mutex for symbol."""
         position_side = action
@@ -1366,7 +1384,11 @@ class TradeExecutor:
                 symbol, position_side, quantity, fill_price
             )
 
-            place_native = bool(Config.ENABLE_NATIVE_TP_SL or attach_native_exits)
+            place_native = self._should_attach_native_exits(
+                attach_native_exits,
+                metadata,
+                structure,
+            )
             if place_native:
                 self._place_native_exit_orders(
                     trade_id=trade_id,

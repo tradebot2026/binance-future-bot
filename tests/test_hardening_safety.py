@@ -303,6 +303,59 @@ class TestOrderStateSafety(unittest.TestCase):
             self.assertEqual(record.phase, ExecutionPhase.POSITION_CONFIRMED)
             exchange.seed_position_after_fill.assert_called()
 
+    def test_complete_fill_resolves_attach_native_exits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ledger = ExecutionLedger(persist_path=os.path.join(tmp, "u.json"))
+            executor, exchange = self._executor(ledger)
+            record = ExecutionRecord(
+                exec_id="EXEC-TEST-NATIVE",
+                symbol="ETHUSDT",
+                action="LONG",
+                strategy="SMC_TREND",
+                score=80.0,
+                atr=1.0,
+            )
+            with patch("executor.get_execution_ledger", return_value=ledger), patch.object(
+                executor,
+                "_resolve_execution_levels",
+                return_value=(98.0, 102.0, 104.0, 106.0),
+            ), patch.object(
+                executor, "_validate_stop_loss", return_value=(True, "")
+            ), patch.object(
+                executor, "_persist_trade_with_retry", return_value=True
+            ), patch.object(
+                executor, "_build_partial_quantities", return_value={}
+            ), patch.object(
+                executor, "_place_native_exit_orders"
+            ) as place_native, patch.object(
+                Config, "ENABLE_NATIVE_TP_SL", False
+            ), patch.object(
+                Config, "ATTACH_NATIVE_TP_SL_AFTER_VALIDATION", True
+            ):
+                result = executor._complete_filled_entry(
+                    symbol="ETHUSDT",
+                    action="LONG",
+                    atr=1.0,
+                    current_price=100.0,
+                    strategy="SMC_TREND",
+                    score=80.0,
+                    structure={"backtest_validated": True},
+                    record=record,
+                    response={
+                        "status": "FILLED",
+                        "orderId": "77",
+                        "avgPrice": 100.0,
+                        "executedQty": 1.0,
+                    },
+                    quantity=1.0,
+                    leverage=5,
+                    metadata={"backtest_validated": True},
+                    rules=_rules(),
+                    attach_native_exits=True,
+                )
+            self.assertIsNotNone(result)
+            place_native.assert_called()
+
     def test_duplicate_execution_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ledger = ExecutionLedger(persist_path=os.path.join(tmp, "u.json"))

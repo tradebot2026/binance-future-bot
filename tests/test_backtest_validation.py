@@ -8,9 +8,30 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 
 from config import Config
-from core.candle_backtest import run_15m_backtest
+from core.candle_backtest import required_backtest_win_rate, run_15m_backtest
 from core.validation_queue import AsyncBacktestValidator
 from pipeline.event_scan_orchestrator import EventScanOrchestrator
+
+
+def _run_with_outcomes(outcomes: list[float]):
+    df = _ohlcv(501)
+    remaining = list(outcomes)
+    signal_idx = {"n": 0}
+
+    def _signal(_df, idx):
+        if idx >= 200 and (idx - 200) % 20 == 0 and signal_idx["n"] < len(outcomes):
+            signal_idx["n"] += 1
+            return "LONG"
+        return None
+
+    def _sim(_df, start, *_a, **_k):
+        r = remaining.pop(0) if remaining else 1.0
+        return r, start + 5
+
+    with patch("core.candle_backtest.signal_at", side_effect=_signal), patch(
+        "core.candle_backtest._simulate_trade", side_effect=_sim
+    ):
+        return run_15m_backtest(df)
 
 
 def _ohlcv(n: int) -> pd.DataFrame:
@@ -116,21 +137,43 @@ class TestFifteenMinuteBacktest(unittest.TestCase):
         self.assertGreaterEqual(result.win_rate, 60.0)
         self.assertGreater(result.profit_r, 0.0)
 
+    def test_required_win_rate_tiers(self) -> None:
+        self.assertIsNone(required_backtest_win_rate(0))
+        self.assertIsNone(required_backtest_win_rate(2))
+        self.assertEqual(required_backtest_win_rate(3), 100.0)
+        self.assertEqual(required_backtest_win_rate(4), 75.0)
+        self.assertEqual(required_backtest_win_rate(5), 60.0)
+        self.assertEqual(required_backtest_win_rate(12), 60.0)
+
     def test_rejects_insufficient_trade_samples(self) -> None:
-        df = _ohlcv(501)
-
-        def _signal(_df, idx):
-            if idx in (220, 240, 260):
-                return "LONG"
-            return None
-
-        with patch("core.candle_backtest.signal_at", side_effect=_signal), patch(
-            "core.candle_backtest._simulate_trade",
-            side_effect=lambda _df, start, *_a, **_k: (1.0, start + 5),
-        ):
-            result = run_15m_backtest(df)
+        result = _run_with_outcomes([1.0, 1.0])
         self.assertFalse(result.passed)
+        self.assertEqual(result.trades, 2)
         self.assertEqual(result.reason, "Insufficient historical trade samples")
+
+    def test_passes_perfect_three_of_three(self) -> None:
+        result = _run_with_outcomes([1.0, 1.0, 1.0])
+        self.assertTrue(result.passed)
+        self.assertEqual(result.trades, 3)
+        self.assertEqual(result.win_rate, 100.0)
+
+    def test_rejects_imperfect_three_trade_sample(self) -> None:
+        result = _run_with_outcomes([1.0, 1.0, -1.0])
+        self.assertFalse(result.passed)
+        self.assertEqual(result.trades, 3)
+        self.assertIn("win_rate", result.reason)
+
+    def test_passes_three_of_four(self) -> None:
+        result = _run_with_outcomes([1.0, 1.0, 1.0, -1.0])
+        self.assertTrue(result.passed)
+        self.assertEqual(result.trades, 4)
+        self.assertGreaterEqual(result.win_rate, 75.0)
+
+    def test_rejects_two_of_four(self) -> None:
+        result = _run_with_outcomes([1.0, 1.0, -1.0, -1.0])
+        self.assertFalse(result.passed)
+        self.assertEqual(result.trades, 4)
+        self.assertIn("win_rate", result.reason)
 
 
 class TestValidationQueue(unittest.TestCase):
@@ -166,7 +209,7 @@ class TestValidationQueue(unittest.TestCase):
         failed = MagicMock(
             passed=False,
             win_rate=0.0,
-            trades=3,
+            trades=2,
             reason="Insufficient historical trade samples",
         )
         with patch("core.validation_queue.run_15m_backtest", return_value=failed), patch(

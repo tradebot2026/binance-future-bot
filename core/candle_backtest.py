@@ -131,13 +131,23 @@ def backtest_min_bars() -> int:
     return max(min(floor, limit), 200)
 
 
+def required_backtest_win_rate(trades: int) -> Optional[float]:
+    """Min win-rate for a closed-trade sample, or None if the sample is too thin."""
+    closed = int(trades)
+    if closed >= 5:
+        return float(Config.BACKTEST_MIN_WIN_RATE)
+    if closed == 4:
+        return 75.0
+    if closed == 3:
+        return 100.0
+    return None
+
+
 def run_15m_backtest(df: Optional[pd.DataFrame]) -> BacktestResult:
     """Walk-forward 15m simulation. Fail-closed on thin or losing history."""
     result = BacktestResult()
     min_bars = backtest_min_bars()
     warmup = max(int(Config.BACKTEST_WARMUP_BARS), 150)
-    min_wr = float(Config.BACKTEST_MIN_WIN_RATE)
-    min_trades = max(int(Config.BACKTEST_MIN_TRADES), 1)
     sl_mult = max(float(Config.SL_ATR_MULTIPLIER), 0.25)
     tp_mult = max(float(Config.TP1_ATR_MULTIPLIER), sl_mult)
 
@@ -174,7 +184,8 @@ def run_15m_backtest(df: Optional[pd.DataFrame]) -> BacktestResult:
         result.win_rate = 100.0 * result.wins / result.trades
         result.expectancy_r = result.profit_r / result.trades
 
-    if triggers < min_trades or result.trades < min_trades:
+    min_wr = required_backtest_win_rate(result.trades)
+    if min_wr is None:
         result.reason = "Insufficient historical trade samples"
         return result
     if result.win_rate < min_wr:

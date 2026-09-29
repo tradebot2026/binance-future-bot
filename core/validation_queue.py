@@ -23,7 +23,7 @@ class _QueuedCandidate:
 class AsyncBacktestValidator:
     """
     Lightweight producer (main scan) / single-consumer validator.
-    Fetches 500x15m bars and rejects win-rate < BACKTEST_MIN_WIN_RATE.
+    Fetches 500x15m bars and applies dynamic sample WR rules (3/4/5+).
     """
 
     def __init__(self, exchange: Any) -> None:
