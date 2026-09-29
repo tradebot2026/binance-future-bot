@@ -199,11 +199,19 @@ def rest_position_quantity(
     exchange: "BinanceExchangeManager",
     symbol: str,
     position_side: str,
+    *,
+    urgent: bool = False,
 ) -> Optional[float]:
     """REST-backed quantity; None means verification unavailable."""
-    if exchange.is_rest_blocked()[0]:
+    if not urgent and exchange.is_rest_blocked()[0]:
         return None
-    return exchange.get_position_quantity_rest(symbol, position_side)
+    getter = getattr(exchange, "get_position_quantity_rest", None)
+    if not callable(getter):
+        return None
+    try:
+        return getter(symbol, position_side, urgent=urgent)
+    except TypeError:
+        return getter(symbol, position_side)
 
 
 def confirm_external_close_allowed(

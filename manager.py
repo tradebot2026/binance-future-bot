@@ -65,7 +65,7 @@ class TradeManager:
     """Algorithmic virtual SL/TP manager using absolute quantities from trade metadata."""
 
     TRAILING_ATR_MULTIPLIER = 1.0
-    CLOSE_ORDER_MAX_RETRIES = 3
+    CLOSE_ORDER_MAX_RETRIES = 4
     CLOSE_ORDER_RETRY_DELAY_SECONDS = 1.0
 
     def __init__(
@@ -90,6 +90,8 @@ class TradeManager:
         self._close_queue: queue.Queue[Optional[_CloseTask]] = queue.Queue()
         self._close_inflight: set[str] = set()
         self._close_lock = threading.Lock()
+        self._market_close_attempts: dict[str, int] = {}
+        self._market_close_exhausted: set[str] = set()
         self._tick_worker = threading.Thread(
             target=self._price_tick_worker,
             name="price-tick-worker",
@@ -653,6 +655,8 @@ class TradeManager:
 
             stop_loss = safe_float(trade.get("stop_loss"))
             if stop_loss > 0 and current_price <= stop_loss:
+                if self._market_close_is_exhausted(str(trade.get("trade_id", "")), "STOP_LOSS"):
+                    return
                 self._trigger_virtual_sl(trade, current_price, stop_loss)
                 self._cancel_all_native_orders(trade)
                 self._close_position(
@@ -707,6 +711,8 @@ class TradeManager:
 
             stop_loss = safe_float(trade.get("stop_loss"))
             if stop_loss > 0 and current_price >= stop_loss:
+                if self._market_close_is_exhausted(str(trade.get("trade_id", "")), "STOP_LOSS"):
+                    return
                 self._trigger_virtual_sl(trade, current_price, stop_loss)
                 self._cancel_all_native_orders(trade)
                 self._close_position(
@@ -1113,15 +1119,123 @@ class TradeManager:
         live_qty = self.exchange.get_position_quantity_cached(symbol, position_side)
         if live_qty <= 0:
             live_qty = self.exchange.get_position_quantity(symbol, position_side)
-        if live_qty <= 0 and not exchange_only:
-            live_qty = self._metadata_remaining_quantity(trade)
-        if live_qty <= 0 and partial and requested_qty > 0:
-            live_qty = requested_qty
+        if live_qty <= 0 and partial:
+            if requested_qty > 0:
+                live_qty = requested_qty
+            elif not exchange_only:
+                live_qty = self._metadata_remaining_quantity(trade)
         if live_qty <= 0:
             return 0.0
 
         qty = min(requested_qty, live_qty)
         return round_step_size(qty, rules.step_size, rules.quantity_precision)
+
+    def _market_close_max_attempts(self) -> int:
+        return max(int(getattr(Config, "MARKET_CLOSE_MAX_ATTEMPTS", 4)), 1)
+
+    def _ensure_close_attempt_state(self) -> None:
+        if not hasattr(self, "_market_close_attempts"):
+            self._market_close_attempts = {}
+        if not hasattr(self, "_market_close_exhausted"):
+            self._market_close_exhausted = set()
+
+    def _market_close_key(self, trade_id: str, reason: str) -> str:
+        return f"{trade_id}:{reason}"
+
+    def _market_close_is_exhausted(self, trade_id: str, reason: str) -> bool:
+        if not trade_id:
+            return False
+        self._ensure_close_attempt_state()
+        return self._market_close_key(trade_id, reason) in self._market_close_exhausted
+
+    def _note_market_close_attempt(self, trade_id: str, reason: str) -> int:
+        self._ensure_close_attempt_state()
+        key = self._market_close_key(trade_id, reason)
+        count = int(self._market_close_attempts.get(key, 0)) + 1
+        self._market_close_attempts[key] = count
+        if count >= self._market_close_max_attempts():
+            self._market_close_exhausted.add(key)
+        return count
+
+    def _clear_market_close_attempts(self, trade_id: str) -> None:
+        self._ensure_close_attempt_state()
+        prefix = f"{trade_id}:"
+        for key in list(self._market_close_attempts):
+            if key.startswith(prefix):
+                self._market_close_attempts.pop(key, None)
+                self._market_close_exhausted.discard(key)
+
+    def _inspect_exchange_position_qty(
+        self, symbol: str, position_side: str
+    ) -> Optional[float]:
+        """Urgent REST size check for close/SL cleanup. None = unavailable."""
+        try:
+            ctx = getattr(self.exchange, "execution_context", None)
+            if callable(ctx):
+                with ctx():
+                    return rest_position_quantity(
+                        self.exchange, symbol, position_side, urgent=True
+                    )
+            return rest_position_quantity(
+                self.exchange, symbol, position_side, urgent=True
+            )
+        except Exception as exc:
+            error_logger.warning(
+                "Urgent REST position inspect failed for %s %s: %s",
+                symbol,
+                position_side,
+                exc,
+            )
+            return None
+
+    def _finalize_close_if_exchange_flat(
+        self,
+        trade: dict[str, Any],
+        reason: str,
+        *,
+        exit_reason: Optional[str] = None,
+    ) -> bool:
+        """If Binance size is 0, close the local trade, book PnL, and notify."""
+        return self._reconcile_exchange_flat(
+            trade,
+            reason,
+            exit_reason=exit_reason or reason or "RECONCILED_REDUCE_ONLY",
+            confirmed_by_exchange=True,
+            force_rest_inspect=True,
+        )
+
+    def _close_after_reduce_only_reject(
+        self, trade: dict[str, Any], reason: str
+    ) -> bool:
+        """-2022 / reduce-only miss: REST-inspect size and close DB if already flat."""
+        flattened = self._finalize_close_if_exchange_flat(trade, reason)
+        if flattened:
+            self._clear_market_close_attempts(str(trade.get("trade_id", "")))
+            return True
+        trade_logger.warning(
+            "[%s] ReduceOnly/miss after market close — REST did not confirm flat | trigger=%s",
+            trade.get("symbol"),
+            reason,
+        )
+        return False
+
+    def _handle_failed_market_close(
+        self, trade: dict[str, Any], reason: str
+    ) -> bool:
+        """After inner retries fail, inspect Binance size before looping again."""
+        rest_qty = self._inspect_exchange_position_qty(
+            str(trade.get("symbol", "")),
+            str(trade.get("side", "LONG")),
+        )
+        if rest_qty is not None and rest_qty <= 0:
+            return self._close_after_reduce_only_reject(trade, reason)
+        trade_logger.warning(
+            "[%s] Market close failed — REST size=%s | trigger=%s",
+            trade.get("symbol"),
+            rest_qty,
+            reason,
+        )
+        return False
 
     def _reconcile_exchange_flat(
         self,
@@ -1130,18 +1244,25 @@ class TradeManager:
         *,
         exit_reason: str = "RECONCILED_REDUCE_ONLY",
         confirmed_by_exchange: bool = False,
+        force_rest_inspect: bool = False,
     ) -> bool:
         """Mark trade closed only after REST confirms the exchange is flat."""
         symbol = str(trade.get("symbol", ""))
         position_side = str(trade.get("side", "LONG")).upper()
-        if confirmed_by_exchange:
-            rest_qty = rest_position_quantity(self.exchange, symbol, position_side)
+        inspect_now = bool(confirmed_by_exchange or force_rest_inspect)
+        if inspect_now:
+            rest_qty = self._inspect_exchange_position_qty(symbol, position_side)
+            if rest_qty is None:
+                rest_qty = rest_position_quantity(
+                    self.exchange, symbol, position_side, urgent=force_rest_inspect
+                )
             if rest_qty is None or rest_qty > 0:
                 trade_logger.warning(
-                    "[%s] Skip %s — REST did not confirm flat | trigger=%s",
+                    "[%s] Skip %s — REST did not confirm flat | trigger=%s | qty=%s",
                     symbol,
                     exit_reason,
                     reason,
+                    rest_qty,
                 )
                 return False
         elif not confirm_external_close_allowed(self.exchange, trade):
@@ -1198,19 +1319,50 @@ class TradeManager:
             partial=partial,
             exchange_only=not partial,
         )
-        if close_qty <= 0:
-            if partial:
-                if quantity > 0:
-                    close_qty = quantity
-                    trade_logger.info(
-                        "[%s] Partial close qty from metadata=%s (exchange cache stale).",
+        if not partial:
+            if self._market_close_is_exhausted(trade_id, reason):
+                flattened = self._finalize_close_if_exchange_flat(trade, reason)
+                if flattened:
+                    return True
+                trade_logger.warning(
+                    "[%s] Market close exhausted for %s — skipping further retries | trigger=%s",
+                    symbol,
+                    trade_id,
+                    reason,
+                )
+                return False
+            if close_qty <= 0:
+                flattened = self._finalize_close_if_exchange_flat(trade, reason)
+                if flattened:
+                    return True
+                rest_qty = self._inspect_exchange_position_qty(
+                    symbol, str(trade.get("side", "LONG"))
+                )
+                if rest_qty is not None and rest_qty > 0:
+                    close_qty = rest_qty
+                    trade_logger.warning(
+                        "[%s] Cache miss on close qty; REST size=%.8f — retrying flatten | trigger=%s",
                         symbol,
                         close_qty,
+                        reason,
                     )
                 else:
+                    trade_logger.warning(
+                        "[%s] Close qty=0 and REST did not confirm remaining size | trigger=%s",
+                        symbol,
+                        reason,
+                    )
                     return False
+        elif close_qty <= 0:
+            if quantity > 0:
+                close_qty = quantity
+                trade_logger.info(
+                    "[%s] Partial close qty from metadata=%s (exchange cache stale).",
+                    symbol,
+                    close_qty,
+                )
             else:
-                return self._reconcile_exchange_flat(trade, reason)
+                return False
 
         with self._close_lock:
             if inflight_key in self._close_inflight:
@@ -1222,6 +1374,16 @@ class TradeManager:
                 )
                 return False
             self._close_inflight.add(inflight_key)
+            if not partial:
+                attempts = self._note_market_close_attempt(trade_id, reason)
+                trade_logger.info(
+                    "[%s] Executing Market Close attempt %s/%s | trigger=%s | qty=%s",
+                    symbol,
+                    attempts,
+                    self._market_close_max_attempts(),
+                    reason,
+                    close_qty,
+                )
 
         task = _CloseTask(
             trade=trade,
@@ -1284,7 +1446,10 @@ class TradeManager:
                     reason,
                 )
                 return False
-            return self._reconcile_exchange_flat(trade, reason)
+            flattened = self._finalize_close_if_exchange_flat(trade, reason)
+            if flattened:
+                self._clear_market_close_attempts(str(trade_id))
+            return flattened
 
         try:
             response: Optional[dict[str, Any]] = None
@@ -1304,14 +1469,10 @@ class TradeManager:
                         reason,
                         exc,
                     )
-                    return self._reconcile_exchange_flat(
-                        trade, reason, confirmed_by_exchange=True
-                    )
+                    return self._close_after_reduce_only_reject(trade, reason)
                 except OrderExecutionError as exc:
                     if PositionAlreadyClosedError.matches(exc):
-                        return self._reconcile_exchange_flat(
-                            trade, reason, confirmed_by_exchange=True
-                        )
+                        return self._close_after_reduce_only_reject(trade, reason)
                     if attempt >= self.CLOSE_ORDER_MAX_RETRIES - 1:
                         error_logger.error(
                             "Close order failed for %s (%s) after %s attempts: %s",
@@ -1320,7 +1481,7 @@ class TradeManager:
                             self.CLOSE_ORDER_MAX_RETRIES,
                             exc,
                         )
-                        return False
+                        return self._handle_failed_market_close(trade, reason)
                     delay = self.CLOSE_ORDER_RETRY_DELAY_SECONDS * (attempt + 1)
                     trade_logger.warning(
                         "[%s] Close retry %s/%s in %.1fs | reason=%s | err=%s",
@@ -1339,19 +1500,15 @@ class TradeManager:
                 reason,
                 exc,
             )
-            return self._reconcile_exchange_flat(
-                trade, reason, confirmed_by_exchange=True
-            )
+            return self._close_after_reduce_only_reject(trade, reason)
         except OrderExecutionError as exc:
             if PositionAlreadyClosedError.matches(exc):
-                return self._reconcile_exchange_flat(
-                    trade, reason, confirmed_by_exchange=True
-                )
+                return self._close_after_reduce_only_reject(trade, reason)
             error_logger.error("Close order failed for %s (%s): %s", symbol, reason, exc)
-            return False
+            return self._handle_failed_market_close(trade, reason)
 
         if not response:
-            return False
+            return self._handle_failed_market_close(trade, reason)
 
         order_id = str(response.get("orderId", ""))
         fill_pnl = self.exchange.resolve_order_fill_pnl(
@@ -1571,7 +1728,7 @@ class TradeManager:
                     claim_owner,
                 )
                 return safe_float(trade.get("realized_pnl") or trade.get("pnl"))
-            if claim_owner != "close_pipeline":
+            if claim_owner not in ("main", "close_pipeline"):
                 if not claim_exit(trade_id, "close_pipeline"):
                     if exit_claim_active(trade_id):
                         trade_logger.debug(
@@ -1611,6 +1768,7 @@ class TradeManager:
         symbol = str(trade.get("symbol", ""))
         position_side = str(trade.get("side", "LONG")).upper()
         closed_at = utc_now().isoformat()
+        self._clear_market_close_attempts(trade_id)
 
         opened_at_raw = trade.get("opened_at")
         duration: Optional[int] = None

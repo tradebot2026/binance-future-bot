@@ -792,5 +792,134 @@ class TestPrematureCloseGuards(unittest.TestCase):
             close.assert_not_called()
 
 
+class TestStopLossMarketCloseLoop(unittest.TestCase):
+    def _manager(self):
+        import threading
+
+        from exchange import SymbolRules
+        from manager import TradeManager
+
+        mgr = TradeManager.__new__(TradeManager)
+        mgr.exchange = MagicMock()
+        mgr.db = MagicMock()
+        mgr.telegram = MagicMock()
+        mgr._close_lock = threading.Lock()
+        mgr._close_inflight = set()
+        mgr._close_queue = MagicMock()
+        mgr._market_close_attempts = {}
+        mgr._market_close_exhausted = set()
+        mgr._cancel_all_native_orders = MagicMock()
+        mgr._mark_trade_closed = MagicMock()
+        mgr.exchange.get_symbol_rules.return_value = SymbolRules(
+            2, 3, 0.01, 0.001, 0.001, 5.0
+        )
+        mgr.exchange.get_position_quantity_cached.return_value = 0.0
+        mgr.exchange.get_position_quantity.return_value = 0.0
+        mgr.exchange.get_market_price.return_value = 99.0
+        return mgr
+
+    def test_market_close_max_attempts_in_range(self) -> None:
+        self.assertGreaterEqual(Config.MARKET_CLOSE_MAX_ATTEMPTS, 3)
+        self.assertLessEqual(Config.MARKET_CLOSE_MAX_ATTEMPTS, 5)
+
+    def test_stop_loss_rest_flat_closes_without_miss_threshold(self) -> None:
+        from exchange import ClosedPositionPnl
+
+        mgr = self._manager()
+        trade = {"trade_id": "t-sl", "symbol": "BTCUSDT", "side": "LONG"}
+        with patch.object(mgr, "_inspect_exchange_position_qty", return_value=0.0), patch(
+            "manager.confirm_external_close_allowed", return_value=False
+        ), patch(
+            "manager.resolve_exchange_close_pnl",
+            return_value=ClosedPositionPnl(
+                realized_pnl=-1.25, exit_price=99.0, source="income", fill_count=1
+            ),
+        ):
+            ok = mgr._close_position(trade, quantity=1.0, reason="STOP_LOSS")
+        self.assertTrue(ok)
+        mgr._mark_trade_closed.assert_called_once()
+        self.assertEqual(mgr._mark_trade_closed.call_args.kwargs["reason"], "STOP_LOSS")
+        self.assertEqual(mgr._mark_trade_closed.call_args.kwargs["pnl"], -1.25)
+        mgr._close_queue.put.assert_not_called()
+
+    def test_reduce_only_reject_rest_flat_closes_db(self) -> None:
+        from exceptions import PositionAlreadyClosedError
+        from exchange import ClosedPositionPnl
+
+        mgr = self._manager()
+        trade = {
+            "trade_id": "t-sl",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "status": "OPEN",
+        }
+        mgr.db.get_trade.return_value = trade
+        mgr.exchange.get_position_quantity_cached.return_value = 1.0
+        mgr.exchange.get_position_quantity.return_value = 1.0
+        mgr.exchange.close_position_quantity.side_effect = PositionAlreadyClosedError(
+            "ReduceOnly order is rejected"
+        )
+        with patch.object(mgr, "_inspect_exchange_position_qty", return_value=0.0), patch(
+            "manager.resolve_exchange_close_pnl",
+            return_value=ClosedPositionPnl(
+                realized_pnl=-2.0, exit_price=98.5, source="income", fill_count=1
+            ),
+        ):
+            ok = mgr._execute_close_order(trade, 1.0, "STOP_LOSS")
+        self.assertTrue(ok)
+        mgr._mark_trade_closed.assert_called_once()
+        self.assertEqual(mgr._mark_trade_closed.call_args.kwargs["reason"], "STOP_LOSS")
+        self.assertEqual(mgr._mark_trade_closed.call_args.kwargs["pnl"], -2.0)
+
+    def test_exhausted_market_close_does_not_retry_when_rest_still_open(self) -> None:
+        mgr = self._manager()
+        trade = {"trade_id": "t-sl", "symbol": "BTCUSDT", "side": "LONG"}
+        mgr.exchange.get_position_quantity_cached.return_value = 1.0
+        mgr.exchange.get_position_quantity.return_value = 1.0
+        with patch("manager.claim_exit", return_value=True), patch(
+            "manager.exit_claim_active", return_value=False
+        ):
+            for _ in range(Config.MARKET_CLOSE_MAX_ATTEMPTS):
+                mgr._close_inflight.clear()
+                self.assertTrue(
+                    mgr._close_position(trade, quantity=1.0, reason="STOP_LOSS")
+                )
+        self.assertEqual(
+            mgr._close_queue.put.call_count, Config.MARKET_CLOSE_MAX_ATTEMPTS
+        )
+        self.assertTrue(mgr._market_close_is_exhausted("t-sl", "STOP_LOSS"))
+        mgr._close_queue.put.reset_mock()
+        with patch.object(mgr, "_inspect_exchange_position_qty", return_value=1.25):
+            ok = mgr._close_position(trade, quantity=1.0, reason="STOP_LOSS")
+        self.assertFalse(ok)
+        mgr._close_queue.put.assert_not_called()
+        mgr._mark_trade_closed.assert_not_called()
+
+    def test_manage_long_skips_stop_loss_after_exhausted_retries(self) -> None:
+        mgr = self._manager()
+        trade = {
+            "trade_id": "t-sl",
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "status": "OPEN",
+            "entry_price": 100.0,
+            "stop_loss": 95.0,
+            "take_profit_1": 0,
+            "take_profit_2": 0,
+            "take_profit_3": 0,
+        }
+        mgr.db.get_trade.return_value = trade
+        mgr.db.parse_trade_metadata.return_value = {}
+        mgr._market_close_exhausted.add("t-sl:STOP_LOSS")
+        with patch.object(mgr, "_advance_profit_stop_ladder"), patch.object(
+            mgr, "_apply_trailing_stop"
+        ), patch.object(mgr, "_trigger_virtual_sl") as sl, patch.object(
+            mgr, "_close_position"
+        ) as close:
+            mgr._manage_long_trade(trade, 90.0)
+        sl.assert_not_called()
+        close.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

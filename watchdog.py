@@ -462,6 +462,21 @@ class PositionWatchdog:
         close_qty = min(signal.quantity, live_qty) if live_qty > 0 else signal.quantity
 
         if close_qty <= 0:
+            rest_qty = None
+            getter = getattr(self.exchange, "get_position_quantity_rest", None)
+            if callable(getter):
+                try:
+                    rest_qty = getter(symbol, side, urgent=True)
+                except TypeError:
+                    rest_qty = getter(symbol, side)
+            if rest_qty is not None and rest_qty <= 0:
+                watchdog_logger.warning(
+                    "[%s] Emergency close: REST qty=0 — marking local trade CLOSED.",
+                    symbol,
+                )
+                self._mark_trade_closed_db(trade, signal.reason, mark_price)
+                self.state.clear_breach(f"{trade_id}:")
+                return
             watchdog_logger.warning("[%s] Emergency close skipped — qty=0.", symbol)
             return
 

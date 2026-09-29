@@ -2934,17 +2934,26 @@ class BinanceExchangeManager:
         return self._refresh_positions_cache(force=force_refresh)
 
     def fetch_symbol_positions_rest(
-        self, symbol: str, *, force: bool = False
+        self, symbol: str, *, force: bool = False, urgent: bool = False
     ) -> Optional[list[dict[str, Any]]]:
         """
         Authoritative per-symbol REST snapshot via futures_position_information.
         Returns None when REST is unavailable (never falls back to WS/cache).
         """
         symbol = symbol.upper()
-        if self.is_rest_blocked()[0]:
+        if urgent:
+            if self._rest_usage.in_safety_mode():
+                return None
+            if self._market_data:
+                banned, _ = self._market_data.is_rest_blocked()
+                if banned:
+                    return None
+        elif self.is_rest_blocked()[0]:
             return None
-        if not self._is_execution_priority() and not self._degraded_rest_allowed(
-            "position", consume=False
+        if (
+            not urgent
+            and not self._is_execution_priority()
+            and not self._degraded_rest_allowed("position", consume=False)
         ):
             cached = self._symbol_position_rest_cache.get(symbol)
             return cached[1] if cached else None
@@ -2953,13 +2962,15 @@ class BinanceExchangeManager:
         min_interval = max(Config.POSITION_REST_VERIFY_MIN_INTERVAL_SECONDS, 5.0)
         if self._ws_reconnect_or_warmup():
             min_interval = max(min_interval, float(Config.WS_DEGRADED_REST_MIN_INTERVAL_SECONDS), 60.0)
-        if not force or self._ws_reconnect_or_warmup():
+        if not urgent and (not force or self._ws_reconnect_or_warmup()):
             cached = self._symbol_position_rest_cache.get(symbol)
             if cached and (now - cached[0]) < min_interval:
                 return cached[1]
 
-        if not self._is_execution_priority() and not self._degraded_rest_allowed(
-            "position"
+        if (
+            not urgent
+            and not self._is_execution_priority()
+            and not self._degraded_rest_allowed("position")
         ):
             cached = self._symbol_position_rest_cache.get(symbol)
             return cached[1] if cached else None
@@ -2968,8 +2979,8 @@ class BinanceExchangeManager:
             raw = self._throttled_call(
                 self.client.futures_position_information,
                 symbol=symbol,
-                execution_priority=self._is_execution_priority(),
-                bypass_account_cache=self._is_execution_priority(),
+                execution_priority=urgent or self._is_execution_priority(),
+                bypass_account_cache=urgent or self._is_execution_priority(),
             )
         except ExchangeRateLimitError as exc:
             error_logger.warning(
@@ -2992,7 +3003,7 @@ class BinanceExchangeManager:
         return raw
 
     def get_position_quantity_rest(
-        self, symbol: str, position_side: str
+        self, symbol: str, position_side: str, *, urgent: bool = False
     ) -> Optional[float]:
         """
         REST-backed position quantity for reconciliation.
@@ -3001,7 +3012,7 @@ class BinanceExchangeManager:
         """
         symbol = symbol.upper()
         position_side = position_side.upper()
-        raw = self.fetch_symbol_positions_rest(symbol)
+        raw = self.fetch_symbol_positions_rest(symbol, force=urgent, urgent=urgent)
         if raw is None:
             return None
         for pos in raw:
