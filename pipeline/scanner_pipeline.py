@@ -93,9 +93,9 @@ class StrategyScannerPipeline:
 
         tag_label = ",".join(s.tag for s in strategies)
         scanner_logger.info(
-            "Pipeline scan starting | strategies=%s | pair_delay=%.2fs",
+            "Pipeline scan starting | strategies=%s | symbol_delay=%.1fs",
             tag_label,
-            Config.SCAN_PAIR_DELAY_SECONDS,
+            Config.scan_symbol_delay_seconds(),
         )
 
         if reset_conflict_cycle:
@@ -118,34 +118,34 @@ class StrategyScannerPipeline:
         scanned = 0
         cap = max_results or Config.MAX_POSITIONS
 
-        with self.exchange.scan_context():
-            delay = Config.scan_symbol_delay_seconds()
-            for index, symbol in enumerate(symbols):
-                if index > 0 and delay > 0:
-                    time.sleep(delay)
-                if time.time() - started > Config.SCAN_TIMEOUT_SEC:
-                    scanner_logger.warning(
-                        "Scan timeout after %ss — partial results (%s/%s).",
-                        Config.SCAN_TIMEOUT_SEC,
-                        scanned,
-                        len(symbols),
-                    )
-                    break
-
-                ticker = ticker_map.get(symbol, {})
-                book = book_map.get(symbol, {})
-                price = universe.price_map.get(symbol, safe_float(ticker.get("lastPrice")))
-                volume_24h = safe_float(ticker.get("quoteVolume"))
-                volume_rank = universe.volume_ranks.get(symbol, 0)
-
-                snapshot = self.snapshot_factory.build(
-                    symbol,
-                    price=price,
-                    ticker=ticker,
-                    book=book,
-                    volume_24h=volume_24h,
-                    volume_rank=volume_rank,
+        delay = Config.scan_symbol_delay_seconds()
+        for index, symbol in enumerate(symbols):
+            if index > 0 and delay > 0:
+                time.sleep(delay)
+            if time.time() - started > Config.SCAN_TIMEOUT_SEC:
+                scanner_logger.warning(
+                    "Scan timeout after %ss — partial results (%s/%s).",
+                    Config.SCAN_TIMEOUT_SEC,
+                    scanned,
+                    len(symbols),
                 )
+                break
+
+            ticker = ticker_map.get(symbol, {})
+            book = book_map.get(symbol, {})
+            price = universe.price_map.get(symbol, safe_float(ticker.get("lastPrice")))
+            volume_24h = safe_float(ticker.get("quoteVolume"))
+            volume_rank = universe.volume_ranks.get(symbol, 0)
+
+            snapshot = self.snapshot_factory.build(
+                symbol,
+                price=price,
+                ticker=ticker,
+                book=book,
+                volume_24h=volume_24h,
+                volume_rank=volume_rank,
+            )
+            with self.exchange.scan_context():
                 if snapshot is None:
                     rejection_stats["snapshot_miss"] += 1
                     continue
@@ -200,9 +200,6 @@ class StrategyScannerPipeline:
                     else:
                         winners.append(winner)
                         self._log_accepted_signal(winner)
-
-                if Config.SCAN_PAIR_DELAY_SECONDS > 0:
-                    time.sleep(Config.SCAN_PAIR_DELAY_SECONDS)
 
         ranked = CandidateArbitrator.rank_global(winners, cap)
         dict_results = [c.to_dict() for c in ranked]

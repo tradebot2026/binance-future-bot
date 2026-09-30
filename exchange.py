@@ -547,20 +547,18 @@ class BinanceExchangeManager:
         if until_ms:
             halt_seconds = max(
                 int((until_ms / 1000.0) - time.time()),
-                Config.RATE_LIMIT_HALT_SECONDS,
+                int(Config.rate_limit_scanner_halt_seconds()),
             )
         elif exc.code == 418:
-            halt_seconds = max(Config.RATE_LIMIT_HALT_SECONDS, 600)
-        elif exc.code == -1003:
-            halt_seconds = max(
-                Config.RATE_LIMIT_SOFT_HALT_SECONDS,
-                Config.RATE_LIMIT_HALT_SECONDS,
-                300,
-            )
+            halt_seconds = int(max(Config.rate_limit_scanner_halt_seconds(), 900))
+        elif exc.code in (-1003, 429):
+            halt_seconds = int(max(Config.rate_limit_scanner_halt_seconds(), 900))
         else:
-            halt_seconds = max(
-                Config.REST_BAN_MIN_SLEEP_SECONDS,
-                Config.RATE_LIMIT_HALT_SECONDS,
+            halt_seconds = int(
+                max(
+                    Config.REST_BAN_MIN_SLEEP_SECONDS,
+                    Config.rate_limit_scanner_halt_seconds(),
+                )
             )
 
         self._rest_usage.note_binance_error(
@@ -654,11 +652,24 @@ class BinanceExchangeManager:
             or (getattr(hub, "is_ws_warming_up", lambda: False)())
         )
 
+    def _ws_streams_degraded(self) -> bool:
+        """True when WS health is DEGRADED/STALE — REST must back off, not flood."""
+        hub = self._market_data
+        if hub is None:
+            return False
+        checker = getattr(hub, "ws_state_is_degraded", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        return False
+
     def _degraded_rest_allowed(self, kind: str = "account", *, consume: bool = True) -> bool:
-        """During WS reconnect/warmup, at most one REST of this kind per 60s."""
-        if not self._ws_reconnect_or_warmup():
+        """During WS reconnect/DEGRADED, space REST of this kind (default 10s)."""
+        if not self._ws_reconnect_or_warmup() and not self._ws_streams_degraded():
             return True
-        interval = max(float(Config.WS_DEGRADED_REST_MIN_INTERVAL_SECONDS), 60.0)
+        interval = max(float(Config.ws_degraded_rest_min_interval_seconds()), 10.0)
         now = time.monotonic()
         last = self._last_degraded_rest_at.get(kind, 0.0)
         if last > 0 and (now - last) < interval:
@@ -678,6 +689,10 @@ class BinanceExchangeManager:
         """True when a non-execution REST call is allowed (ban, hard-stop, budget)."""
         if self._ws_reconnect_or_warmup():
             return False
+        if self._ws_streams_degraded() and not self._degraded_rest_allowed(
+            "background", consume=False
+        ):
+            return False
         if self._market_data and self._market_data.is_rest_blocked()[0]:
             return False
         if self._rest_token_bucket.is_hard_stopped():
@@ -688,9 +703,13 @@ class BinanceExchangeManager:
         if self._rest_usage.projected_used_weight() + max(weight, 1) > throttle:
             return False
         if not Config.ENABLE_STRICT_RATE_LIMIT:
-            return True
-        lane = RestLane.BOOTSTRAP if self._is_bootstrap_priority() else RestLane.BACKGROUND
-        return self._rest_budget.has_budget_for(max(weight, 1), lane)
+            allowed = True
+        else:
+            lane = RestLane.BOOTSTRAP if self._is_bootstrap_priority() else RestLane.BACKGROUND
+            allowed = self._rest_budget.has_budget_for(max(weight, 1), lane)
+        if allowed and self._ws_streams_degraded():
+            self._degraded_rest_allowed("background", consume=True)
+        return allowed
 
     def is_rest_blocked(self) -> tuple[bool, str]:
         """True when REST must not be attempted (IP ban / hard-stop)."""

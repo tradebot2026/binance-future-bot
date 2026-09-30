@@ -104,9 +104,7 @@ class ScanPriorityQueue:
     def should_run_hot_scan(self) -> bool:
         if not self._hot:
             return False
-        if Config.SCAN_ALIGN_TO_MINUTE:
-            return True
-        interval = max(Config.HOT_SCAN_INTERVAL_SECONDS, 5.0)
+        interval = max(Config.hot_scan_interval_seconds(), 120.0)
         return (time.monotonic() - self._last_hot_scan_at) >= interval
 
     def mark_hot_scan_complete(self) -> None:
@@ -115,9 +113,7 @@ class ScanPriorityQueue:
     def should_run_background_batch(self) -> bool:
         if not self._background:
             return False
-        if Config.SCAN_ALIGN_TO_MINUTE:
-            return True
-        delay = max(Config.BACKGROUND_SCAN_BATCH_DELAY_SECONDS, 0.5)
+        delay = max(Config.BACKGROUND_SCAN_BATCH_DELAY_SECONDS, 10.0)
         return (time.monotonic() - self._last_background_batch_at) >= delay
 
     def next_background_batch(self) -> list[str]:

@@ -32,17 +32,15 @@ class TestEnvFailClosed(unittest.TestCase):
 
 
 class TestRestUsageTracker(unittest.TestCase):
-    def test_http_429_enters_safety_mode(self) -> None:
+    def test_http_429_pauses_rest_for_fifteen_minutes(self) -> None:
         tracker = RestUsageTracker()
         response = SimpleNamespace(
             status_code=429,
             headers={"Retry-After": "12", "X-MBX-USED-WEIGHT-1M": "2400"},
         )
         tracker.note_http_response(response)
-        self.assertTrue(tracker.in_safety_mode())
-        self.assertFalse(tracker.allows_background_rest())
-        self.assertFalse(tracker.allows_new_entries())
-        self.assertGreater(tracker.safety_remaining(), 0)
+        self.assertGreaterEqual(tracker.safety_remaining(), 899)
+        self.assertGreaterEqual(Config.rate_limit_scanner_halt_seconds(), 900.0)
 
     def test_http_418_is_ip_banned(self) -> None:
         tracker = RestUsageTracker()
@@ -50,7 +48,7 @@ class TestRestUsageTracker(unittest.TestCase):
         tracker.note_http_response(response)
         snap = tracker.snapshot()
         self.assertEqual(snap["state"], "IP_BANNED")
-        self.assertGreaterEqual(tracker.safety_remaining(), 600)
+        self.assertGreaterEqual(tracker.safety_remaining(), 900)
 
     def test_minus_1003_halt_is_not_capped_at_120s(self) -> None:
         tracker = RestUsageTracker()
@@ -100,11 +98,25 @@ class TestRestUsageTracker(unittest.TestCase):
         self.assertFalse(tracker.in_safety_mode())
         self.assertEqual(snap["used_weight_1m"], 1000)
 
-    def test_operational_cap_keeps_1800_env_at_1000(self) -> None:
+    def test_used_weight_600_freezes_background_rest(self) -> None:
+        tracker = RestUsageTracker()
+        tracker.note_http_response(
+            SimpleNamespace(
+                status_code=200,
+                headers={"X-MBX-USED-WEIGHT-1M": "600"},
+            )
+        )
+        snap = tracker.snapshot()
+        self.assertEqual(snap["state"], "RATE_LIMIT_WARNING")
+        self.assertFalse(tracker.allows_background_rest())
+        self.assertTrue(tracker.allows_new_entries())
+        self.assertEqual(snap["used_weight_1m"], 600)
+
+    def test_operational_cap_keeps_1800_env_at_600(self) -> None:
         with patch.object(Config, "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1800), patch.object(
-            Config, "REST_OPERATIONAL_WEIGHT_CAP", 1000
+            Config, "REST_OPERATIONAL_WEIGHT_CAP", 600
         ):
-            self.assertEqual(Config.rest_weight_throttle_threshold(), 1000)
+            self.assertEqual(Config.rest_weight_throttle_threshold(), 600)
 
     def test_local_weight_reserve_blocks_before_binance_header(self) -> None:
         tracker = RestUsageTracker()
@@ -113,8 +125,8 @@ class TestRestUsageTracker(unittest.TestCase):
             reserved += 5
             if reserved > 2000:
                 self.fail("local reserve did not stop at the operational cap")
-        self.assertGreaterEqual(reserved, 995)
-        self.assertLessEqual(reserved, 1000)
+        self.assertGreaterEqual(reserved, 595)
+        self.assertLessEqual(reserved, 600)
         self.assertFalse(tracker.try_reserve_background(5))
         self.assertFalse(tracker.allows_background_rest())
 

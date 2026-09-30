@@ -181,6 +181,9 @@ class MarketDataHub:
         self._reconnect_in_progress = False
         self._last_reconnect_request_at: float = 0.0
         self._last_stale_reconnect_success_at: float = 0.0
+        self._last_ticker_socket_refresh_at: float = 0.0
+        self._ticker_socket_refresh_in_progress = False
+        self._ticker_socket_refresh_lock = threading.Lock()
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
         self._reconnect_policy = WsReconnectPolicy(
@@ -254,6 +257,15 @@ class MarketDataHub:
         """True during reconnect or warmup — REST fallbacks must not storm."""
         return bool(self._reconnect_in_progress or self.is_ws_warming_up())
 
+    def ws_state_is_degraded(self) -> bool:
+        """True when hub health is DEGRADED/STALE/reconnect — REST must back off."""
+        if self._reconnect_in_progress or self.is_ws_warming_up():
+            return True
+        if not self._ws_running:
+            return False
+        state = str(self.get_ws_health_snapshot().get("state") or "").upper()
+        return state in {"DEGRADED", "STALE", "RECONNECTING", "WARMING"}
+
     def _governor_blocks_background_rest(self, weight: int = 40) -> bool:
         gov = self._rest_governor
         if gov is None:
@@ -326,10 +338,10 @@ class MarketDataHub:
         if fetcher is None:
             return len(self._tickers)
 
-        if self.ws_is_degraded():
+        if self.ws_is_degraded() or self.ws_state_is_degraded():
             if self._ws_log.should_log("ticker_rest_skip_degraded"):
                 system_logger.debug(
-                    "Ticker REST skipped — WS reconnect/warmup (cache only)."
+                    "Ticker REST skipped — WS degraded/reconnect (cache only, backoff)."
                 )
             return len(self._tickers)
 
@@ -431,6 +443,75 @@ class MarketDataHub:
         if self._kline_feeds_healthy() or self._stale_reconnect_on_cooldown():
             return False
         return True
+
+    def _should_refresh_ticker_sockets(self) -> bool:
+        """Resubscribe miniTicker/bookTicker when those feeds are stale but klines live."""
+        if not self._ws_running or self._reconnect_in_progress or self.is_ws_warming_up():
+            return False
+        if getattr(self, "_ticker_socket_refresh_in_progress", False):
+            return False
+        if not self.ws_is_stale() and not self._book_stream_is_stale():
+            return False
+        if not self._kline_feeds_healthy():
+            return False
+        cooldown = max(float(getattr(Config, "WS_TICKER_SOCKET_REFRESH_SECONDS", 15.0)), 5.0)
+        last = float(getattr(self, "_last_ticker_socket_refresh_at", 0.0) or 0.0)
+        if last > 0 and (time.monotonic() - last) < cooldown:
+            return False
+        return True
+
+    def _refresh_stale_ticker_sockets(self, reason: str) -> None:
+        """Reconnect ticker/book sockets only — do not tear down healthy klines."""
+        manager = self._ws_manager
+        if manager is None or not self._ws_running:
+            return
+        with self._ticker_socket_refresh_lock:
+            if self._ticker_socket_refresh_in_progress:
+                return
+            self._ticker_socket_refresh_in_progress = True
+            self._last_ticker_socket_refresh_at = time.monotonic()
+
+        system_logger.info("[WS_RECONNECT_ATTEMPT] ticker/book sockets only: %s", reason)
+        try:
+            if self._book_ticker_conn_key:
+                try:
+                    manager.stop_socket(self._book_ticker_conn_key)
+                except Exception as exc:
+                    system_logger.debug("BookTicker socket stop failed: %s", exc)
+                self._book_ticker_conn_key = None
+            if self._ticker_conn_key:
+                try:
+                    manager.stop_socket(self._ticker_conn_key)
+                except Exception as exc:
+                    system_logger.debug("Ticker socket stop failed: %s", exc)
+                self._ticker_conn_key = None
+
+            self._ticker_conn_key = manager.start_futures_multiplex_socket(
+                callback=self._wrap_ws_callback(self._on_ticker_message, stream="ticker"),
+                streams=["!miniTicker@arr"],
+            )
+            if Config.ENABLE_WS_BOOK_STREAM:
+                self._book_ticker_conn_key = manager.start_futures_multiplex_socket(
+                    callback=self._wrap_ws_callback(
+                        self._on_book_ticker_message, stream="book"
+                    ),
+                    streams=["!bookTicker@arr"],
+                )
+            system_logger.info(
+                "[WS_RECONNECTED] miniTicker/bookTicker re-subscribed after: %s",
+                reason,
+            )
+            self._reconnect_policy.reset()
+        except Exception as exc:
+            system_logger.error(
+                "[WS_ERROR] ticker socket refresh failed: %s — scheduling full reconnect",
+                exc,
+            )
+            self._ticker_socket_refresh_in_progress = False
+            self._request_reconnect(f"ticker socket refresh failed: {exc}")
+            return
+        finally:
+            self._ticker_socket_refresh_in_progress = False
 
     def is_ticker_cache_usable(self, min_symbols: int = 1) -> bool:
         """Scanner may proceed when tickers are present (WS or REST)."""
@@ -774,10 +855,16 @@ class MarketDataHub:
             ):
                 continue
             blocked, _ = self.is_rest_blocked()
-            if (
+            if self._should_refresh_ticker_sockets():
+                age = self.ticker_cache_age_seconds()
+                self._refresh_stale_ticker_sockets(
+                    f"ticker/book stale — age {age:.0f}s (klines healthy)"
+                )
+            elif (
                 not blocked
                 and not self._rest_quiet_mode()
                 and not self._governor_blocks_background_rest(40)
+                and not self.ws_state_is_degraded()
                 and self.needs_ticker_rest_fallback()
             ):
                 self.refresh_ticker_cache_from_rest()
@@ -2200,13 +2287,13 @@ class MarketDataHub:
         blocked, _ = self.is_rest_blocked()
         if blocked or not allow_rest or rest_fetcher is None:
             return cached
-        if self.ws_is_degraded() or self._governor_blocks_background_rest(5):
+        if self.ws_is_degraded() or self.ws_state_is_degraded() or self._governor_blocks_background_rest(5):
             return cached
 
         miss_key = (symbol.upper(), timeframe)
         last_miss = self._cache_miss_rest_at.get(miss_key, 0.0)
         if cached.empty and (time.monotonic() - last_miss) < max(
-            float(Config.WS_DEGRADED_REST_MIN_INTERVAL_SECONDS), 60.0
+            float(Config.ws_degraded_rest_min_interval_seconds()), 10.0
         ):
             return cached
         if cached.empty:

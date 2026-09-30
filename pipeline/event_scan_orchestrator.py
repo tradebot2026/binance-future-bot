@@ -192,15 +192,16 @@ class EventScanOrchestrator:
         ticker_map: dict[str, Any],
         book_map: dict[str, Any],
         event_by_symbol: Optional[dict[str, CandleCloseEvent]] = None,
+        pace: bool = True,
     ) -> list[SignalCandidate]:
         if not symbols:
             return []
         candidates: list[SignalCandidate] = []
-        with self.exchange.scan_context():
-            delay = Config.scan_symbol_delay_seconds()
-            for index, symbol in enumerate(symbols):
-                if index > 0 and delay > 0:
-                    time.sleep(delay)
+        delay = Config.scan_symbol_delay_seconds() if pace else 0.0
+        for index, symbol in enumerate(symbols):
+            if index > 0 and delay > 0:
+                time.sleep(delay)
+            with self.exchange.scan_context():
                 event = (event_by_symbol or {}).get(symbol)
                 bar_open_ms = 0
                 eval_tf = timeframe
@@ -220,8 +221,8 @@ class EventScanOrchestrator:
                     book_map=book_map,
                     mark_event=event,
                 )
-                if signal is not None:
-                    candidates.append(signal)
+            if signal is not None:
+                candidates.append(signal)
         return candidates
 
     def warmup_and_evaluate_kline_misses(self) -> list[dict[str, Any]]:
@@ -477,10 +478,8 @@ class EventScanOrchestrator:
 
     def process_priority_scan_cycle(self) -> list[dict[str, Any]]:
         """
-        One aligned scan tick (normally once per 1m close):
-        - Hot watchlist: WS-only
-        - Background queue: one rotating batch
-        - Candle-close events drained since the previous tick
+        One smooth 60-coin page: 5s between symbols (~300s), then the caller
+        immediately starts the next cycle. WS TP/SL monitor stays on its own thread.
         """
         halted, reason = self._scan_gate_open()
         if halted:
@@ -496,41 +495,73 @@ class EventScanOrchestrator:
 
         self._fast_track_live_spikes()
 
-        candidates: list[SignalCandidate] = []
-        candidates.extend(self.process_hot_scan_cycle())
-        candidates.extend(self.process_background_scan_cycle())
-        candidates.extend(self._process_due_event_candidates())
+        event_by_symbol, event_symbols = self._drain_due_event_symbols()
+        symbols = self._cycle_scan_symbols(event_symbols)
+        if not symbols:
+            scanner_logger.info(
+                "Priority scan produced 0 execution candidates "
+                "(empty universe, tier2=%s).",
+                self.assignment_manager.tier2_size,
+            )
+            return []
+
+        open_symbols = self._open_symbols()
+        ticker_map = self._ws_ticker_map()
+        book_map = self._ws_book_map(ticker_map)
+        trigger_tfs = Config.get_scan_trigger_timeframes()
+        primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
+        ready, missing = self._partition_kline_ready(symbols)
+        self._note_missing_scan_klines(missing, events=event_by_symbol)
+        candidates = self._evaluate_symbols_ws(
+            ready,
+            timeframe=primary_tf,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+            event_by_symbol=event_by_symbol,
+            pace=True,
+        )
         candidates = self._dedupe_symbol_candidates(candidates)
+
+        scanned_bg = [
+            symbol
+            for symbol in symbols
+            if not self.priority_queue.is_priority(symbol)
+        ]
+        if scanned_bg:
+            self.priority_queue.rotation.mark_evaluated(scanned_bg)
+        self.priority_queue.mark_hot_scan_complete()
 
         universe_total = len(self.priority_queue.full_universe) or len(
             self._tier1_symbols
         )
-        hot_count = len(self.priority_queue.hot_symbols)
         touch_scan_cycle(
-            scanned=max(hot_count, universe_total),
-            universe_total=max(universe_total, hot_count),
+            scanned=len(symbols),
+            universe_total=max(universe_total, len(symbols)),
         )
 
         dict_results = [c.to_dict() for c in candidates]
         if dict_results:
             self.db.update_watchlist(dict_results)
             scanner_logger.info(
-                "Priority scan dispatching %s execution candidate(s).",
+                "Priority scan dispatching %s execution candidate(s) "
+                "from %s symbols (5s/coin).",
                 len(dict_results),
+                len(symbols),
             )
         else:
             scanner_logger.info(
                 "Priority scan produced 0 execution candidates "
-                "(tier2=%s top10_hot=%s rotating=%s).",
+                "(tier2=%s paged=%s rotating=%s).",
                 self.assignment_manager.tier2_size,
-                hot_count,
+                len(symbols),
                 len(self.priority_queue.background_symbols),
             )
         return dict_results
 
-    def process_hot_scan_cycle(self) -> list[SignalCandidate]:
-        """Tier 1 — frequent WS-only scan of high-activity + Tier-2 symbols."""
-        run_hot = self.priority_queue.should_run_hot_scan()
+    def process_hot_scan_cycle(self, *, pace: bool = True) -> list[SignalCandidate]:
+        """Tier 1 — WS-only scan of high-activity + Tier-2 symbols."""
+        run_hot = True if not pace else self.priority_queue.should_run_hot_scan()
         symbols = self._execution_scan_symbols(include_hot=run_hot)
         if not symbols:
             return []
@@ -548,6 +579,7 @@ class EventScanOrchestrator:
             open_symbols=open_symbols,
             ticker_map=ticker_map,
             book_map=book_map,
+            pace=pace,
         )
 
         if run_hot:
@@ -625,6 +657,7 @@ class EventScanOrchestrator:
             ticker_map=ticker_map,
             book_map=book_map,
             event_by_symbol=event_by_symbol,
+            pace=True,
         )
 
         if candidates:
@@ -912,22 +945,54 @@ class EventScanOrchestrator:
             ", ".join(promoted[:8]),
         )
 
-    def _execution_scan_symbols(self, *, include_hot: bool) -> list[str]:
-        """Top volume/volatility coins only — lightweight Stage-1 watchlist."""
+    def _drain_due_event_symbols(
+        self,
+    ) -> tuple[dict[str, CandleCloseEvent], list[str]]:
+        events = self.event_scheduler.drain_due(limit=Config.scan_cycle_symbol_count())
+        event_by_symbol: dict[str, CandleCloseEvent] = {}
         symbols: list[str] = []
+        for event in events:
+            key = str(event.symbol).upper()
+            if not key or key in event_by_symbol:
+                continue
+            event_by_symbol[key] = event
+            symbols.append(key)
+        return event_by_symbol, symbols
+
+    def _cycle_scan_symbols(self, extra: Optional[list[str]] = None) -> list[str]:
+        """Page through up to 60 coins in queue order (5s each)."""
+        cap = Config.scan_cycle_symbol_count()
         seen: set[str] = set()
+        out: list[str] = []
         rows: list[str] = []
-        if include_hot:
-            rows.extend(self.priority_queue.hot_symbols)
-        rows.extend(self.assignment_manager.hot_symbols())
+        rows.extend(extra or [])
+        try:
+            rows.extend(self.priority_queue.hot_symbols or [])
+        except Exception:
+            pass
+        try:
+            rows.extend(self.assignment_manager.hot_symbols() or [])
+        except Exception:
+            pass
+        try:
+            rows.extend(self.priority_queue.background_symbols or [])
+        except Exception:
+            pass
+        rows.extend(self._tier1_symbols or [])
         for raw in rows:
-            key = str(raw).upper()
+            key = str(raw or "").upper()
             if not key or key in seen:
                 continue
             seen.add(key)
-            symbols.append(key)
-        symbols.sort(key=lambda sym: int(self._volume_ranks.get(sym, 10_000)))
-        return symbols[: Config.scan_watchlist_size()]
+            out.append(key)
+            if len(out) >= cap:
+                break
+        return out
+
+    def _execution_scan_symbols(self, *, include_hot: bool) -> list[str]:
+        """Top watchlist coins for a lightweight /watchlist refresh."""
+        extra = self.priority_queue.hot_symbols if include_hot else []
+        return self._cycle_scan_symbols(extra)
 
     def _resolve_eval_price(self, symbol: str, ticker: dict[str, Any]) -> float:
         """Prefer cached last price; never REST inside scan_context."""

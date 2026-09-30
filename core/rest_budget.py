@@ -25,11 +25,11 @@ class RestBudgetManager:
     """
 
     def __init__(self, max_weight_per_minute: Optional[int] = None) -> None:
-        cap = 1000
+        cap = 600
         try:
             cap = Config.rest_operational_weight_cap()
         except Exception:
-            cap = 1000
+            cap = 600
         self._max_per_minute = min(
             max(
                 max_weight_per_minute or Config.REST_BUDGET_WEIGHT_PER_MINUTE, 1

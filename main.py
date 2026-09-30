@@ -726,7 +726,7 @@ def main(controller: Optional[BotController] = None) -> str:
         consecutive_errors = 0
         scan_clock = MinuteScanClock(
             offset_seconds=Config.SCAN_MINUTE_OFFSET_SECONDS,
-            enabled=Config.SCAN_ALIGN_TO_MINUTE,
+            enabled=False,
         )
 
         while not controller.is_shutdown_requested():
@@ -779,7 +779,7 @@ def main(controller: Optional[BotController] = None) -> str:
                     db.run_maintenance(retention_days=Config.DB_RETENTION_DAYS, vacuum=True)
                     last_maintenance = now_mono
 
-                # Step 2 — Scan only after warm-up, once per 1m close
+                # Step 2 — Smooth 5s/coin page (~300s for 60 symbols); TP/SL stay on WS threads
                 if scan_warmup.in_warmup():
                     scan_warmup.maybe_log_progress()
                 elif scanner is None:
@@ -882,13 +882,8 @@ def main(controller: Optional[BotController] = None) -> str:
             if controller.is_shutdown_requested():
                 break
 
-            elapsed = time.monotonic() - loop_started
-            idle = max(float(Config.LOOP_IDLE_SECONDS), 0.2)
-            if Config.SCAN_ALIGN_TO_MINUTE:
-                until_mark = scan_clock.seconds_until_due()
-                sleep_for = min(idle, max(until_mark, 0.05))
-            else:
-                sleep_for = max(Config.SCAN_INTERVAL_SECONDS - elapsed, idle)
+            # 5s/symbol pacing already filled the cycle — restart immediately.
+            sleep_for = max(float(Config.LOOP_IDLE_SECONDS), 0.05)
             slept = 0.0
             while slept < sleep_for and not controller.is_shutdown_requested():
                 chunk = min(0.25, sleep_for - slept)

@@ -93,7 +93,7 @@ class Config:
     WS_STALE_SECONDS: int = _env_int("WS_STALE_SECONDS", 90)
     WS_STALE_SECONDS_TESTNET: int = _env_int("WS_STALE_SECONDS_TESTNET", 180)
     WS_STALE_RECONNECT_COOLDOWN_SECONDS: float = _env_float(
-        "WS_STALE_RECONNECT_COOLDOWN_SECONDS", 180.0
+        "WS_STALE_RECONNECT_COOLDOWN_SECONDS", 45.0
     )
     WS_PING_INTERVAL_SECONDS: float = _env_float("WS_PING_INTERVAL_SECONDS", 15.0)
     WS_PING_TIMEOUT_SECONDS: float = _env_float("WS_PING_TIMEOUT_SECONDS", 10.0)
@@ -121,8 +121,8 @@ class Config:
         "STARTUP_BALANCE_RETRY_SECONDS", 3.0
     )
     WS_RECONNECT_ENABLED: bool = _env_bool("WS_RECONNECT_ENABLED", True)
-    WS_RECONNECT_MIN_SECONDS: float = _env_float("WS_RECONNECT_MIN_SECONDS", 5.0)
-    WS_RECONNECT_MAX_SECONDS: float = _env_float("WS_RECONNECT_MAX_SECONDS", 30.0)
+    WS_RECONNECT_MIN_SECONDS: float = _env_float("WS_RECONNECT_MIN_SECONDS", 2.0)
+    WS_RECONNECT_MAX_SECONDS: float = _env_float("WS_RECONNECT_MAX_SECONDS", 15.0)
     WS_RECONNECT_LOG_INTERVAL_SECONDS: int = _env_int(
         "WS_RECONNECT_LOG_INTERVAL_SECONDS", 60
     )
@@ -144,20 +144,23 @@ class Config:
     SCAN_WS_ONLY: bool = _env_bool("SCAN_WS_ONLY", True)
     BOOTSTRAP_KLINE_BATCH_SIZE: int = _env_int("BOOTSTRAP_KLINE_BATCH_SIZE", 9)
     BOOK_TICKER_CACHE_SECONDS: int = _env_int("BOOK_TICKER_CACHE_SECONDS", 90)
-    RATE_LIMIT_HALT_SECONDS: int = _env_int("RATE_LIMIT_HALT_SECONDS", 300)
-    RATE_LIMIT_SOFT_HALT_SECONDS: int = _env_int("RATE_LIMIT_SOFT_HALT_SECONDS", 180)
+    RATE_LIMIT_HALT_SECONDS: int = _env_int("RATE_LIMIT_HALT_SECONDS", 900)
+    RATE_LIMIT_SOFT_HALT_SECONDS: int = _env_int("RATE_LIMIT_SOFT_HALT_SECONDS", 900)
     REST_IP_REQUEST_LIMIT_MAINNET: int = _env_int("REST_IP_REQUEST_LIMIT_MAINNET", 2400)
     REST_IP_REQUEST_LIMIT_TESTNET: int = _env_int("REST_IP_REQUEST_LIMIT_TESTNET", 6000)
     REST_USED_WEIGHT_LIMIT: int = _env_int("REST_USED_WEIGHT_LIMIT", 6000)
-    REST_OPERATIONAL_WEIGHT_CAP: int = _env_int("REST_OPERATIONAL_WEIGHT_CAP", 1000)
+    REST_OPERATIONAL_WEIGHT_CAP: int = _env_int("REST_OPERATIONAL_WEIGHT_CAP", 600)
     REST_USED_WEIGHT_THROTTLE_THRESHOLD: int = _env_int(
-        "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1000
+        "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 600
     )
     REST_USED_WEIGHT_HARD_THRESHOLD: int = _env_int(
         "REST_USED_WEIGHT_HARD_THRESHOLD", 1200
     )
     WS_DEGRADED_REST_MIN_INTERVAL_SECONDS: float = _env_float(
-        "WS_DEGRADED_REST_MIN_INTERVAL_SECONDS", 60.0
+        "WS_DEGRADED_REST_MIN_INTERVAL_SECONDS", 10.0
+    )
+    WS_TICKER_SOCKET_REFRESH_SECONDS: float = _env_float(
+        "WS_TICKER_SOCKET_REFRESH_SECONDS", 15.0
     )
     REST_WEIGHT_THROTTLE_SECONDS: float = _env_float(
         "REST_WEIGHT_THROTTLE_SECONDS", 12.0
@@ -190,7 +193,7 @@ class Config:
         os.getenv("TREND_TIMEFRAME", "1h"),
     ]
     SCAN_INTERVAL_SECONDS: int = _env_int("SCAN_INTERVAL_SECONDS", 15)
-    SCAN_ALIGN_TO_MINUTE: bool = _env_bool("SCAN_ALIGN_TO_MINUTE", True)
+    SCAN_ALIGN_TO_MINUTE: bool = _env_bool("SCAN_ALIGN_TO_MINUTE", False)
     SCAN_MINUTE_OFFSET_SECONDS: float = _env_float("SCAN_MINUTE_OFFSET_SECONDS", 1.0)
     LOOP_IDLE_SECONDS: float = _env_float("LOOP_IDLE_SECONDS", 0.5)
     SCAN_WARMUP_SECONDS: float = _env_float("SCAN_WARMUP_SECONDS", 300.0)
@@ -220,7 +223,7 @@ class Config:
     ACCOUNT_REST_MIN_INTERVAL_SECONDS: int = _env_int(
         "ACCOUNT_REST_MIN_INTERVAL_SECONDS", 600
     )
-    IP_BAN_HALT_SECONDS: int = _env_int("IP_BAN_HALT_SECONDS", 600)
+    IP_BAN_HALT_SECONDS: int = _env_int("IP_BAN_HALT_SECONDS", 900)
     REST_BUDGET_ACCOUNT_RESERVE_FRACTION: float = _env_float(
         "REST_BUDGET_ACCOUNT_RESERVE_FRACTION", 0.15
     )
@@ -230,7 +233,7 @@ class Config:
     REST_TOKEN_REFILL_PER_SECOND: float = _env_float(
         "REST_TOKEN_REFILL_PER_SECOND", 0.8
     )
-    REST_BAN_MIN_SLEEP_SECONDS: int = _env_int("REST_BAN_MIN_SLEEP_SECONDS", 600)
+    REST_BAN_MIN_SLEEP_SECONDS: int = _env_int("REST_BAN_MIN_SLEEP_SECONDS", 900)
     REST_BLOCK_LOG_INTERVAL_SECONDS: int = _env_int(
         "REST_BLOCK_LOG_INTERVAL_SECONDS", 600
     )
@@ -257,12 +260,12 @@ class Config:
     )
     KLINE_BOOTSTRAP_BATCH_SYMBOLS: int = _env_int("KLINE_BOOTSTRAP_BATCH_SYMBOLS", 5)
     KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS: float = _env_float(
-        "KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS", 3.0
+        "KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS", 10.0
     )
     KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS: float = _env_float(
         "KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS", 1.0
     )
-    SCAN_SYMBOL_DELAY_SECONDS: float = _env_float("SCAN_SYMBOL_DELAY_SECONDS", 1.0)
+    SCAN_SYMBOL_DELAY_SECONDS: float = _env_float("SCAN_SYMBOL_DELAY_SECONDS", 5.0)
     POSITION_REST_VERIFY_MIN_INTERVAL_SECONDS: float = _env_float(
         "POSITION_REST_VERIFY_MIN_INTERVAL_SECONDS", 30.0
     )
@@ -514,13 +517,13 @@ class Config:
     ENABLE_EVENT_DRIVEN_SCAN: bool = _env_bool("ENABLE_EVENT_DRIVEN_SCAN", True)
     SCAN_TRIGGER_TIMEFRAMES: str = os.getenv("SCAN_TRIGGER_TIMEFRAMES", "5m,15m")
     TIER1_WATCHLIST_SIZE: int = _env_int("TIER1_WATCHLIST_SIZE", 100)
-    SCAN_WATCHLIST_SIZE: int = _env_int("SCAN_WATCHLIST_SIZE", 10)
-    HOT_SCAN_SIZE: int = _env_int("HOT_SCAN_SIZE", 10)
+    SCAN_WATCHLIST_SIZE: int = _env_int("SCAN_WATCHLIST_SIZE", 60)
+    HOT_SCAN_SIZE: int = _env_int("HOT_SCAN_SIZE", 60)
     ENABLE_LIGHTWEIGHT_SCANNER: bool = _env_bool("ENABLE_LIGHTWEIGHT_SCANNER", True)
-    HOT_SCAN_INTERVAL_SECONDS: float = _env_float("HOT_SCAN_INTERVAL_SECONDS", 20.0)
+    HOT_SCAN_INTERVAL_SECONDS: float = _env_float("HOT_SCAN_INTERVAL_SECONDS", 300.0)
     BACKGROUND_SCAN_BATCH_SIZE: int = _env_int("BACKGROUND_SCAN_BATCH_SIZE", 10)
     BACKGROUND_SCAN_BATCH_DELAY_SECONDS: float = _env_float(
-        "BACKGROUND_SCAN_BATCH_DELAY_SECONDS", 1.0
+        "BACKGROUND_SCAN_BATCH_DELAY_SECONDS", 10.0
     )
     TIER2_HOT_SIZE: int = _env_int("TIER2_HOT_SIZE", 10)
     TIER2_PROMOTE_SCORE: float = _env_float("TIER2_PROMOTE_SCORE", 80.0)
@@ -717,7 +720,7 @@ class Config:
 
     # ---------------- Scanner ----------------
     MAX_WORKERS: int = _env_int("MAX_WORKERS", 1)
-    SCAN_TIMEOUT_SEC: int = _env_int("SCAN_TIMEOUT_SEC", 120)
+    SCAN_TIMEOUT_SEC: int = _env_int("SCAN_TIMEOUT_SEC", 360)
     SCAN_PAIR_DELAY_SECONDS: float = _env_float("SCAN_PAIR_DELAY_SECONDS", 0.25)
     SCAN_TIMEFRAME_DELAY_SECONDS: float = _env_float("SCAN_TIMEFRAME_DELAY_SECONDS", 0.05)
     CANDLE_FETCH_LIMIT: int = _env_int("CANDLE_FETCH_LIMIT", 280)
@@ -788,10 +791,10 @@ class Config:
 
     @classmethod
     def rest_operational_weight_cap(cls) -> int:
-        """Background REST target: stay well below Binance, never above 1800."""
+        """Background REST target: 50% of 1200 weight/min (hard cap 600)."""
         return min(
-            max(int(getattr(cls, "REST_OPERATIONAL_WEIGHT_CAP", 1000)), 1),
-            1800,
+            max(int(getattr(cls, "REST_OPERATIONAL_WEIGHT_CAP", 600)), 1),
+            600,
             cls.rest_used_weight_limit(),
         )
 
@@ -849,16 +852,43 @@ class Config:
 
     @classmethod
     def scan_cycle_seconds(cls) -> float:
-        """Effective scan cadence: 60s when aligned to the 1m close."""
-        if cls.SCAN_ALIGN_TO_MINUTE:
-            return 60.0
-        return float(max(cls.SCAN_INTERVAL_SECONDS, 1))
+        """One full 60-coin page at 5s/symbol = 300s (5m candle aligned)."""
+        return float(cls.scan_cycle_symbol_count()) * cls.scan_symbol_delay_seconds()
 
     @classmethod
+    def hot_scan_interval_seconds(cls) -> float:
+        """Full-universe page interval — one 5s/coin pass (~300s)."""
+        return max(float(cls.HOT_SCAN_INTERVAL_SECONDS), cls.scan_cycle_seconds())
+
+    @classmethod
+    def scan_cycle_symbol_count(cls) -> int:
+        """Coins evaluated per smooth scan pass (60 × 5s = 5 minutes)."""
+        return max(
+            int(cls.TOP_UNIVERSE_POOL_SIZE),
+            int(cls.SCAN_WATCHLIST_SIZE),
+            int(cls.HOT_SCAN_SIZE),
+            1,
+        )
+
     @classmethod
     def scan_watchlist_size(cls) -> int:
-        """Per-cycle lightweight scan cap (top volume/volatility coins)."""
-        return max(min(int(cls.HOT_SCAN_SIZE), int(cls.SCAN_WATCHLIST_SIZE)), 1)
+        """Per-cycle scan cap — 60-coin page by default."""
+        return cls.scan_cycle_symbol_count()
+
+    @classmethod
+    def scan_symbol_delay_seconds(cls) -> float:
+        """Pause between scanner symbol evaluations (strictly 5.0s)."""
+        return max(float(getattr(cls, "SCAN_SYMBOL_DELAY_SECONDS", 5.0)), 5.0)
+
+    @classmethod
+    def ws_degraded_rest_min_interval_seconds(cls) -> float:
+        """Minimum gap between background REST calls while WS is DEGRADED."""
+        return max(float(cls.WS_DEGRADED_REST_MIN_INTERVAL_SECONDS), 10.0)
+
+    @classmethod
+    def rate_limit_scanner_halt_seconds(cls) -> float:
+        """Pause REST scanner activity after 429/418/-1003 (avoid IP ban)."""
+        return max(float(cls.RATE_LIMIT_HALT_SECONDS), 900.0)
 
     @classmethod
     def scan_warmup_seconds(cls) -> float:
@@ -867,11 +897,6 @@ class Config:
         if raw <= 0:
             return 0.0
         return min(max(raw, 180.0), 300.0)
-
-    @classmethod
-    def scan_symbol_delay_seconds(cls) -> float:
-        """Pause between scanner/bootstrap symbol steps (never below 1.0s)."""
-        return max(float(getattr(cls, "SCAN_SYMBOL_DELAY_SECONDS", 1.0)), 1.0)
 
     @classmethod
     def get_scan_kline_intervals(cls) -> list[str]:

@@ -205,8 +205,20 @@ class TestWsStaleReconnect(unittest.TestCase):
         ) as rest:
             self.assertTrue(hub._kline_feeds_healthy())
             self.assertFalse(hub._should_reconnect_for_stale_ticker())
+            self.assertTrue(hub._should_refresh_ticker_sockets())
+            self.assertTrue(hub.ws_state_is_degraded())
             rest.assert_not_called()
             self.assertEqual(hub.get_ws_health_snapshot()["state"], "DEGRADED")
+
+    def test_degraded_ws_skips_ticker_rest_fallback(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._last_ticker_event_at = time.monotonic() - 90.0
+        hub._ticker_rest_fetcher = MagicMock(return_value={"BTCUSDT": {"lastPrice": 1}})
+        with patch.object(Config, "USE_TESTNET", True), patch.object(
+            Config, "WS_STALE_SECONDS_TESTNET", 60
+        ):
+            hub.refresh_ticker_cache_from_rest()
+        hub._ticker_rest_fetcher.assert_not_called()
 
     def test_stale_reconnect_cooldown_skips_repeat(self) -> None:
         hub = _hub_with_running_ws()

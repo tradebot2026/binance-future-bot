@@ -801,7 +801,7 @@ class TelegramManager:
                 rest_blocked = bool(self.exchange.is_rest_blocked()[0])
             if orchestrator is not None and not tiers.get("tier2") and not rest_blocked:
                 try:
-                    orchestrator.process_hot_scan_cycle()
+                    orchestrator.process_hot_scan_cycle(pace=False)
                     tiers = scanner.get_watchlist_tiers()
                 except Exception as exc:
                     error_logger.warning("/watchlist hot scan refresh failed: %s", exc)
@@ -810,7 +810,7 @@ class TelegramManager:
                 tier1_background=tiers.get("tier1_background", []),
                 tier1_full=tiers.get("tier1_full", []),
                 tier2_rows=tiers.get("tier2", []),
-                hot_scan_interval=Config.scan_cycle_seconds(),
+                hot_scan_interval=Config.hot_scan_interval_seconds(),
                 tier2_display_limit=Config.TIER2_HOT_SIZE,
                 tier2_near_miss=tiers.get("tier2_near_miss", []),
                 rotation_cycle=int(tiers.get("rotation_cycle") or 0),

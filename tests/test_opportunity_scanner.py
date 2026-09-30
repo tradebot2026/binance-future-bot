@@ -441,15 +441,20 @@ class TestMinuteScanClock(unittest.TestCase):
         self.assertFalse(clock.due(minute + 15.0))
         self.assertTrue(clock.due(minute + 61.1))
 
-    def test_aligned_queue_does_not_wait_on_hot_timer(self) -> None:
+    def test_aligned_queue_honors_hot_scan_interval(self) -> None:
         queue = ScanPriorityQueue()
         queue._hot = ["ETHUSDT"]
         queue._last_hot_scan_at = time.monotonic()
-        with patch.object(Config, "SCAN_ALIGN_TO_MINUTE", True):
-            self.assertTrue(queue.should_run_hot_scan())
+        with patch.object(Config, "SCAN_ALIGN_TO_MINUTE", True), patch.object(
+            Config, "HOT_SCAN_INTERVAL_SECONDS", 120.0
+        ):
+            self.assertFalse(queue.should_run_hot_scan())
+        queue._last_hot_scan_at = 0.0
+        self.assertTrue(queue.should_run_hot_scan())
         with patch.object(Config, "SCAN_ALIGN_TO_MINUTE", False), patch.object(
             Config, "HOT_SCAN_INTERVAL_SECONDS", 20.0
         ):
+            queue._last_hot_scan_at = time.monotonic()
             self.assertFalse(queue.should_run_hot_scan())
 
 
@@ -478,9 +483,9 @@ class TestScanWarmupGate(unittest.TestCase):
             self.assertEqual(Config.scan_warmup_seconds(), 0.0)
         with patch.object(Config, "SCAN_WARMUP_SECONDS", 300.0):
             self.assertEqual(Config.scan_warmup_seconds(), 300.0)
-        self.assertGreaterEqual(Config.scan_symbol_delay_seconds(), 1.0)
+        self.assertGreaterEqual(Config.scan_symbol_delay_seconds(), 5.0)
 
-    def test_evaluate_symbols_ws_sleeps_one_second_between_symbols(self) -> None:
+    def test_evaluate_symbols_ws_sleeps_five_seconds_between_symbols(self) -> None:
         from pipeline.event_scan_orchestrator import EventScanOrchestrator
 
         orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
@@ -489,7 +494,7 @@ class TestScanWarmupGate(unittest.TestCase):
         orch.exchange.scan_context.return_value.__exit__ = MagicMock(return_value=False)
         orch._hub = None
         orch._evaluate_symbol = MagicMock(return_value=None)
-        with patch.object(Config, "SCAN_SYMBOL_DELAY_SECONDS", 1.0), patch(
+        with patch.object(Config, "SCAN_SYMBOL_DELAY_SECONDS", 5.0), patch(
             "pipeline.event_scan_orchestrator.time.sleep"
         ) as sleeper:
             orch._evaluate_symbols_ws(
@@ -499,7 +504,7 @@ class TestScanWarmupGate(unittest.TestCase):
                 ticker_map={},
                 book_map={},
             )
-        sleeper.assert_called_once_with(1.0)
+        sleeper.assert_called_once_with(5.0)
         self.assertEqual(orch._evaluate_symbol.call_count, 2)
 
 

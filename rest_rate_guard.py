@@ -260,9 +260,13 @@ class RestUsageTracker:
             if retry_after > 0:
                 self._retry_after_seconds = retry_after
             if status in (418, 429):
-                halt = max(retry_after, float(Config.RATE_LIMIT_HALT_SECONDS), 180.0)
+                halt = max(
+                    retry_after,
+                    float(Config.rate_limit_scanner_halt_seconds()),
+                    900.0,
+                )
                 if status == 418:
-                    halt = max(halt, 600.0)
+                    halt = max(halt, float(Config.IP_BAN_HALT_SECONDS), 900.0)
                     self._state = ApiHealthState.IP_BANNED
                     self._reason = f"HTTP {status} — IP banned / WAF"
                 else:

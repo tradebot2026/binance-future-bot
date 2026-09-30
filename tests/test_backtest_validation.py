@@ -47,25 +47,28 @@ def _ohlcv(n: int) -> pd.DataFrame:
 
 
 class TestLightweightWatchlist(unittest.TestCase):
-    def test_scan_watchlist_is_top_10(self) -> None:
-        self.assertEqual(Config.SCAN_WATCHLIST_SIZE, 10)
-        self.assertLessEqual(Config.scan_watchlist_size(), 10)
+    def test_scan_watchlist_is_sixty_coin_page(self) -> None:
+        self.assertGreaterEqual(Config.scan_cycle_symbol_count(), 60)
+        self.assertGreaterEqual(Config.scan_symbol_delay_seconds(), 5.0)
+        self.assertGreaterEqual(Config.scan_cycle_seconds(), 300.0)
         self.assertTrue(Config.ENABLE_LIGHTWEIGHT_SCANNER)
 
     def test_execution_scan_ranks_volume_and_caps(self) -> None:
         orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
         orch._volume_ranks = {"LOWVOL": 40, "HOT1": 1, "HOT2": 2, "HOT3": 3}
+        orch._tier1_symbols = []
         orch.priority_queue = MagicMock()
         orch.priority_queue.hot_symbols = ["LOWVOL", "HOT3", "HOT1", "HOT2"]
+        orch.priority_queue.background_symbols = []
         orch.assignment_manager = MagicMock()
         orch.assignment_manager.hot_symbols.return_value = []
         with patch.object(Config, "SCAN_WATCHLIST_SIZE", 2), patch.object(
             Config, "HOT_SCAN_SIZE", 2
-        ):
+        ), patch.object(Config, "TOP_UNIVERSE_POOL_SIZE", 2):
             out = orch._execution_scan_symbols(include_hot=True)
-        self.assertEqual(out, ["HOT1", "HOT2"])
+        self.assertEqual(out, ["LOWVOL", "HOT3"])
 
-    def test_lightweight_cycle_scans_top10_and_rotates_universe(self) -> None:
+    def test_lightweight_cycle_pages_universe_once(self) -> None:
         orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
         orch._scan_gate_open = MagicMock(return_value=(False, ""))
         orch.maybe_refresh_tier1_periodic = MagicMock()
@@ -73,21 +76,27 @@ class TestLightweightWatchlist(unittest.TestCase):
         orch.run_catchup = MagicMock()
         orch.conflict_guard = MagicMock()
         orch._fast_track_live_spikes = MagicMock()
-        orch.process_hot_scan_cycle = MagicMock(return_value=[])
-        orch.process_background_scan_cycle = MagicMock(return_value=[])
-        orch._process_due_event_candidates = MagicMock(return_value=[])
+        orch._drain_due_event_symbols = MagicMock(return_value=({}, []))
+        orch._cycle_scan_symbols = MagicMock(return_value=["AAAUSDT"])
+        orch._open_symbols = MagicMock(return_value=set())
+        orch._ws_ticker_map = MagicMock(return_value={})
+        orch._ws_book_map = MagicMock(return_value={})
+        orch._partition_kline_ready = MagicMock(return_value=(["AAAUSDT"], []))
+        orch._note_missing_scan_klines = MagicMock()
+        orch._evaluate_symbols_ws = MagicMock(return_value=[])
         orch._dedupe_symbol_candidates = MagicMock(return_value=[])
         orch.priority_queue = MagicMock()
         orch.priority_queue.full_universe = ["AAAUSDT"]
         orch.priority_queue.hot_symbols = ["AAAUSDT"]
         orch.priority_queue.background_symbols = ["BBBUSDT"]
+        orch.priority_queue.is_priority.return_value = True
         orch.assignment_manager = MagicMock()
         orch.assignment_manager.tier2_size = 0
         orch.db = MagicMock()
         with patch.object(Config, "ENABLE_LIGHTWEIGHT_SCANNER", True):
             orch.process_priority_scan_cycle()
-        orch.process_hot_scan_cycle.assert_called_once()
-        orch.process_background_scan_cycle.assert_called_once()
+        orch._evaluate_symbols_ws.assert_called_once()
+        orch._cycle_scan_symbols.assert_called_once()
 
 
 class TestFifteenMinuteBacktest(unittest.TestCase):

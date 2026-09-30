@@ -285,7 +285,7 @@ def run_batched_kline_bootstrap(
         batch_symbols = symbol_order[batch_idx : batch_idx + batch_size]
         for sym_index, sym in enumerate(batch_symbols):
             if sym_index > 0:
-                time.sleep(max(delay, Config.scan_symbol_delay_seconds()))
+                time.sleep(max(delay, 1.0))
             for interval in by_symbol[sym]:
                 if can_fetch is not None and not can_fetch():
                     aborted = True
