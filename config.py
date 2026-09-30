@@ -265,6 +265,10 @@ class Config:
     KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS: float = _env_float(
         "KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS", 1.0
     )
+    WARMUP_KLINE_FETCH_LIMIT: int = _env_int("WARMUP_KLINE_FETCH_LIMIT", 100)
+    WARMUP_KLINE_DELAY_SECONDS: float = _env_float("WARMUP_KLINE_DELAY_SECONDS", 1.0)
+    WARMUP_REST_WEIGHT_PAUSE: int = _env_int("WARMUP_REST_WEIGHT_PAUSE", 500)
+    WARMUP_REST_PAUSE_SECONDS: float = _env_float("WARMUP_REST_PAUSE_SECONDS", 8.0)
     SCAN_SYMBOL_DELAY_SECONDS: float = _env_float("SCAN_SYMBOL_DELAY_SECONDS", 5.0)
     POSITION_REST_VERIFY_MIN_INTERVAL_SECONDS: float = _env_float(
         "POSITION_REST_VERIFY_MIN_INTERVAL_SECONDS", 30.0
@@ -897,6 +901,31 @@ class Config:
         if raw <= 0:
             return 0.0
         return min(max(raw, 180.0), 300.0)
+
+    @classmethod
+    def warmup_kline_fetch_limit(cls) -> int:
+        """Historical kline depth per warmup REST fetch (50–100, weight 1–2)."""
+        return min(max(int(getattr(cls, "WARMUP_KLINE_FETCH_LIMIT", 100)), 50), 100)
+
+    @classmethod
+    def warmup_kline_delay_seconds(cls) -> float:
+        """Gap between warmup historical kline REST calls (0.5–1.0s)."""
+        return min(max(float(getattr(cls, "WARMUP_KLINE_DELAY_SECONDS", 1.0)), 0.5), 1.0)
+
+    @classmethod
+    def warmup_rest_weight_pause(cls) -> int:
+        """Pause warmup REST populate when used-weight exceeds this (hard 500)."""
+        return min(max(int(getattr(cls, "WARMUP_REST_WEIGHT_PAUSE", 500)), 1), 500)
+
+    @classmethod
+    def warmup_rest_pause_seconds(cls) -> float:
+        """How long to pause warmup cache populate after the weight guard trips."""
+        return min(max(float(getattr(cls, "WARMUP_REST_PAUSE_SECONDS", 8.0)), 5.0), 10.0)
+
+    @classmethod
+    def ws_kline_bootstrap_concurrency(cls) -> int:
+        """Never fetch multiple warmup/bootstrap kline series concurrently."""
+        return 1
 
     @classmethod
     def get_scan_kline_intervals(cls) -> list[str]:

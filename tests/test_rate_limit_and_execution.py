@@ -134,6 +134,27 @@ class TestRestUsageTracker(unittest.TestCase):
         self.assertGreaterEqual(kline_rest_delay_seconds(0), 1.0)
         self.assertGreaterEqual(kline_rest_delay_seconds(1000), 1.0)
 
+    def test_warmup_weight_guard_pauses_when_over_500(self) -> None:
+        from rest_rate_guard import maybe_pause_warmup_rest
+
+        sleeps: list[float] = []
+        with patch("rest_rate_guard.time.sleep", side_effect=lambda s: sleeps.append(s)):
+            self.assertFalse(maybe_pause_warmup_rest(500))
+            self.assertTrue(maybe_pause_warmup_rest(501))
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 5.0)
+        self.assertLessEqual(sleeps[0], 10.0)
+
+    def test_warmup_kline_weight_is_low(self) -> None:
+        def futures_klines(**_kwargs):
+            return None
+
+        futures_klines.__name__ = "futures_klines"
+        self.assertEqual(weight_for_call(futures_klines, limit=50), 1)
+        self.assertEqual(weight_for_call(futures_klines, limit=100), 2)
+        self.assertEqual(weight_for_call(futures_klines, limit=280), 2)
+        self.assertEqual(weight_for_call(futures_klines, limit=500), 5)
+
     def test_used_weight_1800_freezes_background_rest(self) -> None:
         with patch.object(Config, "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1800), patch.object(
             Config, "REST_USED_WEIGHT_HARD_THRESHOLD", 2400

@@ -257,6 +257,7 @@ class TestMainLoopIsEventDriven(unittest.TestCase):
         self.assertIn("scan_clock.due", source)
         self.assertIn("ScanWarmupGate", source)
         self.assertIn("WARMUP_MODE", source)
+        self.assertIn("populate_warmup_kline_cache", source)
         from core.scan_warmup import ScanWarmupGate
 
         self.assertEqual(ScanWarmupGate.MODE_WARMUP, "WARMUP_MODE")

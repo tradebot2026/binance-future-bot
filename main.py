@@ -697,6 +697,7 @@ def main(controller: Optional[BotController] = None) -> str:
             error_logger.error("Startup reconciliation failed (continuing): %s", exc)
 
         scan_warmup = ScanWarmupGate(Config.scan_warmup_seconds())
+        market_data.begin_scan_warmup(scan_warmup.duration_seconds)
         if scan_warmup.in_warmup() and tg is not None:
             tg.send_message(
                 f"⏳ <b>WARMUP_MODE</b> — populating cache "
@@ -782,12 +783,15 @@ def main(controller: Optional[BotController] = None) -> str:
                 # Step 2 — Smooth 5s/coin page (~300s for 60 symbols); TP/SL stay on WS threads
                 if scan_warmup.in_warmup():
                     scan_warmup.maybe_log_progress()
+                    if scanner is not None:
+                        scanner.populate_warmup_kline_cache()
                 elif scanner is None:
                     if cycle == 1:
                         system_logger.warning(
                             "scanner.py not found — entries disabled until scanner is added."
                         )
                 else:
+                    market_data.end_scan_warmup()
                     if scan_warmup.just_finished():
                         scanner.subscribe_watchlist_ws_only()
                         scan_clock.skip_current_minute()

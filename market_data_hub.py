@@ -23,7 +23,7 @@ from binance.exceptions import BinanceAPIException
 from config import Config
 from kline_bootstrap import run_batched_kline_bootstrap
 from logger import error_logger, system_logger
-from rest_rate_guard import kline_rest_delay_seconds
+from rest_rate_guard import kline_rest_delay_seconds, maybe_pause_warmup_rest
 from utils import safe_float
 from core.fill_pnl_tracker import FillPnlRecord, FillPnlTracker
 from ws_reconnect import (
@@ -157,6 +157,8 @@ class MarketDataHub:
         self._kline_sockets: list[_KlineMultiplexSocket] = []
         self._subscribed_kline_streams: set[str] = set()
         self._bootstrapped_pairs: set[tuple[str, str]] = set()
+        self._warmup_seeded_pairs: set[tuple[str, str]] = set()
+        self._scan_warmup_until: float = 0.0
         self._candle_close_listeners: list[
             Callable[[str, str, int], None]
         ] = []
@@ -252,6 +254,45 @@ class MarketDataHub:
     def set_rest_governor(self, governor: Any) -> None:
         """Attach exchange used-weight governor so hub fallbacks honor it."""
         self._rest_governor = governor
+
+    def begin_scan_warmup(self, duration_seconds: float) -> None:
+        """Mark the ScanWarmupGate window so REST kline populate uses warmup guards."""
+        duration = max(float(duration_seconds or 0.0), 0.0)
+        if duration <= 0:
+            self._scan_warmup_until = 0.0
+            return
+        self._scan_warmup_until = time.monotonic() + duration
+
+    def in_scan_warmup(self) -> bool:
+        if self._scan_warmup_until <= 0:
+            return False
+        if time.monotonic() >= self._scan_warmup_until:
+            self._scan_warmup_until = 0.0
+            return False
+        return True
+
+    def end_scan_warmup(self) -> None:
+        self._scan_warmup_until = 0.0
+
+    def _warmup_used_weight(self) -> int:
+        gov = self._rest_governor
+        usage = getattr(gov, "_rest_usage", None) if gov is not None else None
+        fn = getattr(usage, "projected_used_weight", None)
+        if callable(fn):
+            try:
+                return int(fn() or 0)
+            except Exception:
+                return 0
+        return 0
+
+    def _kline_bootstrap_limits(self, *, warmup: bool) -> tuple[int, int, int]:
+        """Return (fetch_limit, seed_min_bars, complete_min_bars)."""
+        complete = max(int(getattr(Config, "WS_KLINE_BOOTSTRAP_MIN_BARS", 250)), 10)
+        if warmup or self.in_scan_warmup():
+            limit = Config.warmup_kline_fetch_limit()
+            return limit, limit, complete
+        limit = int(Config.CANDLE_FETCH_LIMIT)
+        return limit, complete, complete
 
     def ws_is_degraded(self) -> bool:
         """True during reconnect or warmup — REST fallbacks must not storm."""
@@ -1849,6 +1890,7 @@ class MarketDataHub:
         *,
         min_bars: int,
         limit: int,
+        warmup: bool = False,
     ) -> list[tuple[str, str]]:
         pending: list[tuple[str, str]] = []
         for symbol in symbols:
@@ -1857,9 +1899,16 @@ class MarketDataHub:
                 pair = (sym, interval)
                 if pair in self._bootstrapped_pairs:
                     continue
+                if warmup and pair in self._warmup_seeded_pairs:
+                    continue
                 cached = self.get_candles_cached_only(sym, interval, limit)
                 if not cached.empty and len(cached) >= min_bars:
-                    self._bootstrapped_pairs.add(pair)
+                    if len(cached) >= max(int(getattr(Config, "WS_KLINE_BOOTSTRAP_MIN_BARS", 250)), 10):
+                        self._bootstrapped_pairs.add(pair)
+                    elif warmup:
+                        self._warmup_seeded_pairs.add(pair)
+                    else:
+                        pending.append(pair)
                     continue
                 pending.append(pair)
         return pending
@@ -1881,12 +1930,16 @@ class MarketDataHub:
             )
             return self._seed_bootstrapped_from_ws_cache(symbols, intervals)
 
-        limit = Config.CANDLE_FETCH_LIMIT
-        min_bars = max(Config.WS_KLINE_BOOTSTRAP_MIN_BARS, 10)
+        warmup = self.in_scan_warmup()
+        limit, min_bars, complete_bars = self._kline_bootstrap_limits(warmup=warmup)
 
         ws_seeded = self._seed_bootstrapped_from_ws_cache(symbols, intervals)
         pending = self._pending_bootstrap_pairs(
-            symbols, intervals, min_bars=min_bars, limit=limit
+            symbols,
+            intervals,
+            min_bars=min_bars,
+            limit=limit,
+            warmup=warmup,
         )
 
         if not pending:
@@ -1900,6 +1953,9 @@ class MarketDataHub:
         def _mark_bootstrapped(sym: str, interval: str) -> None:
             self._bootstrapped_pairs.add((sym.upper(), interval))
 
+        def _mark_warmup_seeded(sym: str, interval: str) -> None:
+            self._warmup_seeded_pairs.add((sym.upper(), interval))
+
         result = run_batched_kline_bootstrap(
             pending,
             rest_fetcher,
@@ -1908,7 +1964,15 @@ class MarketDataHub:
             seed_fn=self.seed_klines_from_dataframe,
             mark_bootstrapped=_mark_bootstrapped,
             can_fetch=can_fetch,
-            request_delay_seconds=kline_rest_delay_seconds(0),
+            request_delay_seconds=(
+                Config.warmup_kline_delay_seconds()
+                if warmup
+                else kline_rest_delay_seconds(0)
+            ),
+            warmup_mode=warmup,
+            used_weight_fn=self._warmup_used_weight if warmup else None,
+            warmup_seed_fn=_mark_warmup_seeded if warmup else None,
+            complete_min_bars=complete_bars,
         )
         if result.aborted:
             system_logger.warning(
@@ -1923,6 +1987,7 @@ class MarketDataHub:
         rest_fetcher: Callable[[str, str, int], pd.DataFrame],
         *,
         max_pairs: int | None = None,
+        warmup: bool = False,
     ) -> int:
         """Paced REST bootstrap for a subset of symbols (background tier seeding)."""
         if not symbols or not rest_fetcher:
@@ -1934,10 +1999,14 @@ class MarketDataHub:
             )
             return 0
 
-        limit = Config.CANDLE_FETCH_LIMIT
-        min_bars = max(Config.WS_KLINE_BOOTSTRAP_MIN_BARS, 10)
+        warmup = warmup or self.in_scan_warmup()
+        limit, min_bars, complete_bars = self._kline_bootstrap_limits(warmup=warmup)
         pending = self._pending_bootstrap_pairs(
-            symbols, intervals, min_bars=min_bars, limit=limit
+            symbols,
+            intervals,
+            min_bars=min_bars,
+            limit=limit,
+            warmup=warmup,
         )
         if not pending:
             return 0
@@ -1945,17 +2014,18 @@ class MarketDataHub:
         now = time.monotonic()
         while self._bootstrap_series_window and self._bootstrap_series_window[0] < now - 60.0:
             self._bootstrap_series_window.popleft()
-        per_minute = max(int(getattr(Config, "KLINE_BOOTSTRAP_MAX_SERIES_PER_MINUTE", 12)), 1)
-        remaining = per_minute - len(self._bootstrap_series_window)
-        if remaining <= 0:
-            system_logger.info(
-                "Kline bootstrap paced — %s series already requested in the last 60s.",
-                per_minute,
-            )
-            return 0
-        pending = pending[:remaining]
-        for _ in pending:
-            self._bootstrap_series_window.append(now)
+        if not warmup:
+            per_minute = max(int(getattr(Config, "KLINE_BOOTSTRAP_MAX_SERIES_PER_MINUTE", 12)), 1)
+            remaining = per_minute - len(self._bootstrap_series_window)
+            if remaining <= 0:
+                system_logger.info(
+                    "Kline bootstrap paced — %s series already requested in the last 60s.",
+                    per_minute,
+                )
+                return 0
+            pending = pending[:remaining]
+            for _ in pending:
+                self._bootstrap_series_window.append(now)
 
         exchange = getattr(rest_fetcher, "__self__", None)
         can_fetch = None
@@ -1964,6 +2034,9 @@ class MarketDataHub:
 
         def _mark_bootstrapped(sym: str, interval: str) -> None:
             self._bootstrapped_pairs.add((sym.upper(), interval))
+
+        def _mark_warmup_seeded(sym: str, interval: str) -> None:
+            self._warmup_seeded_pairs.add((sym.upper(), interval))
 
         result = run_batched_kline_bootstrap(
             pending,
@@ -1974,7 +2047,15 @@ class MarketDataHub:
             mark_bootstrapped=_mark_bootstrapped,
             can_fetch=can_fetch,
             max_pairs=max_pairs,
-            request_delay_seconds=kline_rest_delay_seconds(0),
+            request_delay_seconds=(
+                Config.warmup_kline_delay_seconds()
+                if warmup
+                else kline_rest_delay_seconds(0)
+            ),
+            warmup_mode=warmup,
+            used_weight_fn=self._warmup_used_weight if warmup else None,
+            warmup_seed_fn=_mark_warmup_seeded if warmup else None,
+            complete_min_bars=complete_bars,
         )
         return result.seeded
 
@@ -2328,13 +2409,26 @@ class MarketDataHub:
             return 0
 
         seeded = 0
+        warmup = self.in_scan_warmup()
+        delay = (
+            Config.warmup_kline_delay_seconds()
+            if warmup
+            else max(float(Config.INIT_REST_DELAY_SECONDS), 0.0)
+        )
+        fetch_limit = Config.warmup_kline_fetch_limit() if warmup else int(limit)
+        first = True
         for symbol in symbols:
             for interval in intervals:
-                key = (symbol.upper(), interval, limit)
+                if warmup:
+                    maybe_pause_warmup_rest(self._warmup_used_weight())
+                if not first and delay > 0:
+                    time.sleep(delay)
+                first = False
+                key = (symbol.upper(), interval, fetch_limit)
                 with self._lock:
                     if key in self._candles and not self._candles[key].dataframe.empty:
                         continue
-                df = rest_fetcher(symbol, interval, limit)
+                df = rest_fetcher(symbol, interval, fetch_limit)
                 if not df.empty:
                     self.seed_klines_from_dataframe(symbol, interval, df)
                     bar_open_ms = self._current_bar_open_ms(interval)
@@ -2344,8 +2438,6 @@ class MarketDataHub:
                             last_bar_open_ms=bar_open_ms,
                         )
                     seeded += 1
-                if Config.INIT_REST_DELAY_SECONDS > 0:
-                    time.sleep(Config.INIT_REST_DELAY_SECONDS)
         return seeded
 
     def format_ban_message(self, ban: BanStatus) -> str:

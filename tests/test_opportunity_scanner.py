@@ -485,6 +485,24 @@ class TestScanWarmupGate(unittest.TestCase):
             self.assertEqual(Config.scan_warmup_seconds(), 300.0)
         self.assertGreaterEqual(Config.scan_symbol_delay_seconds(), 5.0)
 
+    def test_warmup_kline_rest_guards_are_clamped(self) -> None:
+        with patch.object(Config, "WARMUP_KLINE_FETCH_LIMIT", 20):
+            self.assertEqual(Config.warmup_kline_fetch_limit(), 50)
+        with patch.object(Config, "WARMUP_KLINE_FETCH_LIMIT", 500):
+            self.assertEqual(Config.warmup_kline_fetch_limit(), 100)
+        with patch.object(Config, "WARMUP_KLINE_DELAY_SECONDS", 0.1):
+            self.assertEqual(Config.warmup_kline_delay_seconds(), 0.5)
+        with patch.object(Config, "WARMUP_KLINE_DELAY_SECONDS", 3.0):
+            self.assertEqual(Config.warmup_kline_delay_seconds(), 1.0)
+        with patch.object(Config, "WARMUP_REST_WEIGHT_PAUSE", 900):
+            self.assertEqual(Config.warmup_rest_weight_pause(), 500)
+        with patch.object(Config, "WARMUP_REST_PAUSE_SECONDS", 1.0):
+            self.assertEqual(Config.warmup_rest_pause_seconds(), 5.0)
+        with patch.object(Config, "WARMUP_REST_PAUSE_SECONDS", 30.0):
+            self.assertEqual(Config.warmup_rest_pause_seconds(), 10.0)
+        with patch.object(Config, "WS_KLINE_BOOTSTRAP_CONCURRENCY", 8):
+            self.assertEqual(Config.ws_kline_bootstrap_concurrency(), 1)
+
     def test_evaluate_symbols_ws_sleeps_five_seconds_between_symbols(self) -> None:
         from pipeline.event_scan_orchestrator import EventScanOrchestrator
 

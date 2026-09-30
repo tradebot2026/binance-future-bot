@@ -21,6 +21,7 @@ from indicators.market_analyzer import MIN_ANALYZER_BARS
 from logger import log_trade_approved, scanner_logger
 from pipeline.snapshot_factory import SnapshotFactory
 from pipeline.universe_builder import UniverseBuilder
+from rest_rate_guard import maybe_pause_warmup_rest
 from strategies import build_strategy_registry
 
 
@@ -181,6 +182,79 @@ class EventScanOrchestrator:
             target,
             seeded,
         )
+        return int(seeded or 0)
+
+    def populate_warmup_klines(self) -> int:
+        """One symbol of paced REST klines during WARMUP_MODE cache populate."""
+        if self._hub is None or not getattr(self._hub, "in_scan_warmup", lambda: False)():
+            return 0
+        if self.exchange.in_scan_mode:
+            return 0
+        if not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP:
+            return 0
+        if getattr(self.exchange, "_ws_reconnect_or_warmup", lambda: False)():
+            return 0
+
+        usage = getattr(self.exchange, "_rest_usage", None)
+        weight = 0
+        if usage is not None:
+            fn = getattr(usage, "projected_used_weight", None)
+            if callable(fn):
+                try:
+                    weight = int(fn() or 0)
+                except Exception:
+                    weight = 0
+        can_boot = getattr(self.exchange, "can_bootstrap_klines_rest", None)
+        can_rest = getattr(self.exchange, "can_make_background_rest_call", None)
+        if callable(can_boot) and not can_boot():
+            maybe_pause_warmup_rest(weight)
+            return 0
+        if callable(can_rest) and not can_rest(2):
+            maybe_pause_warmup_rest(weight)
+            return 0
+
+        if not self._tier1_symbols:
+            self.refresh_tier1_universe(force=True, allow_rest=False)
+        symbols = list(self.priority_queue.hot_symbols or self._tier1_symbols)
+        if not symbols:
+            return 0
+
+        timeframes = Config.get_scan_kline_intervals()
+        pending = self._hub._pending_bootstrap_pairs(
+            symbols,
+            timeframes,
+            min_bars=Config.warmup_kline_fetch_limit(),
+            limit=Config.warmup_kline_fetch_limit(),
+            warmup=True,
+        )
+        if not pending:
+            return 0
+        target = pending[0][0]
+
+        try:
+            self._hub.subscribe_kline_streams([target])
+            with self.exchange.bootstrap_context():
+                seeded = self._hub.bootstrap_klines_for_symbols(
+                    [target],
+                    timeframes,
+                    self.exchange.fetch_bootstrap_klines_df,
+                    max_pairs=len(timeframes),
+                    warmup=True,
+                )
+        except Exception as exc:
+            scanner_logger.warning(
+                "[SCAN_KLINE_WARMUP] %s REST populate failed — %s",
+                target,
+                exc,
+            )
+            return 0
+        if seeded:
+            scanner_logger.info(
+                "[SCAN_KLINE_WARMUP] %s populated %s series (limit=%s).",
+                target,
+                seeded,
+                Config.warmup_kline_fetch_limit(),
+            )
         return int(seeded or 0)
 
     def _evaluate_symbols_ws(

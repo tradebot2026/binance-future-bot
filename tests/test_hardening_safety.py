@@ -426,6 +426,65 @@ class TestWatchdogAndWs(unittest.TestCase):
         self.assertEqual(seeded, 0)
         self.assertEqual(called, [])
 
+    def test_warmup_kline_bootstrap_paces_timeframes_and_pauses_on_weight(self) -> None:
+        from kline_bootstrap import run_batched_kline_bootstrap
+
+        calls: list[tuple[str, str, int]] = []
+
+        def fetcher(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+            calls.append((symbol, interval, limit))
+            n = 80
+            return pd.DataFrame(
+                {
+                    "timestamp": list(range(n)),
+                    "open": [1.0] * n,
+                    "high": [1.1] * n,
+                    "low": [0.9] * n,
+                    "close": [1.0] * n,
+                    "volume": [1.0] * n,
+                }
+            )
+
+        sleeps: list[float] = []
+        weights = [600, 100, 100]
+
+        def used_weight() -> int:
+            return weights.pop(0) if weights else 100
+
+        def _sleep(seconds: float) -> None:
+            sleeps.append(seconds)
+
+        with patch("kline_bootstrap.time.sleep", _sleep), patch(
+            "rest_rate_guard.time.sleep", _sleep
+        ):
+            result = run_batched_kline_bootstrap(
+                [("AAAUSDT", "5m"), ("AAAUSDT", "15m"), ("BBBUSDT", "5m")],
+                fetcher,
+                limit=100,
+                min_bars=50,
+                seed_fn=lambda *_args: None,
+                mark_bootstrapped=lambda *_args: None,
+                warmup_mode=True,
+                used_weight_fn=used_weight,
+                request_delay_seconds=0.5,
+                max_symbols_per_batch=10,
+                batch_cooldown_seconds=0.0,
+                complete_min_bars=250,
+            )
+        self.assertEqual(result.seeded, 3)
+        self.assertEqual([c[0] for c in calls], ["AAAUSDT", "AAAUSDT", "BBBUSDT"])
+        self.assertEqual([c[1] for c in calls], ["5m", "15m", "5m"])
+        self.assertTrue(all(c[2] == 100 for c in calls))
+        self.assertGreaterEqual(max(sleeps), 5.0)
+        self.assertTrue(any(abs(s - 0.5) < 1e-9 for s in sleeps))
+
+    def test_scan_warmup_flag_gates_hub(self) -> None:
+        hub = _ready_hub()
+        hub.begin_scan_warmup(30.0)
+        self.assertTrue(hub.in_scan_warmup())
+        hub.end_scan_warmup()
+        self.assertFalse(hub.in_scan_warmup())
+
     def test_kline_cache_miss_is_queued_without_duplicates(self) -> None:
         from pipeline.event_scan_orchestrator import EventScanOrchestrator
 

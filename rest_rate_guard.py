@@ -94,6 +94,22 @@ def kline_rest_delay_seconds(used_weight: int = 0) -> float:
     return max(float(getattr(Config, "KLINE_REST_MIN_INTERVAL_SECONDS", 1.0)), 1.0)
 
 
+def maybe_pause_warmup_rest(used_weight: int) -> bool:
+    """Pause 5–10s when warmup used-weight exceeds 500. Returns True if paused."""
+    threshold = Config.warmup_rest_weight_pause()
+    if int(used_weight or 0) <= threshold:
+        return False
+    pause = Config.warmup_rest_pause_seconds()
+    system_logger.warning(
+        "Warmup REST weight guard — used_weight=%s exceeds %s; pausing %.1fs.",
+        int(used_weight),
+        threshold,
+        pause,
+    )
+    time.sleep(pause)
+    return True
+
+
 class RestUsageTracker:
     """
     Sliding 60s HTTP request counter + last used-weight header.

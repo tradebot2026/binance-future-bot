@@ -160,6 +160,16 @@ class MarketScanner:
             return 0
         return self.orchestrator._bootstrap_missing_scan_klines(symbols)
 
+    def populate_warmup_kline_cache(self) -> int:
+        """Paced REST kline populate during WARMUP_MODE (one symbol per tick)."""
+        if (
+            not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
+            or not self._hub
+            or self.orchestrator is None
+        ):
+            return 0
+        return self.orchestrator.populate_warmup_klines()
+
     def warmup_and_evaluate_kline_misses(self) -> List[Dict[str, Any]]:
         """Bootstrap one not-ready miss (missing TFs only), then evaluate if complete."""
         if self.orchestrator is None:

@@ -21,7 +21,7 @@ class ScanWarmupGate:
         if self.duration_seconds > 0:
             system_logger.info(
                 "[%s] Populating Cache — scanner idle for %.0fs "
-                "(WebSocket only, no trade evaluation).",
+                "(paced REST klines + WebSocket; no trade evaluation).",
                 self.MODE_WARMUP,
                 self.duration_seconds,
             )

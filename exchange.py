@@ -1019,13 +1019,26 @@ class BinanceExchangeManager:
         return self._rest_budget.remaining_fraction() >= reserve
 
     def _enforce_kline_rest_pace(self) -> None:
-        """Strict 1.0s gap between consecutive futures_klines REST calls."""
-        min_gap = kline_rest_delay_seconds(self._rest_usage.projected_used_weight())
+        """Gap between consecutive futures_klines REST calls (warmup 0.5–1.0s)."""
+        if self._in_scan_warmup():
+            min_gap = Config.warmup_kline_delay_seconds()
+        else:
+            min_gap = kline_rest_delay_seconds(self._rest_usage.projected_used_weight())
         with self._kline_rest_lock:
             elapsed = time.monotonic() - self._last_kline_rest_at
             if elapsed < min_gap:
                 time.sleep(min_gap - elapsed)
             self._last_kline_rest_at = time.monotonic()
+
+    def _in_scan_warmup(self) -> bool:
+        hub = self._market_data
+        checker = getattr(hub, "in_scan_warmup", None) if hub is not None else None
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
+        return False
 
     @staticmethod
     def _default_kline_request_delay() -> float:
@@ -2455,6 +2468,8 @@ class BinanceExchangeManager:
                 "fetch_bootstrap_klines_df requires exchange.bootstrap_context()"
             )
         fetch_limit = limit or Config.CANDLE_FETCH_LIMIT
+        if self._in_scan_warmup():
+            fetch_limit = min(int(fetch_limit), Config.warmup_kline_fetch_limit())
         return self._fetch_bootstrap_klines_direct(symbol, timeframe, fetch_limit)
 
     def _fetch_bootstrap_klines_direct(
@@ -2471,9 +2486,14 @@ class BinanceExchangeManager:
         if not self.can_bootstrap_klines_rest():
             return pd.DataFrame()
 
+        if self._in_scan_warmup():
+            limit = min(int(limit), Config.warmup_kline_fetch_limit())
+
         if self._market_data:
             cached = self._market_data.get_candles_cached_only(symbol, timeframe, limit)
             min_bars = max(int(Config.WS_KLINE_BOOTSTRAP_MIN_BARS), 10)
+            if self._in_scan_warmup():
+                min_bars = min(min_bars, Config.warmup_kline_fetch_limit())
             if cached is not None and not cached.empty:
                 if limit < min_bars:
                     if len(cached) >= min_bars:
@@ -2551,10 +2571,15 @@ class BinanceExchangeManager:
             return 0
         if not self._rest_reads_allowed():
             return 0
+        fetch_limit = (
+            Config.warmup_kline_fetch_limit()
+            if self._in_scan_warmup()
+            else Config.CANDLE_FETCH_LIMIT
+        )
         return self._market_data.bootstrap_candles(
             symbols,
             timeframes,
-            Config.CANDLE_FETCH_LIMIT,
+            fetch_limit,
             self.rest_fetch_klines_df,
         )
 

@@ -13,7 +13,7 @@ import pandas as pd
 from config import Config
 from exceptions import ExchangeRateLimitError
 from logger import error_logger, system_logger
-from rest_rate_guard import kline_rest_delay_seconds
+from rest_rate_guard import kline_rest_delay_seconds, maybe_pause_warmup_rest
 
 
 class KlineBootstrapAborted(Exception):
@@ -120,7 +120,7 @@ def run_parallel_kline_bootstrap(
     if not pairs:
         return BootstrapResult()
 
-    concurrency = Config.WS_KLINE_BOOTSTRAP_CONCURRENCY
+    concurrency = Config.ws_kline_bootstrap_concurrency()
     request_timeout = Config.WS_KLINE_BOOTSTRAP_REQUEST_TIMEOUT_SECONDS
     overall_timeout = Config.WS_KLINE_BOOTSTRAP_OVERALL_TIMEOUT_SECONDS
     inter_request_delay = kline_rest_delay_seconds(0)
@@ -218,23 +218,39 @@ def run_batched_kline_bootstrap(
     batch_cooldown_seconds: float | None = None,
     request_delay_seconds: float | None = None,
     max_pairs: int | None = None,
+    warmup_mode: bool = False,
+    used_weight_fn: Callable[[], int] | None = None,
+    warmup_seed_fn: Callable[[str, str], None] | None = None,
+    complete_min_bars: int | None = None,
 ) -> BootstrapResult:
     """
-    REST bootstrap in symbol batches — 0.1–0.2s between requests, cooldown between batches.
+    REST bootstrap in symbol batches — sequential TFs with delay between every request.
     Aborts cleanly when can_fetch() returns False (ban / budget circuit breaker).
+    Warmup mode uses 0.5–1.0s pacing and pauses 5–10s when used-weight exceeds 500.
     """
     if not pairs:
         return BootstrapResult()
 
     batch_size = max(max_symbols_per_batch or Config.KLINE_BOOTSTRAP_BATCH_SYMBOLS, 1)
-    batch_pause = max(
-        batch_cooldown_seconds or Config.KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS,
-        0.0,
-    )
-    delay = (
-        kline_rest_delay_seconds(0)
-        if request_delay_seconds is None
-        else max(float(request_delay_seconds), 1.0)
+    if batch_cooldown_seconds is None:
+        batch_pause = max(float(Config.KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS), 0.0)
+    else:
+        batch_pause = max(float(batch_cooldown_seconds), 0.0)
+    if warmup_mode:
+        delay = (
+            Config.warmup_kline_delay_seconds()
+            if request_delay_seconds is None
+            else min(max(float(request_delay_seconds), 0.5), 1.0)
+        )
+    else:
+        delay = (
+            kline_rest_delay_seconds(0)
+            if request_delay_seconds is None
+            else max(float(request_delay_seconds), 1.0)
+        )
+    done_bars = max(
+        int(complete_min_bars or min_bars),
+        min_bars,
     )
 
     by_symbol: dict[str, list[str]] = defaultdict(list)
@@ -263,12 +279,13 @@ def run_batched_kline_bootstrap(
 
     system_logger.info(
         "Batched kline bootstrap — %s symbols, %s series "
-        "(batch=%s symbols, delay=%ss, batch_pause=%ss).",
+        "(batch=%s symbols, delay=%ss, batch_pause=%ss, warmup=%s).",
         len(symbol_order),
         sum(len(v) for v in by_symbol.values()),
         batch_size,
         delay,
         batch_pause,
+        warmup_mode,
     )
 
     for batch_idx in range(0, len(symbol_order), batch_size):
@@ -283,13 +300,13 @@ def run_batched_kline_bootstrap(
             break
 
         batch_symbols = symbol_order[batch_idx : batch_idx + batch_size]
-        for sym_index, sym in enumerate(batch_symbols):
-            if sym_index > 0:
-                time.sleep(max(delay, 1.0))
+        for sym in batch_symbols:
             for interval in by_symbol[sym]:
                 if can_fetch is not None and not can_fetch():
                     aborted = True
                     break
+                if warmup_mode and used_weight_fn is not None:
+                    maybe_pause_warmup_rest(used_weight_fn())
                 try:
                     df = rest_fetcher(sym, interval, limit)
                 except ExchangeRateLimitError as exc:
@@ -324,7 +341,10 @@ def run_batched_kline_bootstrap(
 
                 try:
                     seed_fn(sym, interval, df)
-                    mark_bootstrapped(sym, interval)
+                    if len(df) >= done_bars:
+                        mark_bootstrapped(sym, interval)
+                    elif warmup_seed_fn is not None:
+                        warmup_seed_fn(sym, interval)
                     seeded += 1
                 except Exception as exc:
                     failed += 1
