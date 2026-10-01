@@ -55,6 +55,7 @@ class EventScanOrchestrator:
         self._last_universe_refresh_at: float = 0.0
         self._kline_cache_misses: list[str] = []
         self._kline_pending_log_at: dict[str, float] = {}
+        self._last_ticker_unavail_log_at: float = 0.0
 
     @property
     def tier1_symbols(self) -> list[str]:
@@ -432,10 +433,16 @@ class EventScanOrchestrator:
             else:
                 ready = bool(self._hub.get_ticker_map())
             if not ready:
-                scanner_logger.warning(
-                    "Tier1 refresh skipped — ticker cache unavailable%s.",
-                    "" if allow_rest else " (WS-only warm-up)",
-                )
+                now_log = time.monotonic()
+                last_log = float(self._last_ticker_unavail_log_at or 0.0)
+                if last_log <= 0.0 or (now_log - last_log) >= 45.0:
+                    self._last_ticker_unavail_log_at = now_log
+                    count = len(self._hub.get_ticker_map()) if self._hub else 0
+                    scanner_logger.info(
+                        "Waiting on WS miniTicker/bookTicker — ticker cache empty "
+                        "(%s symbols). Next notice in 45s.",
+                        count,
+                    )
                 return self._tier1_symbols
 
         universe = self.universe_builder.build()

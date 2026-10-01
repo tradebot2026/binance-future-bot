@@ -112,6 +112,8 @@ class MarketScanner:
         """Subscribe kline streams from the current WS ticker cache — no REST."""
         if self.orchestrator is None:
             return []
+        if self._hub is not None and not self._hub.is_ticker_cache_usable():
+            self._hub.wait_quietly_for_ticker_cache(timeout_seconds=5.0)
         return self.orchestrator.refresh_tier1_universe(force=True, allow_rest=False)
 
     def process_event_scan_cycle(self) -> List[Dict[str, Any]]:
@@ -160,11 +162,15 @@ class MarketScanner:
 
     def populate_warmup_kline_cache(self) -> int:
         """Paced REST kline populate during WARMUP_MODE (one symbol per tick)."""
+        if self._hub is not None and not self._hub.is_ticker_cache_usable():
+            self._hub.wait_quietly_for_ticker_cache(timeout_seconds=5.0)
         if (
             not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
             or not self._hub
             or self.orchestrator is None
         ):
+            return 0
+        if not self._hub.is_ticker_cache_usable():
             return 0
         return self.orchestrator.populate_warmup_klines()
 

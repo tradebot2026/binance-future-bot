@@ -565,17 +565,7 @@ class MarketDataHub:
                     system_logger.debug("Ticker socket stop failed: %s", exc)
                 self._ticker_conn_key = None
 
-            self._ticker_conn_key = manager.start_futures_multiplex_socket(
-                callback=self._wrap_ws_callback(self._on_ticker_message, stream="ticker"),
-                streams=["!miniTicker@arr"],
-            )
-            if Config.ENABLE_WS_BOOK_STREAM:
-                self._book_ticker_conn_key = manager.start_futures_multiplex_socket(
-                    callback=self._wrap_ws_callback(
-                        self._on_book_ticker_message, stream="book"
-                    ),
-                    streams=["!bookTicker@arr"],
-                )
+            self._start_ticker_sockets(manager)
             system_logger.info(
                 "[WS_RECONNECTED] miniTicker/bookTicker re-subscribed after: %s",
                 reason,
@@ -682,6 +672,22 @@ class MarketDataHub:
             timeout_seconds=timeout_seconds,
             min_symbols=min_syms,
         )
+
+    def wait_quietly_for_ticker_cache(
+        self,
+        timeout_seconds: float = 5.0,
+        min_symbols: int = 1,
+    ) -> bool:
+        """Block up to timeout waiting for WS tickers. No REST, no log spam."""
+        min_syms = max(int(min_symbols), 1)
+        if len(self.get_ticker_map()) >= min_syms:
+            return True
+        deadline = time.monotonic() + max(float(timeout_seconds), 0.0)
+        while time.monotonic() < deadline:
+            if len(self.get_ticker_map()) >= min_syms:
+                return True
+            time.sleep(0.25)
+        return len(self.get_ticker_map()) >= min_syms
 
     def is_market_data_ready_for_entry(self, symbol: str = "") -> tuple[bool, str]:
         """NEW-entry gate. Open-position monitoring must not use this."""
@@ -826,17 +832,7 @@ class MarketDataHub:
                 self._last_user_event_at = 0.0
 
             manager = self._ws_manager
-            self._ticker_conn_key = manager.start_futures_multiplex_socket(
-                callback=self._wrap_ws_callback(self._on_ticker_message, stream="ticker"),
-                streams=["!miniTicker@arr"],
-            )
-            if Config.ENABLE_WS_BOOK_STREAM:
-                self._book_ticker_conn_key = manager.start_futures_multiplex_socket(
-                    callback=self._wrap_ws_callback(
-                        self._on_book_ticker_message, stream="book"
-                    ),
-                    streams=["!bookTicker@arr"],
-                )
+            self._start_ticker_sockets(manager)
             self._user_conn_key = manager.start_futures_user_socket(
                 callback=self._wrap_ws_callback(self._on_user_message, stream="user"),
             )
@@ -844,7 +840,8 @@ class MarketDataHub:
             self._ws_running = True
             self._ws_started_at = time.monotonic()
             self._resubscribe_kline_streams()
-            self._mark_stream_freshness()
+            if preserve_cache:
+                self._mark_stream_freshness()
             streams = "miniTicker + user data"
             if Config.ENABLE_WS_BOOK_STREAM:
                 streams += " + bookTicker"
@@ -1065,14 +1062,38 @@ class MarketDataHub:
 
         return _wrapped
 
+    def _start_ticker_sockets(self, manager: Any) -> None:
+        """Subscribe miniTicker + bookTicker so the cache fills from the first WS frame."""
+        self._ticker_conn_key = manager.start_futures_multiplex_socket(
+            callback=self._wrap_ws_callback(self._on_ticker_message, stream="ticker"),
+            streams=["!miniTicker@arr"],
+        )
+        if not Config.ENABLE_WS_BOOK_STREAM:
+            return
+        start_book = getattr(manager, "start_all_ticker_futures_socket", None)
+        if callable(start_book):
+            # python-binance routes !bookTicker on the /public/ futures URL.
+            self._book_ticker_conn_key = start_book(
+                callback=self._wrap_ws_callback(
+                    self._on_book_ticker_message, stream="book"
+                ),
+            )
+            return
+        self._book_ticker_conn_key = manager.start_futures_multiplex_socket(
+            callback=self._wrap_ws_callback(
+                self._on_book_ticker_message, stream="book"
+            ),
+            streams=["!bookTicker@arr"],
+        )
+
     def _wrap_ws_callback(
         self,
-        handler: Callable[[dict[str, Any]], None],
+        handler: Callable[[Any], None],
         stream: str = "ticker",
-    ) -> Callable[[dict[str, Any]], None]:
+    ) -> Callable[[Any], None]:
         """Catch library error passthrough and treat any frame as connection life."""
 
-        def _wrapped(message: dict[str, Any]) -> None:
+        def _wrapped(message: Any) -> None:
             if is_ws_error_message(message):
                 detail = str(message.get("m", message.get("type", "ws error")))
                 system_logger.warning("[WS_ERROR] %s stream=%s", detail, stream)
@@ -1080,6 +1101,8 @@ class MarketDataHub:
                     self._request_reconnect(detail)
                 return
             self._note_ws_frame(stream)
+            if isinstance(message, list):
+                message = {"data": message}
             if not isinstance(message, dict):
                 return
             try:
@@ -1405,10 +1428,9 @@ class MarketDataHub:
         self._watchdog_stop.set()
         self._stop_ws_internal(preserve_kline_subscriptions=False)
 
-    def _on_book_ticker_message(self, message: dict[str, Any]) -> None:
+    def _on_book_ticker_message(self, message: Any) -> None:
         try:
-            payload = message.get("data", message)
-            rows = payload if isinstance(payload, list) else [payload]
+            rows = self._ws_payload_rows(message)
             now = time.monotonic()
             with self._lock:
                 for row in rows:
@@ -1429,9 +1451,59 @@ class MarketDataHub:
                         "updated_at": now,
                     }
                     self._last_book_event_at = now
+                    self._seed_ticker_from_book_row(symbol, bid, ask, now)
                 self._book_fetched_at = now
         except Exception as exc:
             error_logger.warning("Book ticker WS parse error: %s", exc)
+
+    @staticmethod
+    def _ws_payload_rows(message: Any) -> list[Any]:
+        """Normalize combined-stream dicts and raw JSON arrays from python-binance."""
+        if isinstance(message, list):
+            return message
+        if not isinstance(message, dict):
+            return []
+        payload = message.get("data", message)
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            nested = payload.get("data")
+            if isinstance(nested, list):
+                return nested
+            return [payload]
+        return []
+
+    def _seed_ticker_from_book_row(
+        self, symbol: str, bid: float, ask: float, now: float
+    ) -> None:
+        """Fill lastPrice from book mid so the scan universe is not empty while miniTicker is quiet."""
+        mid = (bid + ask) / 2.0
+        if mid <= 0:
+            return
+        existing = self._tickers.get(symbol)
+        if existing is None:
+            self._tickers[symbol] = {
+                "symbol": symbol,
+                "lastPrice": mid,
+                "price": mid,
+                "quoteVolume": 0.0,
+                "volume": 0.0,
+                "highPrice": ask,
+                "lowPrice": bid,
+                "openPrice": mid,
+                "updated_at": now,
+                "from_book": True,
+            }
+            if self._last_real_ticker_at <= 0:
+                self._last_real_ticker_at = now
+            return
+        if existing.get("from_book") or safe_float(existing.get("lastPrice")) <= 0:
+            existing["lastPrice"] = mid
+            existing["price"] = mid
+            existing["highPrice"] = ask
+            existing["lowPrice"] = bid
+            existing["updated_at"] = now
+            existing["from_book"] = True
 
     def get_ws_book_ticker_map(self) -> dict[str, dict[str, Any]]:
         with self._lock:
@@ -1538,10 +1610,9 @@ class MarketDataHub:
 
     # ---------------- WebSocket handlers ----------------
 
-    def _on_ticker_message(self, message: dict[str, Any]) -> None:
+    def _on_ticker_message(self, message: Any) -> None:
         try:
-            payload = message.get("data", message)
-            rows = payload if isinstance(payload, list) else [payload]
+            rows = self._ws_payload_rows(message)
             now = time.monotonic()
             updated = False
             tick_prices: dict[str, float] = {}
@@ -1554,17 +1625,31 @@ class MarketDataHub:
                         continue
                     price = safe_float(row.get("c"))
                     if price <= 0:
+                        price = safe_float(row.get("lastPrice"))
+                    if price <= 0:
+                        bid = safe_float(row.get("b"))
+                        ask = safe_float(row.get("a"))
+                        if bid > 0 and ask > 0:
+                            price = (bid + ask) / 2.0
+                    if price <= 0:
                         continue
+                    prev = self._tickers.get(symbol) or {}
                     self._tickers[symbol] = {
                         "symbol": symbol,
                         "lastPrice": price,
                         "price": price,
-                        "quoteVolume": safe_float(row.get("q")),
-                        "volume": safe_float(row.get("v")),
-                        "highPrice": safe_float(row.get("h")),
-                        "lowPrice": safe_float(row.get("l")),
-                        "openPrice": safe_float(row.get("o")),
+                        "quoteVolume": safe_float(row.get("q"))
+                        or safe_float(prev.get("quoteVolume")),
+                        "volume": safe_float(row.get("v"))
+                        or safe_float(prev.get("volume")),
+                        "highPrice": safe_float(row.get("h"))
+                        or safe_float(prev.get("highPrice")),
+                        "lowPrice": safe_float(row.get("l"))
+                        or safe_float(prev.get("lowPrice")),
+                        "openPrice": safe_float(row.get("o"))
+                        or safe_float(prev.get("openPrice")),
                         "updated_at": now,
+                        "from_book": False,
                     }
                     tick_prices[symbol] = price
                     updated = True

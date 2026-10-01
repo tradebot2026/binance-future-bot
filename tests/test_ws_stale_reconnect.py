@@ -453,6 +453,58 @@ class TestWsStaleReconnect(unittest.TestCase):
         ].default
         self.assertFalse(default)
 
+    def test_raw_list_miniticker_payload_fills_cache(self) -> None:
+        hub = MarketDataHub(MagicMock())
+        hub._ws_running = True
+        wrapped = hub._wrap_ws_callback(hub._on_ticker_message, stream="ticker")
+        wrapped(
+            [
+                {
+                    "s": "BTCUSDT",
+                    "c": "50000",
+                    "q": "10",
+                    "v": "1",
+                    "h": "1",
+                    "l": "1",
+                    "o": "1",
+                }
+            ]
+        )
+        self.assertIn("BTCUSDT", hub.get_ticker_map())
+        self.assertEqual(hub.get_ticker_map()["BTCUSDT"]["lastPrice"], 50000.0)
+
+    def test_book_ticker_list_seeds_ticker_cache(self) -> None:
+        hub = MarketDataHub(MagicMock())
+        hub._ws_running = True
+        wrapped = hub._wrap_ws_callback(hub._on_book_ticker_message, stream="book")
+        wrapped([{"s": "ETHUSDT", "b": "1.0", "a": "1.2"}])
+        self.assertIn("ETHUSDT", hub.get_ticker_map())
+        self.assertAlmostEqual(hub.get_ticker_map()["ETHUSDT"]["lastPrice"], 1.1)
+        self.assertTrue(hub.has_ws_book_data())
+
+    def test_wait_quietly_for_empty_ticker_cache_is_fast(self) -> None:
+        hub = MarketDataHub(MagicMock())
+        started = time.monotonic()
+        ready = hub.wait_quietly_for_ticker_cache(timeout_seconds=0.0)
+        self.assertFalse(ready)
+        self.assertLess(time.monotonic() - started, 0.5)
+
+    def test_tier1_empty_cache_logs_at_most_every_45s(self) -> None:
+        from pipeline.event_scan_orchestrator import EventScanOrchestrator
+
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        hub = MarketDataHub(MagicMock())
+        orch._hub = hub
+        orch._tier1_symbols = []
+        orch._last_universe_refresh_at = 0.0
+        orch._last_ticker_unavail_log_at = 0.0
+        orch.exchange = MagicMock()
+        with patch("pipeline.event_scan_orchestrator.scanner_logger") as log:
+            orch.refresh_tier1_universe(force=True, allow_rest=False)
+            orch.refresh_tier1_universe(force=True, allow_rest=False)
+        self.assertEqual(log.info.call_count, 1)
+        self.assertIn("Waiting on WS miniTicker/bookTicker", log.info.call_args[0][0])
+
 
 if __name__ == "__main__":
     unittest.main()
