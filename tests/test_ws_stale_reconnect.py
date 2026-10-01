@@ -147,11 +147,15 @@ class TestWsStaleReconnect(unittest.TestCase):
 
     def test_silent_rest_refresh_does_not_stamp_ws_freshness(self) -> None:
         hub = _hub_with_running_ws()
-        hub._last_ticker_event_at = time.monotonic() - 90.0
+        now = time.monotonic()
+        hub._last_ticker_event_at = now
+        hub._last_book_event_at = now
         hub.set_ticker_rest_fetcher(
             lambda: {"BTCUSDT": {"lastPrice": "50000", "quoteVolume": "1"}}
         )
-        with patch.object(Config, "ENABLE_REST_TICKER_FALLBACK", True):
+        with patch.object(Config, "ENABLE_REST_TICKER_FALLBACK", True), patch.object(
+            Config, "SCAN_WS_ONLY", False
+        ), patch.object(Config, "ENABLE_WEBSOCKET_STREAMS", False):
             before = hub._last_ticker_event_at
             count = hub.refresh_ticker_cache_from_rest(silent=True)
         self.assertGreaterEqual(count, 1)
@@ -307,6 +311,147 @@ class TestWsStaleReconnect(unittest.TestCase):
         df = hub.get_candles("ETHUSDT", "5m", 50, rest_fetcher, allow_rest=True)
         self.assertTrue(df.empty)
         rest_fetcher.assert_not_called()
+
+    def test_stopped_ws_is_degraded_and_skips_ticker_rest(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._ws_running = False
+        fetcher = MagicMock(return_value={"BTCUSDT": {"lastPrice": "1"}})
+        hub.set_ticker_rest_fetcher(fetcher)
+        self.assertEqual(hub.get_ws_health_snapshot()["state"], "STOPPED")
+        self.assertTrue(hub.ws_is_degraded())
+        self.assertTrue(hub.ws_state_is_degraded())
+        self.assertFalse(hub.ws_blocks_priority_scan())
+        self.assertTrue(hub._should_recover_stopped_ws())
+        self.assertEqual(hub.refresh_ticker_cache_from_rest(silent=True), 12)
+        fetcher.assert_not_called()
+
+    def test_stopped_ws_schedules_reconnect(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._ws_running = False
+        hub._last_reconnect_request_at = 0.0
+        with patch.object(Config, "WS_RECONNECT_ENABLED", True), patch.object(
+            Config, "ENABLE_WEBSOCKET_STREAMS", True
+        ), patch.object(Config, "WS_RECONNECT_DEBOUNCE_SECONDS", 0.0), patch(
+            "market_data_hub.threading.Thread"
+        ) as thread_cls:
+            hub._request_reconnect("ws STOPPED — auto-reconnect")
+        thread_cls.assert_called_once()
+        self.assertTrue(hub._reconnect_in_progress)
+
+    def test_cache_miss_does_not_rest_when_ws_stopped(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._ws_running = False
+        rest_fetcher = MagicMock(return_value=None)
+        df = hub.get_candles("ETHUSDT", "5m", 50, rest_fetcher, allow_rest=True)
+        self.assertTrue(df.empty)
+        rest_fetcher.assert_not_called()
+
+    def test_persistent_degraded_escalates_to_full_reconnect(self) -> None:
+        from market_data_hub import _KlineMultiplexSocket
+
+        hub = _hub_with_running_ws()
+        now = time.monotonic()
+        hub._last_ticker_event_at = now - 90.0
+        hub._last_book_event_at = now - 90.0
+        hub._last_ws_seen_at = now - 90.0
+        hub._kline_sockets = [
+            _KlineMultiplexSocket(
+                streams=["ethusdt@kline_5m"],
+                last_event_at=now,
+            )
+        ]
+        with patch.object(Config, "USE_TESTNET", True), patch.object(
+            Config, "ENABLE_WS_BOOK_STREAM", True
+        ), patch.object(Config, "WS_STALE_SECONDS_TESTNET", 60):
+            self.assertEqual(hub.get_ws_health_snapshot()["state"], "DEGRADED")
+            self.assertTrue(hub._should_refresh_ticker_sockets())
+            self.assertFalse(hub._should_escalate_degraded_reconnect())
+            hub._last_ticker_socket_refresh_at = now
+            self.assertFalse(hub._should_refresh_ticker_sockets())
+            self.assertTrue(hub._should_escalate_degraded_reconnect())
+
+    def test_scan_keeps_running_on_ws_cache_during_reconnect(self) -> None:
+        from pipeline.event_scan_orchestrator import EventScanOrchestrator
+
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        hub = _hub_with_running_ws()
+        hub._ws_running = False
+        orch._hub = hub
+        halted, reason = orch._scan_gate_open()
+        self.assertFalse(halted)
+        self.assertEqual(reason, "")
+        hub._ws_running = True
+        hub._reconnect_in_progress = True
+        halted, reason = orch._scan_gate_open()
+        self.assertFalse(halted)
+
+    def test_ws_ping_interval_is_15_to_20_seconds(self) -> None:
+        with patch.object(Config, "WS_PING_INTERVAL_SECONDS", 5.0):
+            self.assertEqual(Config.ws_ping_interval_seconds(), 15.0)
+        with patch.object(Config, "WS_PING_INTERVAL_SECONDS", 30.0):
+            self.assertEqual(Config.ws_ping_interval_seconds(), 20.0)
+        with patch.object(Config, "WS_PING_INTERVAL_SECONDS", 15.0):
+            self.assertEqual(Config.ws_ping_interval_seconds(), 15.0)
+        with patch.object(Config, "WS_PING_TIMEOUT_SECONDS", 30.0):
+            self.assertLess(Config.ws_ping_timeout_seconds(), Config.ws_ping_interval_seconds())
+
+    def test_scan_ws_only_forbids_healthy_ticker_and_kline_rest(self) -> None:
+        hub = _hub_with_running_ws()
+        now = time.monotonic()
+        hub._last_ticker_event_at = now
+        hub._last_book_event_at = now
+        hub._last_ws_seen_at = now
+        fetcher = MagicMock(return_value={"BTCUSDT": {"lastPrice": "1"}})
+        hub.set_ticker_rest_fetcher(fetcher)
+        rest_klines = MagicMock(return_value=None)
+        with patch.object(Config, "SCAN_WS_ONLY", True), patch.object(
+            Config, "ENABLE_WEBSOCKET_STREAMS", True
+        ), patch.object(Config, "ENABLE_REST_TICKER_FALLBACK", True):
+            self.assertFalse(hub.ws_state_is_degraded())
+            self.assertTrue(hub.ws_forbids_market_rest())
+            self.assertFalse(hub.needs_ticker_rest_fallback())
+            self.assertEqual(hub.refresh_ticker_cache_from_rest(silent=True), 12)
+            fetcher.assert_not_called()
+            df = hub.get_candles("ETHUSDT", "5m", 50, rest_klines, allow_rest=True)
+        self.assertTrue(df.empty)
+        rest_klines.assert_not_called()
+
+    def test_stale_ws_forbids_market_rest_even_if_scan_ws_only_off(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._last_ticker_event_at = time.monotonic() - 90.0
+        fetcher = MagicMock(return_value={"BTCUSDT": {"lastPrice": "1"}})
+        hub.set_ticker_rest_fetcher(fetcher)
+        with patch.object(Config, "USE_TESTNET", True), patch.object(
+            Config, "WS_STALE_SECONDS_TESTNET", 60
+        ), patch.object(Config, "SCAN_WS_ONLY", False), patch.object(
+            Config, "ENABLE_WEBSOCKET_STREAMS", True
+        ), patch.object(Config, "ENABLE_REST_TICKER_FALLBACK", True):
+            self.assertTrue(hub.ws_state_is_degraded())
+            self.assertTrue(hub.ws_forbids_market_rest())
+            hub.refresh_ticker_cache_from_rest(force=True)
+        fetcher.assert_not_called()
+
+    def test_wait_until_ready_skips_rest_when_ws_streams_enabled(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._tickers = {}
+        fetcher = MagicMock(return_value={"BTCUSDT": {"lastPrice": "1"}})
+        hub.set_ticker_rest_fetcher(fetcher)
+        with patch.object(Config, "ENABLE_WEBSOCKET_STREAMS", True), patch.object(
+            Config, "WS_STARTUP_WAIT_SECONDS", 0
+        ), patch.object(Config, "TICKER_REST_FALLBACK_AFTER_SECONDS", 1):
+            ready = hub.wait_until_ready(timeout_seconds=0, min_symbols=1)
+        self.assertFalse(ready)
+        fetcher.assert_not_called()
+
+    def test_tier1_refresh_defaults_to_ws_cache_only(self) -> None:
+        from inspect import signature
+
+        from pipeline.event_scan_orchestrator import EventScanOrchestrator
+
+        default = signature(EventScanOrchestrator.refresh_tier1_universe).parameters[
+            "allow_rest"
+        ].default
+        self.assertFalse(default)
 
 
 if __name__ == "__main__":

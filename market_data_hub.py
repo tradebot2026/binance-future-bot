@@ -47,7 +47,7 @@ class _WsThreadedWebsocketManager(ThreadedWebsocketManager):
 
 
 def _install_ws_ping_defaults() -> None:
-    """Configure python-binance ReconnectingWebsocket ping/pong (15s / 10s)."""
+    """Force python-binance ReconnectingWebsocket ping/pong (15–20s / ~10s)."""
     try:
         from binance.ws.reconnecting_websocket import ReconnectingWebsocket
     except ImportError:
@@ -60,12 +60,10 @@ def _install_ws_ping_defaults() -> None:
 
     def _init_with_ping(self, *args: Any, **kwargs: Any) -> None:
         original_init(self, *args, **kwargs)
-        interval = max(float(Config.WS_PING_INTERVAL_SECONDS), 0.0)
-        timeout = max(float(Config.WS_PING_TIMEOUT_SECONDS), 1.0)
-        if interval <= 0:
-            return
-        self._ws_kwargs.setdefault("ping_interval", interval)
-        self._ws_kwargs.setdefault("ping_timeout", timeout)
+        interval = Config.ws_ping_interval_seconds()
+        timeout = Config.ws_ping_timeout_seconds()
+        self._ws_kwargs["ping_interval"] = interval
+        self._ws_kwargs["ping_timeout"] = timeout
 
     ReconnectingWebsocket.__init__ = _init_with_ping  # type: ignore[method-assign]
     ReconnectingWebsocket._hub_ping_configured = True
@@ -183,7 +181,9 @@ class MarketDataHub:
         self._reconnect_in_progress = False
         self._last_reconnect_request_at: float = 0.0
         self._last_stale_reconnect_success_at: float = 0.0
+        self._degraded_since: float = 0.0
         self._last_ticker_socket_refresh_at: float = 0.0
+        self._last_protocol_ping_at: float = 0.0
         self._ticker_socket_refresh_in_progress = False
         self._ticker_socket_refresh_lock = threading.Lock()
         self._watchdog_stop = threading.Event()
@@ -295,17 +295,53 @@ class MarketDataHub:
         return limit, complete, complete
 
     def ws_is_degraded(self) -> bool:
-        """True during reconnect or warmup — REST fallbacks must not storm."""
-        return bool(self._reconnect_in_progress or self.is_ws_warming_up())
+        """True during reconnect, STOPPED, or warmup — REST market-data must not storm."""
+        return bool(
+            self._reconnect_in_progress
+            or not self._ws_running
+            or self.is_ws_warming_up()
+        )
 
     def ws_state_is_degraded(self) -> bool:
-        """True when hub health is DEGRADED/STALE/reconnect — REST must back off."""
-        if self._reconnect_in_progress or self.is_ws_warming_up():
+        """True when hub health is DEGRADED/STALE/STOPPED/reconnect — REST must back off."""
+        if self._reconnect_in_progress or not self._ws_running or self.is_ws_warming_up():
             return True
-        if not self._ws_running:
+        state = str(self.get_ws_health_snapshot().get("state") or "").upper()
+        return state in {"DEGRADED", "STALE", "RECONNECTING", "WARMING", "STOPPED"}
+
+    def ws_blocks_priority_scan(self) -> bool:
+        """Scan stays on WS cache during reconnect — never freeze the 5s page."""
+        return False
+
+    def ws_forbids_market_rest(self) -> bool:
+        """Block ticker/kline REST while WS is the scan plane or is unhealthy."""
+        if not Config.ENABLE_WEBSOCKET_STREAMS:
+            return False
+        if self.ws_is_degraded() or self.ws_state_is_degraded():
+            return True
+        return bool(getattr(Config, "SCAN_WS_ONLY", True))
+
+    def _should_recover_stopped_ws(self) -> bool:
+        return (
+            bool(Config.WS_RECONNECT_ENABLED)
+            and bool(Config.ENABLE_WEBSOCKET_STREAMS)
+            and not self._reconnect_in_progress
+            and not self._ws_running
+        )
+
+    def _should_escalate_degraded_reconnect(self) -> bool:
+        """Immediate full reconnect when DEGRADED and ticker-socket refresh cannot run."""
+        if self._reconnect_in_progress or not self._ws_running:
+            return False
+        if getattr(self, "_ticker_socket_refresh_in_progress", False):
             return False
         state = str(self.get_ws_health_snapshot().get("state") or "").upper()
-        return state in {"DEGRADED", "STALE", "RECONNECTING", "WARMING"}
+        if state != "DEGRADED":
+            self._degraded_since = 0.0
+            return False
+        if self._should_refresh_ticker_sockets():
+            return False
+        return True
 
     def _governor_blocks_background_rest(self, weight: int = 40) -> bool:
         gov = self._rest_governor
@@ -354,6 +390,8 @@ class MarketDataHub:
 
     def needs_ticker_rest_fallback(self) -> bool:
         """True when WS ticker cache is empty or stale beyond the REST threshold."""
+        if self.ws_forbids_market_rest():
+            return False
         if not Config.ENABLE_REST_TICKER_FALLBACK and not Config.STARTUP_TICKER_REST_SEED:
             return False
         if self.is_ticker_cache_usable(min_symbols=30):
@@ -379,10 +417,10 @@ class MarketDataHub:
         if fetcher is None:
             return len(self._tickers)
 
-        if self.ws_is_degraded() or self.ws_state_is_degraded():
+        if self.ws_forbids_market_rest():
             if self._ws_log.should_log("ticker_rest_skip_degraded"):
                 system_logger.debug(
-                    "Ticker REST skipped — WS degraded/reconnect (cache only, backoff)."
+                    "Ticker REST skipped — WS cache only (reconnect/stale/SCAN_WS_ONLY)."
                 )
             return len(self._tickers)
 
@@ -495,7 +533,7 @@ class MarketDataHub:
             return False
         if not self._kline_feeds_healthy():
             return False
-        cooldown = max(float(getattr(Config, "WS_TICKER_SOCKET_REFRESH_SECONDS", 15.0)), 5.0)
+        cooldown = max(float(getattr(Config, "WS_TICKER_SOCKET_REFRESH_SECONDS", 15.0)), 0.0)
         last = float(getattr(self, "_last_ticker_socket_refresh_at", 0.0) or 0.0)
         if last > 0 and (time.monotonic() - last) < cooldown:
             return False
@@ -563,9 +601,7 @@ class MarketDataHub:
         timeout_seconds: Optional[int] = None,
         min_symbols: int = 30,
     ) -> bool:
-        """
-        Wait briefly for WS tickers, then REST fallback if still empty/stale.
-        """
+        """Wait briefly for WS tickers. Never REST-poll while streams are enabled."""
         min_syms = max(min_symbols, 1)
         if len(self.get_ticker_map()) >= min_syms:
             system_logger.info(
@@ -574,8 +610,13 @@ class MarketDataHub:
             )
             return True
 
+        requested_wait = (
+            timeout_seconds
+            if timeout_seconds is not None
+            else Config.WS_STARTUP_WAIT_SECONDS
+        )
         ws_wait = min(
-            timeout_seconds or Config.WS_STARTUP_WAIT_SECONDS,
+            max(int(requested_wait), 0),
             max(int(Config.TICKER_REST_FALLBACK_AFTER_SECONDS), 1),
         )
         deadline = time.monotonic() + ws_wait
@@ -586,8 +627,21 @@ class MarketDataHub:
                 return True
             time.sleep(0.25)
 
+        count = len(self.get_ticker_map())
+        if Config.ENABLE_WEBSOCKET_STREAMS or self.ws_forbids_market_rest():
+            if count > 0:
+                system_logger.info(
+                    "Ticker cache WS-only after wait — %s symbols (no REST fallback).",
+                    count,
+                )
+            else:
+                system_logger.warning(
+                    "Ticker cache empty after WS wait (%ss) — staying on cache, no REST.",
+                    ws_wait,
+                )
+            return count > 0
+
         if self.ws_is_degraded() or self._governor_blocks_background_rest(40):
-            count = len(self.get_ticker_map())
             return count > 0
         if self.refresh_ticker_cache_from_rest(force=False) >= min_syms:
             return True
@@ -615,7 +669,7 @@ class MarketDataHub:
         rest_seeder: Optional[Callable[[], dict[str, dict[str, Any]]]] = None,
     ) -> bool:
         """
-        Ensure ticker cache is usable for universe build — WS first, REST after 10s.
+        Ensure ticker cache is usable for universe build — WS wait only, no REST poll.
         """
         if rest_seeder is not None:
             self._ticker_rest_fetcher = rest_seeder
@@ -746,13 +800,12 @@ class MarketDataHub:
     def start(self) -> None:
         if not Config.ENABLE_WEBSOCKET_STREAMS:
             return
-        if self._ws_running:
-            return
-        try:
-            self._start_ws_internal()
-            self._start_watchdog()
-        except Exception as exc:
-            error_logger.error("Failed to start WebSocket streams: %s", exc)
+        if not self._ws_running:
+            try:
+                self._start_ws_internal()
+            except Exception as exc:
+                error_logger.error("Failed to start WebSocket streams: %s", exc)
+        self._start_watchdog()
 
     def _start_ws_internal(self, *, preserve_cache: bool = False) -> None:
         """Create ThreadedWebsocketManager on a dedicated event loop (never main thread)."""
@@ -879,42 +932,75 @@ class MarketDataHub:
         )
         self._watchdog_thread.start()
 
+    def _maybe_protocol_ping(self) -> None:
+        """Send websockets ping frames so idle Testnet multiplex sockets stay alive."""
+        if not self._ws_running or self._reconnect_in_progress:
+            return
+        interval = Config.ws_ping_interval_seconds()
+        now = time.monotonic()
+        last = float(getattr(self, "_last_protocol_ping_at", 0.0) or 0.0)
+        if last > 0 and (now - last) < interval:
+            return
+        manager = self._ws_manager
+        loop = self._ws_loop
+        if manager is None or loop is None or not loop.is_running():
+            return
+        conns = getattr(manager, "_conns", None)
+        if conns is None:
+            bsm = getattr(manager, "_bsm", None)
+            conns = getattr(bsm, "_conns", None) if bsm is not None else None
+        if not isinstance(conns, dict) or not conns:
+            self._last_protocol_ping_at = now
+            return
+        pinged = 0
+        for sock in list(conns.values()):
+            ws = getattr(sock, "ws", None)
+            ping = getattr(ws, "ping", None) if ws is not None else None
+            if not callable(ping):
+                continue
+            try:
+                asyncio.run_coroutine_threadsafe(ping(), loop)
+                pinged += 1
+            except Exception:
+                continue
+        self._last_protocol_ping_at = now
+        if pinged and self._ws_log.should_log("ws_protocol_ping"):
+            system_logger.debug(
+                "WS ping/pong keepalive sent on %s socket(s) (interval=%.0fs).",
+                pinged,
+                interval,
+            )
+
     def _watchdog_loop(self) -> None:
         interval = max(float(Config.WS_HEALTH_CHECK_SECONDS), 5.0)
         while not self._watchdog_stop.wait(interval):
+            if self._reconnect_in_progress:
+                continue
+            if self._should_recover_stopped_ws():
+                self._request_reconnect("ws STOPPED — silent auto-reconnect")
+                continue
             if not self._ws_running:
                 continue
-            if self._reconnect_in_progress or self.is_ws_warming_up():
+            self._maybe_protocol_ping()
+            if self.is_ws_warming_up():
                 continue
             self._maybe_keepalive_user_listen_key()
             self._check_kline_sockets_health()
-            scan_warm = Config.scan_warmup_seconds()
-            if (
-                scan_warm > 0
-                and self._ws_started_at > 0
-                and (time.monotonic() - self._ws_started_at) < scan_warm
-            ):
-                continue
-            blocked, _ = self.is_rest_blocked()
             if self._should_refresh_ticker_sockets():
                 age = self.ticker_cache_age_seconds()
                 self._refresh_stale_ticker_sockets(
                     f"ticker/book stale — age {age:.0f}s (klines healthy)"
                 )
-            elif (
-                not blocked
-                and not self._rest_quiet_mode()
-                and not self._governor_blocks_background_rest(40)
-                and not self.ws_state_is_degraded()
-                and self.needs_ticker_rest_fallback()
-            ):
-                self.refresh_ticker_cache_from_rest()
             if self._should_reconnect_for_stale_ticker():
                 age = self.ticker_cache_age_seconds()
                 self._request_reconnect(
                     f"ticker stream stale — age {age:.0f}s "
                     f"(threshold {self._effective_ticker_stale_seconds():.0f}s) "
-                    "resetting miniTicker/bookTicker/userData"
+                    "silent WS reconnect"
+                )
+            elif self._should_escalate_degraded_reconnect():
+                self._request_reconnect(
+                    "ws DEGRADED — silent WS reconnect"
                 )
             elif self._should_reconnect_for_stale_user_stream():
                 self._request_reconnect(
@@ -1018,7 +1104,8 @@ class MarketDataHub:
     def _request_reconnect(self, reason: str) -> None:
         if not Config.WS_RECONNECT_ENABLED or not Config.ENABLE_WEBSOCKET_STREAMS:
             return
-        if self.is_ws_warming_up():
+        # STOPPED must recover even if no health stamp exists yet.
+        if self._ws_running and self.is_ws_warming_up():
             return
 
         preserve_cache = self._preserve_cache_on_reconnect()
@@ -1034,7 +1121,18 @@ class MarketDataHub:
             self._reconnect_in_progress = True
             self._last_real_ticker_at = 0.0
 
-        silent = preserve_cache and "stale" not in reason.lower()
+        reason_l = str(reason or "").lower()
+        silent = preserve_cache or any(
+            token in reason_l
+            for token in (
+                "stale",
+                "degraded",
+                "stopped",
+                "auto-reconnect",
+                "silent",
+                "ticker/book",
+            )
+        )
         if "stale" in reason.lower():
             system_logger.info("[WS_RECONNECT_ATTEMPT] stale stream: %s", reason)
         elif silent:
@@ -1063,6 +1161,8 @@ class MarketDataHub:
     def _reconnect_worker(self, reason: str, silent: bool = False) -> None:
         try:
             delay = self._reconnect_policy.next_delay()
+            if silent:
+                delay = min(delay, 0.5)
             system_logger.info(
                 "[WS_RECONNECT_ATTEMPT] in %.1fs (attempt %s) reason=%s",
                 delay,
@@ -1086,6 +1186,8 @@ class MarketDataHub:
             self._start_ws_internal(preserve_cache=preserve_cache)
             self._mark_stream_freshness()
             self._last_stale_reconnect_success_at = time.monotonic()
+            self._degraded_since = 0.0
+            self._reconnect_policy.reset()
             self._ws_log.reset()
             system_logger.info(
                 "[WS_RECONNECTED] streams re-subscribed (miniTicker + bookTicker + userData) after: %s",
@@ -2190,7 +2292,12 @@ class MarketDataHub:
                 return dict(self._book_tickers)
 
         blocked, _ = self.is_rest_blocked()
-        if blocked or not allow_rest or rest_fetcher is None:
+        if (
+            blocked
+            or not allow_rest
+            or rest_fetcher is None
+            or self.ws_forbids_market_rest()
+        ):
             with self._lock:
                 return dict(self._book_tickers)
 
@@ -2368,7 +2475,7 @@ class MarketDataHub:
         blocked, _ = self.is_rest_blocked()
         if blocked or not allow_rest or rest_fetcher is None:
             return cached
-        if self.ws_is_degraded() or self.ws_state_is_degraded() or self._governor_blocks_background_rest(5):
+        if self.ws_forbids_market_rest() or self._governor_blocks_background_rest(5):
             return cached
 
         miss_key = (symbol.upper(), timeframe)

@@ -360,6 +360,8 @@ class EventScanOrchestrator:
 
     def _maybe_fetch_single_closed_kline(self, symbols: list[str]) -> None:
         """At most one limit=2 REST kline for a nearly-complete hot symbol."""
+        if bool(getattr(Config, "SCAN_WS_ONLY", True)):
+            return
         if not symbols or self._hub is None or self.exchange.in_scan_mode:
             return
         if getattr(self.exchange, "_ws_reconnect_or_warmup", lambda: False)():
@@ -410,9 +412,9 @@ class EventScanOrchestrator:
         )
 
     def refresh_tier1_universe(
-        self, *, force: bool = False, allow_rest: bool = True
+        self, *, force: bool = False, allow_rest: bool = False
     ) -> list[str]:
-        """Rebuild Tier-1 watchlist and subscribe WS klines."""
+        """Rebuild Tier-1 watchlist from WS ticker cache (no REST poll)."""
         now = time.monotonic()
         if (
             not force

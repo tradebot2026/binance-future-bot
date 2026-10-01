@@ -641,6 +641,12 @@ class BinanceExchangeManager:
         hub = self._market_data
         if hub is None:
             return False
+        checker = getattr(hub, "ws_state_is_degraded", None)
+        if callable(checker):
+            try:
+                return bool(checker())
+            except Exception:
+                return False
         degraded = getattr(hub, "ws_is_degraded", None)
         if callable(degraded):
             try:
@@ -689,9 +695,7 @@ class BinanceExchangeManager:
         """True when a non-execution REST call is allowed (ban, hard-stop, budget)."""
         if self._ws_reconnect_or_warmup():
             return False
-        if self._ws_streams_degraded() and not self._degraded_rest_allowed(
-            "background", consume=False
-        ):
+        if self._ws_streams_degraded():
             return False
         if self._market_data and self._market_data.is_rest_blocked()[0]:
             return False
@@ -1681,6 +1685,13 @@ class BinanceExchangeManager:
         """
         if self._market_data and self._market_data.is_rest_blocked()[0]:
             return {}
+        forbids = getattr(self._market_data, "ws_forbids_market_rest", None)
+        if callable(forbids):
+            try:
+                if bool(forbids()):
+                    return {}
+            except Exception:
+                pass
         if self.in_scan_mode and Config.SCAN_WS_ONLY:
             return {}
         if not self.can_make_background_rest_call(
@@ -2814,9 +2825,16 @@ class BinanceExchangeManager:
             return 0.0
 
     def get_futures_ticker_map(self) -> dict[str, dict[str, Any]]:
-        """Return futures tickers — WS cache first; REST only when WS is empty/stale."""
+        """Return futures tickers — WS cache first; never REST-poll while WS is the data plane."""
         if self._market_data:
             cached = self._market_data.get_ticker_map()
+            forbids = getattr(self._market_data, "ws_forbids_market_rest", None)
+            if callable(forbids):
+                try:
+                    if bool(forbids()):
+                        return cached
+                except Exception:
+                    pass
             if cached and self._market_data.is_ticker_cache_usable(min_symbols=10):
                 if not self._market_data.needs_ticker_rest_fallback():
                     return cached

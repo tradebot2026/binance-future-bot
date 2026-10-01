@@ -115,7 +115,7 @@ class Config:
     WS_SHUTDOWN_JOIN_TIMEOUT_SECONDS: float = _env_float(
         "WS_SHUTDOWN_JOIN_TIMEOUT_SECONDS", 10.0
     )
-    STARTUP_TICKER_REST_SEED: bool = _env_bool("STARTUP_TICKER_REST_SEED", True)
+    STARTUP_TICKER_REST_SEED: bool = _env_bool("STARTUP_TICKER_REST_SEED", False)
     STARTUP_BALANCE_MAX_ATTEMPTS: int = _env_int("STARTUP_BALANCE_MAX_ATTEMPTS", 5)
     STARTUP_BALANCE_RETRY_SECONDS: float = _env_float(
         "STARTUP_BALANCE_RETRY_SECONDS", 3.0
@@ -129,6 +129,9 @@ class Config:
     WS_HEALTH_CHECK_SECONDS: int = _env_int("WS_HEALTH_CHECK_SECONDS", 10)
     WS_RECONNECT_DEBOUNCE_SECONDS: float = _env_float(
         "WS_RECONNECT_DEBOUNCE_SECONDS", 5.0
+    )
+    WS_DEGRADED_RECONNECT_SECONDS: float = _env_float(
+        "WS_DEGRADED_RECONNECT_SECONDS", 20.0
     )
     WS_KLINE_BUFFER_LIMIT: int = _env_int("WS_KLINE_BUFFER_LIMIT", 320)
     WS_KLINE_MAX_STREAMS_PER_SOCKET: int = _env_int(
@@ -286,7 +289,7 @@ class Config:
     UNCERTAIN_ORDER_RECONCILE_SECONDS: float = _env_float(
         "UNCERTAIN_ORDER_RECONCILE_SECONDS", 30.0
     )
-    ENABLE_REST_TICKER_FALLBACK: bool = _env_bool("ENABLE_REST_TICKER_FALLBACK", True)
+    ENABLE_REST_TICKER_FALLBACK: bool = _env_bool("ENABLE_REST_TICKER_FALLBACK", False)
     ENABLE_REST_BALANCE_POLL: bool = _env_bool("ENABLE_REST_BALANCE_POLL", False)
     ENABLE_REST_POSITION_POLL: bool = _env_bool("ENABLE_REST_POSITION_POLL", False)
     ENABLE_REST_PRICE_FALLBACK: bool = _env_bool("ENABLE_REST_PRICE_FALLBACK", False)
@@ -883,6 +886,18 @@ class Config:
     def scan_symbol_delay_seconds(cls) -> float:
         """Pause between scanner symbol evaluations (strictly 5.0s)."""
         return max(float(getattr(cls, "SCAN_SYMBOL_DELAY_SECONDS", 5.0)), 5.0)
+
+    @classmethod
+    def ws_ping_interval_seconds(cls) -> float:
+        """Binance WS protocol ping interval (15–20s) to keep Testnet sockets alive."""
+        return min(max(float(getattr(cls, "WS_PING_INTERVAL_SECONDS", 15.0)), 15.0), 20.0)
+
+    @classmethod
+    def ws_ping_timeout_seconds(cls) -> float:
+        """Must stay below ping interval so websockets ping/pong stays valid."""
+        interval = cls.ws_ping_interval_seconds()
+        raw = max(float(getattr(cls, "WS_PING_TIMEOUT_SECONDS", 10.0)), 5.0)
+        return min(raw, max(interval - 1.0, 5.0))
 
     @classmethod
     def ws_degraded_rest_min_interval_seconds(cls) -> float:

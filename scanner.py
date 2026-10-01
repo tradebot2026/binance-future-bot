@@ -65,9 +65,7 @@ class MarketScanner:
         automatically to keep at least UNIVERSE_RELAXED_MIN_SYMBOLS liquid pairs.
         """
         if self._hub is not None:
-            self._hub.ensure_ticker_cache_ready(
-                rest_seeder=self.exchange.fetch_futures_ticker_map_rest,
-            )
+            self._hub.ensure_ticker_cache_ready()
         result = self._universe_builder.build(priority_symbols=self._scan_priority)
         self._pipeline._last_universe_symbols = result.symbols
         if (
