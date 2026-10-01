@@ -505,6 +505,61 @@ class TestWsStaleReconnect(unittest.TestCase):
         self.assertEqual(log.info.call_count, 1)
         self.assertIn("Waiting on WS miniTicker/bookTicker", log.info.call_args[0][0])
 
+    def test_universe_rest_seed_runs_once_even_when_ws_only(self) -> None:
+        hub = MarketDataHub(MagicMock())
+        calls: list[int] = []
+
+        def fetcher() -> dict[str, dict[str, str]]:
+            calls.append(1)
+            return {
+                "BTCUSDT": {"lastPrice": "50000", "quoteVolume": "1000000"},
+                "ETHUSDT": {"lastPrice": "3000", "quoteVolume": "800000"},
+            }
+
+        with patch.object(Config, "SCAN_WS_ONLY", True), patch.object(
+            Config, "STARTUP_TICKER_REST_SEED", True
+        ):
+            first = hub.seed_universe_from_rest_once(fetcher, min_symbols=2)
+            second = hub.seed_universe_from_rest_once(fetcher, min_symbols=2)
+        self.assertEqual(len(calls), 1)
+        self.assertGreaterEqual(first, 2)
+        self.assertEqual(second, first)
+        self.assertIn("BTCUSDT", hub.get_ticker_map())
+        self.assertGreater(hub.volume_ranked_ticker_count(), 0)
+        self.assertEqual(hub._last_ticker_event_at, 0.0)
+
+    def test_universe_rest_seed_skipped_when_volume_already_present(self) -> None:
+        hub = _hub_with_running_ws()
+        for row in hub._tickers.values():
+            row["quoteVolume"] = 1_000_000.0
+        fetcher = MagicMock(
+            return_value={"BTCUSDT": {"lastPrice": "1", "quoteVolume": "1"}}
+        )
+        hub.seed_universe_from_rest_once(fetcher, min_symbols=10)
+        fetcher.assert_not_called()
+
+    def test_empty_universe_priority_scan_logs_at_most_every_60s(self) -> None:
+        from pipeline.event_scan_orchestrator import EventScanOrchestrator
+
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch._hub = None
+        orch._tier1_symbols = []
+        orch._last_empty_universe_log_at = 0.0
+        orch._scan_gate_open = lambda: (False, "")  # type: ignore[method-assign]
+        orch.maybe_refresh_tier1_periodic = lambda: None  # type: ignore[method-assign]
+        orch.bootstrap_watchlist_once = lambda: []  # type: ignore[method-assign]
+        orch.run_catchup = lambda: 0  # type: ignore[method-assign]
+        orch.conflict_guard = MagicMock()
+        orch._fast_track_live_spikes = lambda: None  # type: ignore[method-assign]
+        orch._drain_due_event_symbols = lambda: ({}, [])  # type: ignore[method-assign]
+        orch._cycle_scan_symbols = lambda extra: []  # type: ignore[method-assign]
+        orch.assignment_manager = MagicMock(tier2_size=0)
+        with patch("pipeline.event_scan_orchestrator.scanner_logger") as log:
+            orch.process_priority_scan_cycle()
+            orch.process_priority_scan_cycle()
+        self.assertEqual(log.info.call_count, 1)
+        self.assertIn("empty universe", log.info.call_args[0][0])
+
 
 if __name__ == "__main__":
     unittest.main()

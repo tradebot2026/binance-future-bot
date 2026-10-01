@@ -1714,6 +1714,31 @@ class BinanceExchangeManager:
                 error_logger.warning("Ticker REST fallback failed: %s", exc)
             return {}
 
+    def fetch_universe_bootstrap_ticker_map(self) -> dict[str, dict[str, Any]]:
+        """
+        One-shot all-symbol futures_ticker() for the scan universe (weight=40).
+        Ban-gated only — not blocked by SCAN_WS_ONLY or WS warmup.
+        Must run outside scan_context (use bootstrap_context).
+        """
+        if self._market_data and self._market_data.is_rest_blocked()[0]:
+            return {}
+        if self.in_scan_mode:
+            return {}
+        try:
+            tickers = self._throttled_call(
+                self.client.futures_ticker,
+                **self.recv_window_param,
+            )
+            return {
+                str(row["symbol"]): row for row in tickers if row.get("symbol")
+            }
+        except ExchangeRateLimitError:
+            return {}
+        except Exception as exc:
+            if self._rest_block_log.should_log("universe_bootstrap_ticker"):
+                error_logger.warning("Universe bootstrap ticker REST failed: %s", exc)
+            return {}
+
     def fetch_startup_ticker_map(self) -> dict[str, dict[str, Any]]:
         """Alias for startup seeding — same single lightweight REST request."""
         return self.fetch_futures_ticker_map_rest()

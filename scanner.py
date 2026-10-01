@@ -106,15 +106,23 @@ class MarketScanner:
         """Refresh Tier-1 watchlist for event-driven scanning."""
         if self.orchestrator is None:
             return []
-        return self.orchestrator.refresh_tier1_universe(force=True)
+        return self.orchestrator.bootstrap_watchlist_once()
 
     def subscribe_watchlist_ws_only(self) -> list[str]:
-        """Subscribe kline streams from the current WS ticker cache — no REST."""
+        """Subscribe kline streams from the current ticker cache — no REST poll."""
         if self.orchestrator is None:
             return []
         if self._hub is not None and not self._hub.is_ticker_cache_usable():
             self._hub.wait_quietly_for_ticker_cache(timeout_seconds=5.0)
+        if self._hub is not None and not self.orchestrator.tier1_symbols:
+            return self.orchestrator.bootstrap_watchlist_once()
         return self.orchestrator.refresh_tier1_universe(force=True, allow_rest=False)
+
+    def bootstrap_scan_universe(self) -> list[str]:
+        """One-shot REST universe seed + Tier-1 watchlist at startup/warmup."""
+        if self.orchestrator is None:
+            return []
+        return self.orchestrator.bootstrap_watchlist_once()
 
     def process_event_scan_cycle(self) -> List[Dict[str, Any]]:
         """Drain candle-close queue and return execution candidates."""

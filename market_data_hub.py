@@ -149,6 +149,7 @@ class MarketDataHub:
         self._last_ticker_rest_at: float = 0.0
         self._cache_miss_rest_at: dict[tuple[str, str], float] = {}
         self._ticker_rest_seeded: bool = False
+        self._universe_rest_seeded: bool = False
         self._ticker_conn_key: Optional[str] = None
         self._book_ticker_conn_key: Optional[str] = None
         self._user_conn_key: Optional[str] = None
@@ -475,6 +476,7 @@ class MarketDataHub:
         self.seed_tickers_from_rest(result)
         self._last_ticker_rest_at = now
         self._ticker_rest_seeded = True
+        self._universe_rest_seeded = True
         count = len(self._tickers)
         if silent:
             system_logger.debug(
@@ -688,6 +690,74 @@ class MarketDataHub:
                 return True
             time.sleep(0.25)
         return len(self.get_ticker_map()) >= min_syms
+
+    def volume_ranked_ticker_count(self, min_quote_volume: float = 1.0) -> int:
+        """Symbols in cache that already have a usable 24h quote volume."""
+        floor = max(float(min_quote_volume), 0.0)
+        with self._lock:
+            return sum(
+                1
+                for row in self._tickers.values()
+                if safe_float(row.get("quoteVolume")) > floor
+            )
+
+    def seed_universe_from_rest_once(
+        self,
+        rest_fetcher: Optional[Callable[[], dict[str, dict[str, Any]]]] = None,
+        *,
+        min_symbols: Optional[int] = None,
+    ) -> int:
+        """
+        One-shot futures_ticker() REST seed for the scan universe (weight=40).
+        Does not poll, does not stamp WS freshness, and skips if already seeded
+        or the cache already has enough volume-ranked symbols.
+        """
+        min_syms = max(int(min_symbols or Config.MIN_SCAN_UNIVERSE), 10)
+        if self._universe_rest_seeded:
+            return len(self._tickers)
+        if self.volume_ranked_ticker_count() >= min_syms:
+            self._universe_rest_seeded = True
+            return len(self._tickers)
+        if not bool(getattr(Config, "STARTUP_TICKER_REST_SEED", True)):
+            return len(self._tickers)
+
+        blocked, reason = self.is_rest_blocked()
+        if blocked:
+            if self._ws_log.should_log(f"universe_rest_blocked:{reason}"):
+                system_logger.debug(
+                    "Universe REST seed skipped — REST blocked: %s", reason
+                )
+            return len(self._tickers)
+
+        fetcher = rest_fetcher or self._ticker_rest_fetcher
+        if fetcher is None:
+            return len(self._tickers)
+
+        try:
+            result = fetcher() or {}
+        except Exception as exc:
+            from binance.exceptions import BinanceAPIException
+
+            if isinstance(exc, BinanceAPIException) and exc.code == -1003:
+                self.handle_rate_limit_error(exc)
+            error_logger.warning("Universe REST ticker seed failed: %s", exc)
+            return len(self._tickers)
+
+        if not result:
+            return len(self._tickers)
+
+        self.seed_tickers_from_rest(result)
+        self._universe_rest_seeded = True
+        self._ticker_rest_seeded = True
+        self._last_ticker_rest_at = time.monotonic()
+        count = len(self._tickers)
+        system_logger.info(
+            "Scan universe seeded from one REST futures_ticker() call "
+            "(%s symbols, volume-ranked=%s).",
+            count,
+            self.volume_ranked_ticker_count(),
+        )
+        return count
 
     def is_market_data_ready_for_entry(self, symbol: str = "") -> tuple[bool, str]:
         """NEW-entry gate. Open-position monitoring must not use this."""
@@ -2416,6 +2486,7 @@ class MarketDataHub:
                     "lowPrice": safe_float(row.get("lowPrice")),
                     "openPrice": safe_float(row.get("openPrice")),
                     "updated_at": now,
+                    "from_book": False,
                 }
 
     # ---------------- Positions (user stream) ----------------

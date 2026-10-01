@@ -621,7 +621,6 @@ def main(controller: Optional[BotController] = None) -> str:
 
     if Config.ENABLE_WEBSOCKET_STREAMS and not (startup_ban and startup_ban.is_banned):
         exchange.mark_ws_rest_ready()
-        market_data.ensure_ticker_cache_ready()
 
     if startup_ban and startup_ban.is_banned:
         ban_msg = market_data.format_ban_message(startup_ban)
@@ -705,7 +704,7 @@ def main(controller: Optional[BotController] = None) -> str:
                 "Scanner idle; exits stay live."
             )
         if scanner is not None and scanner.orchestrator is not None:
-            scanner.subscribe_watchlist_ws_only()
+            scanner.bootstrap_scan_universe()
         if (
             scanner is not None
             and not scan_warmup.in_warmup()
@@ -784,6 +783,11 @@ def main(controller: Optional[BotController] = None) -> str:
                 if scan_warmup.in_warmup():
                     scan_warmup.maybe_log_progress()
                     if scanner is not None:
+                        if (
+                            scanner.orchestrator is not None
+                            and not scanner.orchestrator.tier1_symbols
+                        ):
+                            scanner.bootstrap_scan_universe()
                         scanner.populate_warmup_kline_cache()
                 elif scanner is None:
                     if cycle == 1:

@@ -56,6 +56,7 @@ class EventScanOrchestrator:
         self._kline_cache_misses: list[str] = []
         self._kline_pending_log_at: dict[str, float] = {}
         self._last_ticker_unavail_log_at: float = 0.0
+        self._last_empty_universe_log_at: float = 0.0
 
     @property
     def tier1_symbols(self) -> list[str]:
@@ -215,7 +216,7 @@ class EventScanOrchestrator:
             return 0
 
         if not self._tier1_symbols:
-            self.refresh_tier1_universe(force=True, allow_rest=False)
+            self.bootstrap_watchlist_once()
         symbols = list(self.priority_queue.hot_symbols or self._tier1_symbols)
         if not symbols:
             return 0
@@ -477,11 +478,25 @@ class EventScanOrchestrator:
         )
         return self._tier1_symbols
 
+    def bootstrap_watchlist_once(self) -> list[str]:
+        """One-shot REST ticker seed + Tier-1 watchlist, even in SCAN_WS_ONLY."""
+        if self._hub is not None and bool(getattr(Config, "STARTUP_TICKER_REST_SEED", True)):
+            fetcher = getattr(
+                self.exchange, "fetch_universe_bootstrap_ticker_map", None
+            )
+            if callable(fetcher) and not self.exchange.in_scan_mode:
+                try:
+                    with self.exchange.bootstrap_context():
+                        self._hub.seed_universe_from_rest_once(fetcher)
+                except Exception as exc:
+                    scanner_logger.warning("Universe REST seed skipped — %s", exc)
+        return self.refresh_tier1_universe(force=True, allow_rest=False)
+
     def maybe_refresh_tier1_periodic(self) -> None:
         """Rebuild Tier-1 from live volume ranks on a fixed interval (default 30 min)."""
         now = time.monotonic()
         if not self._tier1_symbols:
-            self.refresh_tier1_universe(force=True)
+            self.bootstrap_watchlist_once()
             return
         if (
             now - self._last_universe_refresh_at
@@ -571,7 +586,7 @@ class EventScanOrchestrator:
 
         self.maybe_refresh_tier1_periodic()
         if not self._tier1_symbols:
-            self.refresh_tier1_universe()
+            self.bootstrap_watchlist_once()
 
         self.run_catchup()
         self.conflict_guard.reset_cycle()
@@ -581,11 +596,15 @@ class EventScanOrchestrator:
         event_by_symbol, event_symbols = self._drain_due_event_symbols()
         symbols = self._cycle_scan_symbols(event_symbols)
         if not symbols:
-            scanner_logger.info(
-                "Priority scan produced 0 execution candidates "
-                "(empty universe, tier2=%s).",
-                self.assignment_manager.tier2_size,
-            )
+            now_log = time.monotonic()
+            last_log = float(self._last_empty_universe_log_at or 0.0)
+            if last_log <= 0.0 or (now_log - last_log) >= 60.0:
+                self._last_empty_universe_log_at = now_log
+                scanner_logger.info(
+                    "Priority scan produced 0 execution candidates "
+                    "(empty universe, tier2=%s). Next notice in 60s.",
+                    self.assignment_manager.tier2_size,
+                )
             return []
 
         open_symbols = self._open_symbols()
