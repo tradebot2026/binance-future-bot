@@ -255,16 +255,33 @@ class TestMainLoopIsEventDriven(unittest.TestCase):
         self.assertIn("warmup_and_evaluate_kline_misses", source)
         self.assertIn("MinuteScanClock", source)
         self.assertIn("scan_clock.due", source)
-        self.assertIn("ScanWarmupGate", source)
-        self.assertIn("WARMUP_MODE", source)
-        self.assertIn("populate_warmup_kline_cache", source)
-        from core.scan_warmup import ScanWarmupGate
-
-        self.assertEqual(ScanWarmupGate.MODE_WARMUP, "WARMUP_MODE")
-        self.assertEqual(ScanWarmupGate.MODE_ACTIVE, "ACTIVE_SCANNING_MODE")
+        self.assertNotIn("ScanWarmupGate", source)
+        self.assertNotIn("WARMUP_MODE", source)
+        self.assertNotIn("populate_warmup_kline_cache", source)
+        self.assertIn("ACTIVE_SCANNING_MODE", source)
+        scan_at = source.find("process_priority_scan_cycle")
+        gate_at = source.find("_entries_allowed(")
+        self.assertGreater(scan_at, 0)
+        self.assertGreater(gate_at, scan_at)
         self.assertNotIn("scan_unified()", source)
         self.assertNotIn("scan_range_market()", source)
         self.assertNotIn("scan_market()", source)
+
+
+class TestRestBanDoesNotFreezeScan(unittest.TestCase):
+    def test_wait_for_rest_unblock_does_not_sleep(self) -> None:
+        import main as main_mod
+
+        market_data = MagicMock()
+        market_data.is_rest_blocked.return_value = (True, "ban")
+        market_data.get_rest_block_remaining_seconds.return_value = 900
+        controller = MagicMock()
+        controller.is_shutdown_requested.return_value = False
+        with patch("main.time.sleep") as slept:
+            blocked = main_mod._wait_for_rest_unblock(market_data, controller)
+        self.assertTrue(blocked)
+        slept.assert_not_called()
+        market_data.log_ban_pause_once.assert_called_once()
 
 
 class TestEnginesPackage(unittest.TestCase):

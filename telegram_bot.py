@@ -6,6 +6,7 @@ HTML-safe messaging, background polling, and authorized chat commands.
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -89,6 +90,12 @@ class TelegramManager:
 
         self._stop_event = threading.Event()
         self._listener_thread: Optional[threading.Thread] = None
+        self._outbound: queue.Queue[str] = queue.Queue(maxsize=200)
+        self._commands: queue.Queue[tuple[Callable[..., None], Any]] = queue.Queue(
+            maxsize=50
+        )
+        self._api_lock = threading.Lock()
+        self._worker_threads: list[threading.Thread] = []
 
         if self.enabled:
             self.bot = telebot.TeleBot(self.token, parse_mode="HTML")
@@ -115,6 +122,7 @@ class TelegramManager:
             daemon=True,
         )
         self._listener_thread.start()
+        self._start_workers()
 
     def stop_listening(self) -> None:
         self._stop_event.set()
@@ -123,6 +131,65 @@ class TelegramManager:
                 self.bot.stop_polling()
             except Exception:
                 pass
+
+    def _start_workers(self) -> None:
+        workers = (
+            ("TelegramOutbound", self._outbound_loop),
+            ("TelegramCommands", self._command_loop),
+        )
+        for name, target in workers:
+            if any(t.name == name and t.is_alive() for t in self._worker_threads):
+                continue
+            thread = threading.Thread(target=target, name=name, daemon=True)
+            thread.start()
+            self._worker_threads.append(thread)
+
+    def _outbound_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                text = self._outbound.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            self._send_now(text)
+
+    def _command_loop(self) -> None:
+        while not self._stop_event.is_set():
+            try:
+                handler, message = self._commands.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                handler(message)
+            except Exception as exc:
+                error_logger.error("Telegram command worker error: %s", exc)
+                try:
+                    self._reply(
+                        message,
+                        "⚠️ Command failed, but Telegram is still online. "
+                        "Binance/API issues do not freeze this chat.",
+                    )
+                except Exception:
+                    pass
+
+    def _send_now(self, text: str) -> None:
+        if not self.enabled or self.bot is None:
+            return
+        try:
+            with self._api_lock:
+                self.bot.send_message(
+                    chat_id=self.chat_id, text=text, parse_mode="HTML"
+                )
+        except Exception as exc:
+            error_logger.error("Failed to send Telegram message: %s", exc)
+
+    def _reply(self, message: Any, text: str) -> None:
+        if not self.enabled or self.bot is None:
+            return
+        try:
+            with self._api_lock:
+                self.bot.reply_to(message, text)
+        except Exception as exc:
+            error_logger.error("Failed to reply via Telegram: %s", exc)
 
     def _polling_loop(self) -> None:
         assert self.bot is not None
@@ -135,7 +202,9 @@ class TelegramManager:
                     skip_pending=True,
                 )
             except Exception as exc:
-                error_logger.error("Telegram polling error: %s", exc)
+                error_logger.error(
+                    "Telegram polling error (listener stays alive): %s", exc
+                )
                 if self._stop_event.is_set():
                     break
                 time.sleep(5)
@@ -146,9 +215,9 @@ class TelegramManager:
         if not self.enabled or self.bot is None:
             return
         try:
-            self.bot.send_message(chat_id=self.chat_id, text=text, parse_mode="HTML")
-        except Exception as exc:
-            error_logger.error("Failed to send Telegram message: %s", exc)
+            self._outbound.put_nowait(text)
+        except queue.Full:
+            error_logger.warning("Telegram outbound queue full — dropping message.")
 
     def send_trade_alert(
         self,
@@ -502,7 +571,13 @@ class TelegramManager:
             def wrapper(message: telebot.types.Message) -> None:
                 if not self._authorized(message):
                     return
-                handler(message)
+                try:
+                    self._commands.put_nowait((handler, message))
+                except queue.Full:
+                    self._reply(
+                        message,
+                        "⚠️ Command queue busy — Telegram is still online. Retry shortly.",
+                    )
 
             return wrapper
 
@@ -511,7 +586,7 @@ class TelegramManager:
         def ping_handler(message: telebot.types.Message) -> None:
             mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
             dry = " | DRY_RUN" if Config.DRY_RUN else ""
-            self.bot.reply_to(
+            self._reply(
                 message,
                 f"🟢 <b>Bot online</b> — actively monitoring markets "
                 f"({escape_html(mode)}{dry}).",
@@ -527,7 +602,7 @@ class TelegramManager:
                 controller=self.controller,
                 scheduler=self.scheduler,
             )
-            self.bot.reply_to(message, text)
+            self._reply(message, text)
 
         @self.bot.message_handler(commands=["status"])
         @authorized
@@ -539,11 +614,11 @@ class TelegramManager:
                 else self.db.get_daily_stats(today)
             )
             if not stats:
-                self.bot.reply_to(message, "⚠️ No daily stats recorded yet today.")
+                self._reply(message, "⚠️ No daily stats recorded yet today.")
                 return
 
             if not self.exchange:
-                self.bot.reply_to(message, "⚠️ Exchange not attached.")
+                self._reply(message, "⚠️ Exchange not attached.")
                 return
 
             engine_status = "RUNNING"
@@ -558,13 +633,13 @@ class TelegramManager:
                 today=today,
                 engine_status=engine_status,
             )
-            self.bot.reply_to(message, msg)
+            self._reply(message, msg)
 
         @self.bot.message_handler(commands=["risk"])
         @authorized
         def risk_handler(message: telebot.types.Message) -> None:
             if not self.risk_manager:
-                self.bot.reply_to(message, "Risk manager not attached.")
+                self._reply(message, "Risk manager not attached.")
                 return
 
             snap = self.risk_manager.get_risk_snapshot()
@@ -593,14 +668,14 @@ class TelegramManager:
             )
             if snap.block_reason:
                 msg += f"\n⛔ <b>Block:</b> {escape_html(snap.block_reason)}"
-            self.bot.reply_to(message, msg)
+            self._reply(message, msg)
 
         @self.bot.message_handler(commands=["positions"])
         @authorized
         def positions_handler(message: telebot.types.Message) -> None:
             trades = self.db.get_open_trades()
             if not trades:
-                self.bot.reply_to(message, "📭 No open positions.")
+                self._reply(message, "📭 No open positions.")
                 return
 
             lines = ["📂 <b>Open Positions</b>\n"]
@@ -612,16 +687,16 @@ class TelegramManager:
                     f"status={escape_html(str(trade.get('status')))} | "
                     f"entry={safe_float(trade.get('entry_price')):.4f}"
                 )
-            self.bot.reply_to(message, "\n".join(lines))
+            self._reply(message, "\n".join(lines))
 
         @self.bot.message_handler(commands=["pause"])
         @authorized
         def pause_handler(message: telebot.types.Message) -> None:
             if not self.scheduler:
-                self.bot.reply_to(message, "Scheduler not attached.")
+                self._reply(message, "Scheduler not attached.")
                 return
             self.scheduler.pause_entries_manual("Manual pause via /pause")
-            self.bot.reply_to(
+            self._reply(
                 message,
                 "⏸ <b>Entries paused.</b>\n"
                 "<i>Open positions continue to be managed.</i>",
@@ -631,7 +706,7 @@ class TelegramManager:
         @authorized
         def resume_handler(message: telebot.types.Message) -> None:
             if not self.scheduler:
-                self.bot.reply_to(message, "Scheduler not attached.")
+                self._reply(message, "Scheduler not attached.")
                 return
             self.scheduler.resume_entries_manual()
             if self.risk_manager:
@@ -652,14 +727,14 @@ class TelegramManager:
                 allowed_line = ""
 
             if paused:
-                self.bot.reply_to(
+                self._reply(
                     message,
                     f"⚠️ Manual pause cleared, but entries still blocked:\n"
                     f"{escape_html(reason)}"
                     f"{consec_line}{allowed_line}",
                 )
             else:
-                self.bot.reply_to(
+                self._reply(
                     message,
                     "▶️ <b>Entries resumed.</b> Scanning will continue."
                     f"{consec_line}{allowed_line}",
@@ -669,12 +744,12 @@ class TelegramManager:
         @authorized
         def forceresume_handler(message: telebot.types.Message) -> None:
             if not self.scheduler:
-                self.bot.reply_to(message, "Scheduler not attached.")
+                self._reply(message, "Scheduler not attached.")
                 return
 
             note = self.scheduler.force_resume_entries()
             if note.startswith("BLOCKED"):
-                self.bot.reply_to(message, f"🚫 {escape_html(note)}")
+                self._reply(message, f"🚫 {escape_html(note)}")
                 return
 
             if self.risk_manager:
@@ -687,7 +762,7 @@ class TelegramManager:
             else:
                 status_line = "\n⚙️ <b>Status:</b> RUNNING"
 
-            self.bot.reply_to(
+            self._reply(
                 message,
                 "🚀 <b>Force resume activated</b>\n"
                 f"{escape_html(note)}"
@@ -699,9 +774,9 @@ class TelegramManager:
         @authorized
         def closeall_handler(message: telebot.types.Message) -> None:
             if not self.manager:
-                self.bot.reply_to(message, "Trade manager not attached.")
+                self._reply(message, "Trade manager not attached.")
                 return
-            self.bot.reply_to(message, "⏳ Closing all open positions…")
+            self._reply(message, "⏳ Closing all open positions…")
             result = self.manager.close_all_positions(reason="MANUAL_CLOSE_ALL")
             closed = result.get("closed", [])
             failed = result.get("failed", [])
@@ -716,12 +791,12 @@ class TelegramManager:
                 msg += "\n\n<b>Failures:</b>\n" + "\n".join(
                     f"• {escape_html(str(f))}" for f in failed[:10]
                 )
-            self.bot.reply_to(message, msg)
+            self._reply(message, msg)
 
         @self.bot.message_handler(commands=["stop"])
         @authorized
         def stop_handler(message: telebot.types.Message) -> None:
-            self.bot.reply_to(
+            self._reply(
                 message,
                 "🛑 <b>Shutdown requested.</b>\n"
                 "Stopping the trading loop safely…",
@@ -734,7 +809,7 @@ class TelegramManager:
         @self.bot.message_handler(commands=["restart"])
         @authorized
         def restart_handler(message: telebot.types.Message) -> None:
-            self.bot.reply_to(
+            self._reply(
                 message,
                 "🔄 <b>Restart requested.</b>\n"
                 "Bot will restart gracefully…",
@@ -751,7 +826,7 @@ class TelegramManager:
         @self.bot.message_handler(commands=["market"])
         @authorized
         def market_handler(message: telebot.types.Message) -> None:
-            self.bot.reply_to(message, self._format_market_snapshot())
+            self._reply(message, self._format_market_snapshot())
 
         @self.bot.message_handler(commands=["errors"])
         @authorized
@@ -759,52 +834,42 @@ class TelegramManager:
             text = self._format_recent_errors()
             if len(text) > 4000:
                 text = text[:3990] + "\n…"
-            self.bot.reply_to(message, text)
+            self._reply(message, text)
 
         @self.bot.message_handler(commands=["balance"])
         @authorized
         def balance_handler(message: telebot.types.Message) -> None:
             if not self.exchange:
-                self.bot.reply_to(message, "Exchange not attached.")
+                self._reply(message, "Exchange not attached.")
                 return
             header = format_live_account_header(
                 self.exchange,
                 db=self.db,
                 date_str=utc_today_str(),
             ).rstrip()
-            self.bot.reply_to(message, header)
+            self._reply(message, header)
 
         @self.bot.message_handler(commands=["active"])
         @authorized
         def active_handler(message: telebot.types.Message) -> None:
             if not self.exchange:
-                self.bot.reply_to(message, "⚠️ Exchange not attached.")
+                self._reply(message, "⚠️ Exchange not attached.")
                 return
             text = format_active_positions_message(
                 self.db, self.exchange, telegram=self
             )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"
-            self.bot.reply_to(message, text)
+            self._reply(message, text)
 
         @self.bot.message_handler(commands=["watchlist"])
         @authorized
         def watchlist_handler(message: telebot.types.Message) -> None:
             scanner = getattr(self, "scanner", None)
             if scanner is None or not hasattr(scanner, "get_watchlist_tiers"):
-                self.bot.reply_to(message, "⚠️ Event scan not available.")
+                self._reply(message, "⚠️ Event scan not available.")
                 return
             tiers = scanner.get_watchlist_tiers()
-            orchestrator = getattr(scanner, "orchestrator", None)
-            rest_blocked = False
-            if self.exchange is not None and hasattr(self.exchange, "is_rest_blocked"):
-                rest_blocked = bool(self.exchange.is_rest_blocked()[0])
-            if orchestrator is not None and not tiers.get("tier2") and not rest_blocked:
-                try:
-                    orchestrator.process_hot_scan_cycle(pace=False)
-                    tiers = scanner.get_watchlist_tiers()
-                except Exception as exc:
-                    error_logger.warning("/watchlist hot scan refresh failed: %s", exc)
             text = format_watchlist_message(
                 tier1_hot=tiers.get("tier1_hot", []),
                 tier1_background=tiers.get("tier1_background", []),
@@ -816,10 +881,12 @@ class TelegramManager:
                 rotation_cycle=int(tiers.get("rotation_cycle") or 0),
                 rotation_evaluated=int(tiers.get("rotation_evaluated") or 0),
                 exchange=self.exchange,
+                super_rows=tiers.get("super", []),
+                lock_cycle=int(tiers.get("lock_cycle") or 0),
             )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"
-            self.bot.reply_to(message, text)
+            self._reply(message, text)
 
         @self.bot.message_handler(commands=["testtrade"])
         @authorized
@@ -827,22 +894,22 @@ class TelegramManager:
             parts = (message.text or "").split()
             symbol = parts[1] if len(parts) >= 2 else ""
             if not symbol:
-                self.bot.reply_to(
+                self._reply(
                     message,
                     "Usage: /testtrade SYMBOL\nExample: <code>/testtrade ONGUSDT</code>",
                 )
                 return
-            self.bot.reply_to(
+            self._reply(
                 message,
                 f"⏳ Placing Testnet min-size market LONG on {escape_html(symbol.upper())}…",
             )
             result = self._place_testnet_test_trade(symbol)
-            self.bot.reply_to(message, result)
+            self._reply(message, result)
 
         @self.bot.message_handler(commands=["help"])
         @authorized
         def help_handler(message: telebot.types.Message) -> None:
-            self.bot.reply_to(
+            self._reply(
                 message,
                 "<b>Available commands</b>\n"
                 "/status — daily performance\n"
@@ -859,7 +926,7 @@ class TelegramManager:
                 f"{int(Config.TELEGRAM_ERROR_LOG_MAX_AGE_HOURS)} hours\n"
                 "/balance — live futures balance\n"
                 "/active — open positions (DB + Binance REST)\n"
-                "/watchlist — Tier 1 hot scan + Tier 2 candidates\n"
+                "/watchlist — Normal / Hot / Super funnel\n"
                 "/health — system diagnostics (alias /pulse)\n"
                 "/testtrade SYMBOL — Testnet min-size market order (REST price)\n"
                 "/ping — quick online check\n"

@@ -1648,8 +1648,8 @@ class MarketDataHub:
         ban = self._ban_status
         until = ban.banned_until_iso if ban and ban.banned_until_iso else "unknown"
         system_logger.warning(
-            "Binance REST/IP ban active — main loop paused ~%ss (until %s). "
-            "Scanning and REST polling suspended; WebSocket cache only.",
+            "Binance REST/IP ban active — REST paused ~%ss (until %s). "
+            "WS-only Normal/Hot scoring continues; order placement deferred.",
             remaining_seconds,
             until,
         )

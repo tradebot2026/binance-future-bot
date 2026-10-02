@@ -125,8 +125,12 @@ def _simulate_trade(
 
 
 def backtest_min_bars() -> int:
-    """Accept 15m history with a 450-bar floor (fetch still requests 500)."""
-    limit = max(int(getattr(Config, "BACKTEST_CANDLE_LIMIT", 500)), 200)
+    """Accept 15m history with a 450-bar floor (fetch capped at 600)."""
+    limit_fn = getattr(Config, "backtest_candle_limit", None)
+    if callable(limit_fn):
+        limit = int(limit_fn())
+    else:
+        limit = min(max(int(getattr(Config, "BACKTEST_CANDLE_LIMIT", 500)), 200), 600)
     floor = int(getattr(Config, "BACKTEST_MIN_BARS", 450))
     return max(min(floor, limit), 200)
 

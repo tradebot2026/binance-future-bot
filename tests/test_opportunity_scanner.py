@@ -474,16 +474,16 @@ class TestScanWarmupGate(unittest.TestCase):
         self.assertFalse(gate.in_warmup())
         self.assertFalse(gate.just_finished())
 
-    def test_config_clamps_warmup_to_3_5_minutes(self) -> None:
+    def test_config_bypasses_warmup_window(self) -> None:
         with patch.object(Config, "SCAN_WARMUP_SECONDS", 60.0):
-            self.assertEqual(Config.scan_warmup_seconds(), 180.0)
+            self.assertEqual(Config.scan_warmup_seconds(), 0.0)
         with patch.object(Config, "SCAN_WARMUP_SECONDS", 400.0):
-            self.assertEqual(Config.scan_warmup_seconds(), 300.0)
+            self.assertEqual(Config.scan_warmup_seconds(), 0.0)
         with patch.object(Config, "SCAN_WARMUP_SECONDS", 0.0):
             self.assertEqual(Config.scan_warmup_seconds(), 0.0)
         with patch.object(Config, "SCAN_WARMUP_SECONDS", 300.0):
-            self.assertEqual(Config.scan_warmup_seconds(), 300.0)
-        self.assertGreaterEqual(Config.scan_symbol_delay_seconds(), 5.0)
+            self.assertEqual(Config.scan_warmup_seconds(), 0.0)
+        self.assertGreaterEqual(Config.scan_symbol_delay_seconds(), 0.0)
 
     def test_warmup_kline_rest_guards_are_clamped(self) -> None:
         with patch.object(Config, "WARMUP_KLINE_FETCH_LIMIT", 20):
@@ -512,7 +512,9 @@ class TestScanWarmupGate(unittest.TestCase):
         orch.exchange.scan_context.return_value.__exit__ = MagicMock(return_value=False)
         orch._hub = None
         orch._evaluate_symbol = MagicMock(return_value=None)
-        with patch.object(Config, "SCAN_SYMBOL_DELAY_SECONDS", 5.0), patch(
+        with patch.object(Config, "ENABLE_THREE_TIER_FUNNEL", False), patch.object(
+            Config, "SCAN_SYMBOL_DELAY_SECONDS", 5.0
+        ), patch(
             "pipeline.event_scan_orchestrator.time.sleep"
         ) as sleeper:
             orch._evaluate_symbols_ws(

@@ -393,59 +393,69 @@ def format_watchlist_message(
     rotation_cycle: int = 0,
     rotation_evaluated: int = 0,
     exchange: Any = None,
+    super_rows: Optional[list[tuple[str, str, float]]] = None,
+    lock_cycle: int = 0,
 ) -> str:
-    """Format /watchlist — Tier 1 hot scan universe + Tier 2 execution candidates."""
-    lines = ["📡 <b>Scan Watchlist</b>\n"]
-    if rotation_cycle or rotation_evaluated:
+    """Format /watchlist — Normal / Hot / Super funnel."""
+    lines = ["📡 <b>3-Tier Scan Funnel</b>\n"]
+    if lock_cycle or rotation_cycle:
         lines.append(
-            f"🔄 <b>Rotation:</b> batch/cycle {rotation_cycle} | "
-            f"evaluated {rotation_evaluated}"
+            f"🔄 <b>Normal lock cycle:</b> {lock_cycle or rotation_cycle} "
+            f"| 3h universe {len(tier1_full)}"
         )
 
     lines.append(
-        f"🔥 <b>Tier 1 — Hot Scan</b> ({len(tier1_hot)}) "
-        f"<i>every {hot_scan_interval:.0f}s</i>"
+        f"📋 <b>Normal Tier</b> ({len(tier1_full)}) "
+        f"<i>2 coins/min · 3h lock</i>"
     )
-    if tier1_hot:
-        hot_preview = ", ".join(escape_html(s) for s in tier1_hot[:20])
-        if len(tier1_hot) > 20:
-            hot_preview += f" … +{len(tier1_hot) - 20} more"
-        lines.append(hot_preview)
+    if tier1_full:
+        preview = ", ".join(escape_html(s) for s in tier1_full[:20])
+        if len(tier1_full) > 20:
+            preview += f" … +{len(tier1_full) - 20} more"
+        lines.append(preview)
     else:
-        lines.append("<i>No hot symbols — universe not refreshed yet.</i>")
+        lines.append("<i>Universe not locked yet.</i>")
 
-    bg_count = len(tier1_background)
-    full_count = len(tier1_full)
     lines.append(
-        f"\n📋 <b>Tier 1 — Background Rotation</b> ({bg_count}) "
-        f"| full universe {full_count}"
+        f"\n🔥 <b>Hot Tier</b> ({len(tier2_rows)}) "
+        f"<i>1 coin/min · 450–600 bar backtest</i>"
     )
-    if tier1_background:
-        bg_preview = ", ".join(escape_html(s) for s in tier1_background[:15])
-        if bg_count > 15:
-            bg_preview += f" … +{bg_count - 15} more"
-        lines.append(bg_preview)
-    else:
-        lines.append("<i>No background symbols.</i>")
-
-    lines.append(f"\n⭐ <b>Tier 2 — Execution Candidates</b> ({len(tier2_rows)})")
     if tier2_rows:
         for sym, strat, score in tier2_rows[:tier2_display_limit]:
             lines.append(
                 f"• {escape_html(sym)} | {escape_html(strategy_display_label(strat))} "
-                f"| norm={score:.0f}"
+                f"| {score:.0f}"
             )
     else:
-        lines.append("<i>No Tier 2 candidates promoted yet.</i>")
+        lines.append("<i>No Hot promotions yet.</i>")
+
+    super_list = super_rows or []
+    lines.append(
+        f"\n⭐ <b>Super Tier</b> ({len(super_list)}) "
+        f"<i>1 coin/min · local TP/SL</i>"
+    )
+    if super_list:
+        for sym, strat, score in super_list[:12]:
+            lines.append(
+                f"• {escape_html(sym)} | {escape_html(strategy_display_label(strat))} "
+                f"| {score:.0f}"
+            )
+    else:
+        lines.append("<i>No Super setups ready.</i>")
 
     near_miss = tier2_near_miss or []
     if near_miss and not tier2_rows:
-        lines.append(f"\n📊 <b>Recent scan scores (not yet promoted)</b>")
-        for sym, strat, norm, raw in near_miss[:8]:
+        lines.append(f"\n📊 <b>Recent Normal scores (not yet promoted)</b>")
+        for row in near_miss[:8]:
+            if len(row) >= 4:
+                sym, strat, norm, raw = row[0], row[1], row[2], row[3]
+            else:
+                continue
             lines.append(
                 f"• {escape_html(sym)} | {escape_html(strategy_display_label(strat))} "
-                f"| raw={raw:.1f} norm={norm:.0f}"
+                f"| raw={raw:.1f}"
             )
 
+    _ = (tier1_hot, tier1_background, hot_scan_interval, rotation_evaluated)
     lines.append(format_runtime_health_block(exchange))
     return "\n".join(lines)

@@ -107,7 +107,9 @@ class SymbolRotationManager:
             str(k).upper(): str(v).upper()
             for k, v in (lifecycle or {}).items()
         }
-        hot_size = max(Config.scan_watchlist_size(), 1)
+        hot_size = max(int(Config.TIER2_HOT_SIZE), 1)
+        if not Config.ENABLE_THREE_TIER_FUNNEL:
+            hot_size = max(Config.scan_watchlist_size(), 1)
 
         if not Config.ENABLE_DYNAMIC_SYMBOL_ROTATION:
             ranked = [s.upper() for s in primary_pool if s]

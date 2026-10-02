@@ -28,6 +28,7 @@ from engines.smc_engine import (
     size_multiplier_for_score,
 )
 from core.entry_in_flight_mutex import entry_in_flight_mutex
+from core.execution_governor import ExecutionGovernor
 from reconciliation import symbol_blocked_for_new_entry
 from utils import (
     amount_to_precision,
@@ -108,6 +109,7 @@ class TradeExecutor:
     def __init__(self, exchange: BinanceExchangeManager, db: DatabaseManager) -> None:
         self.exchange = exchange
         self.db = db
+        self._entry_governor = ExecutionGovernor()
 
     def _validate_stop_loss(
         self, action: str, entry_price: float, sl_price: float
@@ -547,15 +549,10 @@ class TradeExecutor:
         metadata: Optional[dict[str, Any]] = None,
         structure: Optional[dict[str, Any]] = None,
     ) -> bool:
-        """Resolve native TP/SL without relying on a caller-only local name."""
-        if Config.ENABLE_NATIVE_TP_SL or bool(attach_native_exits):
+        """Resolve native TP/SL — off unless ENABLE_NATIVE_TP_SL is explicitly True."""
+        if Config.ENABLE_NATIVE_TP_SL:
             return True
-        meta = metadata or {}
-        struct = structure or {}
-        return bool(
-            Config.ATTACH_NATIVE_TP_SL_AFTER_VALIDATION
-            and (meta.get("backtest_validated") or struct.get("backtest_validated"))
-        )
+        return False
 
     def _place_native_exit_orders(
         self,
@@ -646,6 +643,12 @@ class TradeExecutor:
             log_execution_rejected(
                 symbol, "DRY_RUN enabled — order not sent", strategy=strategy
             )
+            return None
+
+        allowed, pace_reason = self._entry_governor.allow_entry_order()
+        if not allowed:
+            self._entry_governor.note_blocked(symbol, pace_reason)
+            log_execution_rejected(symbol, pace_reason, strategy=strategy)
             return None
 
         ledger = get_execution_ledger()

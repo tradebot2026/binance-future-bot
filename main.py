@@ -28,7 +28,6 @@ from manager import TradeManager
 from risk_manager import RiskManager
 from core.instance_lock import acquire_main_lock, release_main_lock
 from core.minute_clock import MinuteScanClock
-from core.scan_warmup import ScanWarmupGate
 from reconciliation import (
     reconcile_positions,
     reconcile_positions_at_startup,
@@ -92,8 +91,8 @@ def _wait_for_rest_unblock(
     controller: BotController,
 ) -> bool:
     """
-    If Binance REST/IP ban is active, sleep until it clears.
-    Returns True if REST is still blocked (caller should skip this iteration).
+    True when Binance REST/IP ban is active.
+    Does not sleep the trading loop — WS-only Normal/Hot scoring must continue.
     """
     if market_data is None:
         return False
@@ -106,19 +105,11 @@ def _wait_for_rest_unblock(
     if remaining <= 0:
         return False
 
+    if controller is not None and controller.is_shutdown_requested():
+        return True
+
     market_data.log_ban_pause_once(remaining)
-    deadline = time.monotonic() + remaining
-    while time.monotonic() < deadline and not controller.is_shutdown_requested():
-        from core.ops_heartbeat import touch_main_loop
-
-        touch_main_loop()
-        blocked, _ = market_data.is_rest_blocked()
-        if not blocked:
-            system_logger.info("REST ban cleared — resuming trading loop.")
-            return False
-        time.sleep(min(20.0, max(deadline - time.monotonic(), 0.5)))
-
-    return market_data.is_rest_blocked()[0]
+    return True
 
 
 def _startup_banner() -> None:
@@ -139,9 +130,8 @@ def _startup_banner() -> None:
         loop_note = f"1m-aligned (:{int(Config.SCAN_MINUTE_OFFSET_SECONDS):02d})"
     else:
         loop_note = f"{Config.SCAN_INTERVAL_SECONDS}s"
-    warmup_s = Config.scan_warmup_seconds()
-    if warmup_s > 0:
-        loop_note += f" | warmup {int(warmup_s)}s"
+    if Config.ENABLE_THREE_TIER_FUNNEL:
+        loop_note += " | 3-tier funnel (Normal 2/min)"
     system_logger.info(
         "Loop %s | max_positions=%s | scan=%s | reporter=%s",
         loop_note,
@@ -269,6 +259,7 @@ def _execute_candidates(
     tg: TelegramManager,
     critical_alerts: Optional[CriticalAlertService] = None,
     manager: Optional[TradeManager] = None,
+    funnel: Any = None,
 ) -> None:
     entries_this_cycle = 0
 
@@ -376,13 +367,7 @@ def _execute_candidates(
                         )
                         break
 
-            attach_native = bool(
-                Config.ENABLE_NATIVE_TP_SL
-                or (
-                    Config.ATTACH_NATIVE_TP_SL_AFTER_VALIDATION
-                    and normalized.get("backtest_validated")
-                )
-            )
+            attach_native = bool(Config.ENABLE_NATIVE_TP_SL)
             result: Optional[dict[str, Any]] = executor.execute_trade(
                 symbol=symbol,
                 action=action,
@@ -400,6 +385,10 @@ def _execute_candidates(
             risk.record_entry_opened()
             if manager is not None:
                 manager.note_open_symbol(symbol)
+            if funnel is not None:
+                clearer = getattr(funnel, "note_filled", None)
+                if callable(clearer):
+                    clearer(symbol)
 
             if result.get("orphan_fill"):
                 if critical_alerts:
@@ -472,6 +461,7 @@ def _adopt_pending_user_fills(
     scheduler: DailyScheduler,
     risk: RiskManager,
     manager: Optional[TradeManager],
+    funnel: Any = None,
 ) -> None:
     drain = getattr(market_data, "drain_pending_order_fills", None)
     if not callable(drain):
@@ -482,6 +472,10 @@ def _adopt_pending_user_fills(
             continue
         if manager is not None:
             manager.note_open_symbol(str(result.get("symbol", "")))
+        if funnel is not None:
+            clearer = getattr(funnel, "note_filled", None)
+            if callable(clearer):
+                clearer(str(result.get("symbol", "")))
         if not result.get("orphan_fill"):
             meta = result.get("metadata") or {}
             tg.send_trade_alert(
@@ -671,6 +665,9 @@ def main(controller: Optional[BotController] = None) -> str:
         market_data.register_price_tick_listener(manager.on_price_tick)
 
         validator = AsyncBacktestValidator(exchange)
+        if scanner is not None and scanner.orchestrator is not None:
+            scanner.orchestrator.attach_validator(validator)
+            scanner.orchestrator.attach_telegram(tg)
         if Config.ENABLE_ASYNC_BACKTEST_VALIDATION:
             validator.start()
 
@@ -695,19 +692,11 @@ def main(controller: Optional[BotController] = None) -> str:
         except Exception as exc:
             error_logger.error("Startup reconciliation failed (continuing): %s", exc)
 
-        scan_warmup = ScanWarmupGate(Config.scan_warmup_seconds())
-        market_data.begin_scan_warmup(scan_warmup.duration_seconds)
-        if scan_warmup.in_warmup() and tg is not None:
-            tg.send_message(
-                f"⏳ <b>WARMUP_MODE</b> — populating cache "
-                f"({int(scan_warmup.remaining_seconds())}s). "
-                "Scanner idle; exits stay live."
-            )
         if scanner is not None and scanner.orchestrator is not None:
             scanner.bootstrap_scan_universe()
+            scanner.subscribe_watchlist_ws_only()
         if (
             scanner is not None
-            and not scan_warmup.in_warmup()
             and Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
             and not market_data.is_rest_blocked()[0]
         ):
@@ -734,27 +723,24 @@ def main(controller: Optional[BotController] = None) -> str:
             loop_started = time.monotonic()
 
             try:
-                # Step 0 — If IP ban active, pause silently until REST is allowed again
-                if _wait_for_rest_unblock(market_data, controller):
-                    continue
+                rest_blocked = _wait_for_rest_unblock(market_data, controller)
+                funnel = getattr(
+                    getattr(scanner, "orchestrator", None), "funnel", None
+                ) if scanner is not None else None
 
                 # Step 0b — One-time deferred REST init (never retried aggressively in loop)
-                if (
-                    not scan_warmup.in_warmup()
-                    and not exchange._full_init_done
-                    and not market_data.is_rest_blocked()[0]
-                ):
+                if not rest_blocked and not exchange._full_init_done:
                     exchange.ensure_initialized()
 
                 # Step 1 — Periodic DB/exchange reconciliation (every 15 min)
                 now_mono = time.monotonic()
                 _adopt_pending_user_fills(
-                    market_data, executor, tg, scheduler, risk, manager
+                    market_data, executor, tg, scheduler, risk, manager, funnel=funnel
                 )
                 if (
                     now_mono - last_uncertain_reconcile
                     >= Config.UNCERTAIN_ORDER_RECONCILE_SECONDS
-                    and not market_data.is_rest_blocked()[0]
+                    and not rest_blocked
                 ):
                     late = reconcile_uncertain_executions(exchange, executor)
                     if late:
@@ -762,12 +748,8 @@ def main(controller: Optional[BotController] = None) -> str:
                             "Late-fill reconcile confirmed %s position(s).", late
                         )
                     last_uncertain_reconcile = now_mono
-                if (
-                    not scan_warmup.in_warmup()
-                    and now_mono - last_reconciliation
-                    >= Config.RECONCILIATION_INTERVAL_SECONDS
-                ):
-                    if not market_data.is_rest_blocked()[0]:
+                if now_mono - last_reconciliation >= Config.RECONCILIATION_INTERVAL_SECONDS:
+                    if not rest_blocked:
                         reconcile_positions(
                             exchange, db, tg, manager=manager, context="periodic"
                         )
@@ -779,39 +761,42 @@ def main(controller: Optional[BotController] = None) -> str:
                     db.run_maintenance(retention_days=Config.DB_RETENTION_DAYS, vacuum=True)
                     last_maintenance = now_mono
 
-                # Step 2 — Smooth 5s/coin page (~300s for 60 symbols); TP/SL stay on WS threads
-                if scan_warmup.in_warmup():
-                    scan_warmup.maybe_log_progress()
-                    if scanner is not None:
-                        if (
-                            scanner.orchestrator is not None
-                            and not scanner.orchestrator.tier1_symbols
-                        ):
-                            scanner.bootstrap_scan_universe()
-                        scanner.populate_warmup_kline_cache()
-                elif scanner is None:
+                # Step 2 — 3-tier scanner always ticks; entry gate only blocks Super orders
+                if scanner is None:
                     if cycle == 1:
                         system_logger.warning(
                             "scanner.py not found — entries disabled until scanner is added."
                         )
+                elif scanner.orchestrator is None:
+                    if cycle == 1:
+                        system_logger.warning(
+                            "Event-driven orchestrator unavailable — "
+                            "entries skipped (legacy scan loops removed)."
+                        )
                 else:
-                    market_data.end_scan_warmup()
-                    if scan_warmup.just_finished():
-                        scanner.subscribe_watchlist_ws_only()
-                        scan_clock.skip_current_minute()
-                    allowed, gate_reason = _entries_allowed(scheduler, risk, db)
-                    if allowed:
-                        if scanner.orchestrator is None:
-                            if cycle == 1:
-                                system_logger.warning(
-                                    "Event-driven orchestrator unavailable — "
-                                    "entries skipped (legacy scan loops removed)."
+                    if scan_clock.due():
+                        candidates = scanner.process_priority_scan_cycle()
+                        allowed, gate_reason = _entries_allowed(scheduler, risk, db)
+                        can_place = allowed and not rest_blocked
+                        if Config.ENABLE_THREE_TIER_FUNNEL:
+                            if can_place and candidates:
+                                _execute_candidates(
+                                    candidates=candidates,
+                                    executor=executor,
+                                    risk=risk,
+                                    scheduler=scheduler,
+                                    db=db,
+                                    tg=tg,
+                                    critical_alerts=critical_alerts,
+                                    manager=manager,
+                                    funnel=funnel,
                                 )
+                            elif not allowed and gate_reason:
+                                system_logger.info("Entries paused: %s", gate_reason)
                         else:
-                            if scan_clock.due():
-                                candidates = scanner.process_priority_scan_cycle()
-                                warmed = scanner.warmup_and_evaluate_kline_misses()
-                                incoming = list(candidates or []) + list(warmed or [])
+                            warmed = scanner.warmup_and_evaluate_kline_misses()
+                            incoming = list(candidates or []) + list(warmed or [])
+                            if can_place:
                                 if (
                                     Config.ENABLE_ASYNC_BACKTEST_VALIDATION
                                     and validator is not None
@@ -827,11 +812,17 @@ def main(controller: Optional[BotController] = None) -> str:
                                         tg=tg,
                                         critical_alerts=critical_alerts,
                                         manager=manager,
+                                        funnel=funnel,
                                     )
-                        if (
-                            Config.ENABLE_ASYNC_BACKTEST_VALIDATION
-                            and validator is not None
-                        ):
+                            elif gate_reason:
+                                system_logger.info("Entries paused: %s", gate_reason)
+                    if (
+                        not Config.ENABLE_THREE_TIER_FUNNEL
+                        and Config.ENABLE_ASYNC_BACKTEST_VALIDATION
+                        and validator is not None
+                    ):
+                        allowed, gate_reason = _entries_allowed(scheduler, risk, db)
+                        if allowed and not rest_blocked:
                             approved = validator.drain_approved(
                                 max_n=Config.MAX_ENTRIES_PER_CYCLE
                             )
@@ -845,9 +836,8 @@ def main(controller: Optional[BotController] = None) -> str:
                                     tg=tg,
                                     critical_alerts=critical_alerts,
                                     manager=manager,
+                                    funnel=funnel,
                                 )
-                    elif gate_reason:
-                        system_logger.info("Entries paused: %s", gate_reason)
 
                 # Step 3 — Optional daily CSV export (once per UTC day)
                 last_report_day = _maybe_export_daily_report(reporter, last_report_day)
@@ -857,18 +847,14 @@ def main(controller: Optional[BotController] = None) -> str:
                 if now - last_heartbeat >= Config.HEARTBEAT_SECONDS:
                     snap = risk.get_risk_snapshot()
                     is_paused, _ = scheduler.is_entry_paused()
-                    scan_mode = (
-                        ScanWarmupGate.MODE_WARMUP
-                        if scan_warmup.in_warmup()
-                        else ScanWarmupGate.MODE_ACTIVE
-                    )
                     system_logger.info(
-                        "Heartbeat | mode=%s | cycle=%s | exchange_open=%s | paused=%s | "
+                        "Heartbeat | mode=ACTIVE_SCANNING_MODE | cycle=%s | "
+                        "exchange_open=%s | paused=%s | rest_blocked=%s | "
                         "realized_pnl=$%.2f (%.2f%%) | unrealized=$%.2f | drawdown=%.2f%%",
-                        scan_mode,
                         cycle,
                         snap.exchange_open_positions,
                         is_paused,
+                        rest_blocked,
                         snap.daily_realized_pnl,
                         snap.daily_realized_pnl_percent,
                         snap.unrealized_pnl,

@@ -13,7 +13,8 @@ from core.portfolio_allocator import PortfolioAllocator
 from core.scan_priority_queue import ScanPriorityQueue
 from core.scoring_engine import ScoringEngine
 from core.symbol_conflict_guard import SymbolConflictGuard
-from core.types import CandleCloseEvent, SignalCandidate
+from core.tier_funnel import HotRecord, TierFunnel
+from core.types import CandleCloseEvent, SignalCandidate, StrategyScore
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from executor import log_execution_rejected, log_scan_rejected
@@ -57,6 +58,29 @@ class EventScanOrchestrator:
         self._kline_pending_log_at: dict[str, float] = {}
         self._last_ticker_unavail_log_at: float = 0.0
         self._last_empty_universe_log_at: float = 0.0
+        self._last_zero_candidate_log_at: float = 0.0
+        self.funnel = TierFunnel(notify=self._notify_funnel)
+        self._validator: Any = None
+        self._telegram: Any = None
+
+    def attach_validator(self, validator: Any) -> None:
+        self._validator = validator
+        if validator is None:
+            return
+        setter = getattr(validator, "attach_funnel", None)
+        if callable(setter):
+            setter(self.funnel)
+
+    def attach_telegram(self, telegram: Any) -> None:
+        self._telegram = telegram
+
+    def _notify_funnel(self, text: str) -> None:
+        tg = self._telegram
+        if tg is None:
+            return
+        send = getattr(tg, "send_message", None)
+        if callable(send):
+            send(text)
 
     @property
     def tier1_symbols(self) -> list[str]:
@@ -447,8 +471,17 @@ class EventScanOrchestrator:
                 return self._tier1_symbols
 
         universe = self.universe_builder.build()
-        pool_cap = min(len(universe.symbols), Config.TOP_UNIVERSE_POOL_SIZE)
+        pool_cap = min(
+            len(universe.symbols),
+            Config.normal_tier_universe_size()
+            if Config.ENABLE_THREE_TIER_FUNNEL
+            else Config.TOP_UNIVERSE_POOL_SIZE,
+        )
         self._tier1_symbols = universe.symbols[:pool_cap]
+        if Config.ENABLE_THREE_TIER_FUNNEL:
+            now_lock = time.monotonic()
+            if self.funnel.lock_expired(now_lock) or not self.funnel.normal_symbols:
+                self.funnel.replace_normal_universe(self._tier1_symbols, now=now_lock)
         trigger_scores = dict(universe.opportunity_scores)
         for sym, score in self.assignment_manager._last_best.items():
             trigger_scores.setdefault(sym, score.normalized_score)
@@ -493,14 +526,18 @@ class EventScanOrchestrator:
         return self.refresh_tier1_universe(force=True, allow_rest=False)
 
     def maybe_refresh_tier1_periodic(self) -> None:
-        """Rebuild Tier-1 from live volume ranks on a fixed interval (default 30 min)."""
+        """Rebuild Normal-tier universe after the 3-hour lock (or bootstrap if empty)."""
         now = time.monotonic()
         if not self._tier1_symbols:
             self.bootstrap_watchlist_once()
             return
+        if Config.ENABLE_THREE_TIER_FUNNEL and not self.funnel.lock_expired(now):
+            return
         if (
-            now - self._last_universe_refresh_at
-        ) < Config.TIER1_REFRESH_INTERVAL_SECONDS:
+            not Config.ENABLE_THREE_TIER_FUNNEL
+            and (now - self._last_universe_refresh_at)
+            < Config.TIER1_REFRESH_INTERVAL_SECONDS
+        ):
             return
 
         old_symbols = set(self._tier1_symbols)
@@ -576,37 +613,358 @@ class EventScanOrchestrator:
 
     def process_priority_scan_cycle(self) -> list[dict[str, Any]]:
         """
-        One smooth 60-coin page: 5s between symbols (~300s), then the caller
-        immediately starts the next cycle. WS TP/SL monitor stays on its own thread.
+        3-tier funnel tick: 2 Normal coins/min, 1 Hot REST/min, 1 Super eval/min.
+        Only Super-tier candidates are returned for execution.
+        Normal/Hot always tick (even when entries are paused or REST is banned).
         """
-        halted, reason = self._scan_gate_open()
-        if halted:
-            scanner_logger.warning("Priority scan skipped — %s", reason)
-            return []
+        funnel_on = bool(Config.ENABLE_THREE_TIER_FUNNEL)
+        rest_blocked = self._rest_is_blocked()
+        if not funnel_on:
+            halted, reason = self._scan_gate_open()
+            if halted:
+                scanner_logger.warning("Priority scan skipped — %s", reason)
+                return []
 
-        self.maybe_refresh_tier1_periodic()
-        if not self._tier1_symbols:
-            self.bootstrap_watchlist_once()
+        if funnel_on and rest_blocked:
+            if not self._tier1_symbols and not self.funnel.normal_symbols:
+                self._log_empty_universe()
+        else:
+            self.maybe_refresh_tier1_periodic()
+            if not self._tier1_symbols:
+                self.bootstrap_watchlist_once()
 
         self.run_catchup()
         self.conflict_guard.reset_cycle()
+        if funnel_on:
+            return self._process_funnel_cycle()
 
         self._fast_track_live_spikes()
-
         event_by_symbol, event_symbols = self._drain_due_event_symbols()
         symbols = self._cycle_scan_symbols(event_symbols)
         if not symbols:
-            now_log = time.monotonic()
-            last_log = float(self._last_empty_universe_log_at or 0.0)
-            if last_log <= 0.0 or (now_log - last_log) >= 60.0:
-                self._last_empty_universe_log_at = now_log
-                scanner_logger.info(
-                    "Priority scan produced 0 execution candidates "
-                    "(empty universe, tier2=%s). Next notice in 60s.",
-                    self.assignment_manager.tier2_size,
-                )
+            self._log_empty_universe()
             return []
+        return self._evaluate_and_collect(symbols, event_by_symbol, pace=True)
 
+    def _process_funnel_cycle(self) -> list[dict[str, Any]]:
+        now = time.monotonic()
+        if not self.funnel.normal_symbols and self._tier1_symbols:
+            self.funnel.replace_normal_universe(self._tier1_symbols, now=now)
+
+        open_symbols = self._open_symbols()
+        ticker_map = self._ws_ticker_map()
+        book_map = self._ws_book_map(ticker_map)
+        trigger_tfs = Config.get_scan_trigger_timeframes()
+        primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
+
+        normal_due = self.funnel.take_normal(now=now)
+        ready, missing = self._partition_kline_ready(normal_due)
+        self._note_missing_scan_klines(missing)
+        for symbol in ready:
+            if symbol in open_symbols:
+                continue
+            scores = self._score_symbol(
+                symbol,
+                timeframe=primary_tf,
+                open_symbols=open_symbols,
+                ticker_map=ticker_map,
+                book_map=book_map,
+            )
+            if scores:
+                self.funnel.promote_from_normal(symbol, scores)
+
+        if not self._rest_is_blocked():
+            self._enqueue_due_hot_rest(now)
+        self._ingest_hot_backtests(
+            timeframe=primary_tf,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+        )
+        self._rescore_due_hot(
+            now,
+            timeframe=primary_tf,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+        )
+
+        super_rec = self.funnel.take_super(now=now)
+        candidates: list[SignalCandidate] = []
+        if super_rec is not None:
+            if super_rec.symbol in open_symbols:
+                self.funnel.note_filled(super_rec.symbol)
+            else:
+                signal = self._evaluate_super_symbol(
+                    super_rec.symbol,
+                    timeframe=primary_tf,
+                    open_symbols=open_symbols,
+                    ticker_map=ticker_map,
+                    book_map=book_map,
+                )
+                if signal is not None:
+                    candidates.append(signal)
+                else:
+                    self.funnel.demote_super(
+                        super_rec.symbol, reason="super_setup_not_ready"
+                    )
+
+        universe_total = len(self.funnel.scan_pool()) or len(self._tier1_symbols)
+        touch_scan_cycle(
+            scanned=len(normal_due) + (1 if super_rec else 0),
+            universe_total=max(universe_total, 1),
+        )
+        dict_results = [c.to_dict() for c in self._dedupe_symbol_candidates(candidates)]
+        if dict_results:
+            self.db.update_watchlist(dict_results)
+            scanner_logger.info(
+                "Super tier dispatching %s execution candidate(s) "
+                "(normal=%s hot=%s super=%s).",
+                len(dict_results),
+                len(self.funnel.normal_symbols),
+                len(self.funnel.hot_symbols),
+                len(self.funnel.super_symbols),
+            )
+        elif not self.funnel.normal_symbols and not self._tier1_symbols:
+            self._log_empty_universe()
+        else:
+            self._log_zero_candidates_quiet(
+                normal=len(normal_due),
+                hot=len(self.funnel.hot_symbols),
+                super_n=len(self.funnel.super_symbols),
+            )
+        return dict_results
+
+    def _log_empty_universe(self) -> None:
+        now_log = time.monotonic()
+        last_log = float(self._last_empty_universe_log_at or 0.0)
+        if last_log <= 0.0 or (now_log - last_log) >= 60.0:
+            self._last_empty_universe_log_at = now_log
+            hot_n = 0
+            funnel = getattr(self, "funnel", None)
+            if funnel is not None:
+                hot_n = len(funnel.hot_symbols)
+            elif getattr(self, "assignment_manager", None) is not None:
+                hot_n = int(getattr(self.assignment_manager, "tier2_size", 0) or 0)
+            scanner_logger.info(
+                "Priority scan produced 0 execution candidates "
+                "(empty universe, hot=%s). Next notice in 60s.",
+                hot_n,
+            )
+
+    def _log_zero_candidates_quiet(self, *, normal: int, hot: int, super_n: int) -> None:
+        now_log = time.monotonic()
+        last_log = float(self._last_zero_candidate_log_at or 0.0)
+        if last_log > 0.0 and (now_log - last_log) < 60.0:
+            return
+        self._last_zero_candidate_log_at = now_log
+        scanner_logger.debug(
+            "Funnel tick — 0 Super candidates (normal_eval=%s hot=%s super=%s).",
+            normal,
+            hot,
+            super_n,
+        )
+
+    def _enqueue_hot_backtest(self, rec: HotRecord) -> None:
+        if self._validator is None:
+            return
+        payload = {
+            "symbol": rec.symbol,
+            "strategy": rec.strategy,
+            "score": rec.score,
+            "action": rec.action if rec.action in ("LONG", "SHORT") else "LONG",
+            "structure_metadata": {
+                "backup_strategies": list(rec.backup_strategies),
+                "funnel_tier": "HOT",
+                **rec.metadata,
+            },
+        }
+        try:
+            if self._validator.enqueue(payload):
+                self.funnel.note_hot_rest_started(rec.symbol)
+        except Exception as exc:
+            scanner_logger.warning(
+                "[TIER_HOT] queue failed for %s: %s", rec.symbol, exc
+            )
+
+    def _enqueue_due_hot_rest(self, now: float) -> None:
+        if self._validator is None:
+            return
+        rec = self.funnel.take_hot_for_rest(now=now)
+        if rec is None:
+            return
+        self._enqueue_hot_backtest(rec)
+
+    def _ingest_hot_backtests(
+        self,
+        *,
+        timeframe: str,
+        open_symbols: set[str],
+        ticker_map: dict[str, Any],
+        book_map: dict[str, Any],
+    ) -> None:
+        validator = self._validator
+        if validator is None:
+            return
+        approved = []
+        drain = getattr(validator, "drain_approved", None)
+        if callable(drain):
+            approved = drain(max_n=4)
+        for payload in approved:
+            symbol = str(payload.get("symbol", "")).upper()
+            rec = self.funnel.on_backtest_passed(symbol, payload)
+            if rec is None:
+                continue
+            scores = self._score_symbol(
+                symbol,
+                timeframe=timeframe,
+                open_symbols=open_symbols,
+                ticker_map=ticker_map,
+                book_map=book_map,
+            )
+            if not scores:
+                self.funnel.on_backtest_failed(symbol, "hot_rescore_empty")
+                continue
+            self.funnel.apply_hot_scores(symbol, scores, candidate=payload)
+
+    def _rescore_due_hot(
+        self,
+        now: float,
+        *,
+        timeframe: str,
+        open_symbols: set[str],
+        ticker_map: dict[str, Any],
+        book_map: dict[str, Any],
+    ) -> None:
+        rec = self.funnel.take_hot_for_rescore(now=now)
+        if rec is None:
+            return
+        if rec.symbol in open_symbols:
+            self.funnel.note_filled(rec.symbol)
+            return
+        scores = self._score_symbol(
+            rec.symbol,
+            timeframe=timeframe,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+        )
+        if not scores:
+            return
+        payload = {
+            "symbol": rec.symbol,
+            "strategy": rec.strategy,
+            "score": rec.score,
+            "action": rec.action if rec.action in ("LONG", "SHORT") else "LONG",
+            "structure_metadata": {
+                "backup_strategies": list(rec.backup_strategies),
+                "funnel_tier": "HOT",
+                **rec.metadata,
+            },
+        }
+        self.funnel.apply_hot_scores(rec.symbol, scores, candidate=payload)
+
+    def _score_symbol(
+        self,
+        symbol: str,
+        *,
+        timeframe: str,
+        open_symbols: set[str],
+        ticker_map: dict[str, Any],
+        book_map: dict[str, Any],
+    ) -> list[StrategyScore]:
+        snapshot = self._build_eval_snapshot(symbol, ticker_map, book_map)
+        if snapshot is None:
+            self.note_kline_cache_miss(symbol)
+            self._log_kline_warmup_pending(symbol)
+            return []
+        bar_open_ms = 0
+        if self._hub:
+            closed = self._hub.get_last_closed_bar_open_ms(symbol, timeframe)
+            if closed:
+                bar_open_ms = closed
+        with self.exchange.scan_context():
+            scores, _first = self.scoring_engine.evaluate_symbol_detailed(
+                snapshot,
+                bar_open_ms=bar_open_ms,
+                timeframe=timeframe,
+            )
+        return scores or []
+
+    def _build_eval_snapshot(
+        self,
+        symbol: str,
+        ticker_map: dict[str, Any],
+        book_map: dict[str, Any],
+    ) -> Any:
+        symbol = symbol.upper()
+        ticker = ticker_map.get(symbol, {})
+        book = book_map.get(symbol, {})
+        price = self._resolve_eval_price(symbol, ticker)
+        volume_24h = float(ticker.get("quoteVolume", 0) or 0)
+        volume_rank = self._volume_ranks.get(symbol, 0)
+        return self.snapshot_factory.build(
+            symbol,
+            price=price,
+            ticker=ticker,
+            book=book,
+            volume_24h=volume_24h,
+            volume_rank=volume_rank,
+        )
+
+    def _evaluate_super_symbol(
+        self,
+        symbol: str,
+        *,
+        timeframe: str,
+        open_symbols: set[str],
+        ticker_map: dict[str, Any],
+        book_map: dict[str, Any],
+    ) -> Optional[SignalCandidate]:
+        signal = self._evaluate_symbol(
+            symbol,
+            bar_open_ms=0,
+            timeframe=timeframe,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+        )
+        if signal is None:
+            return None
+        from core.strategy_score_ranges import score_range_for
+
+        band = score_range_for(signal.strategy)
+        if not band.meets_super(signal.score):
+            log_scan_rejected(
+                symbol,
+                f"super score {signal.score:.1f} below {band.super_score:.1f}",
+                strategy=signal.strategy,
+            )
+            return None
+        rec = self.funnel._super.get(symbol.upper())
+        if rec is not None:
+            meta = dict(rec.candidate.get("structure_metadata") or {})
+            meta.update(signal.structure_metadata or {})
+            meta["funnel_tier"] = "SUPER"
+            meta["backup_strategies"] = list(rec.backup_strategies)
+            for key in (
+                "backtest_validated",
+                "backtest_win_rate",
+                "backtest_wins",
+                "backtest_trades",
+            ):
+                if key in rec.candidate:
+                    meta.setdefault(key, rec.candidate[key])
+            signal.structure_metadata = meta
+        return signal
+
+    def _evaluate_and_collect(
+        self,
+        symbols: list[str],
+        event_by_symbol: dict[str, CandleCloseEvent],
+        *,
+        pace: bool,
+    ) -> list[dict[str, Any]]:
         open_symbols = self._open_symbols()
         ticker_map = self._ws_ticker_map()
         book_map = self._ws_book_map(ticker_map)
@@ -621,10 +979,9 @@ class EventScanOrchestrator:
             ticker_map=ticker_map,
             book_map=book_map,
             event_by_symbol=event_by_symbol,
-            pace=True,
+            pace=pace,
         )
         candidates = self._dedupe_symbol_candidates(candidates)
-
         scanned_bg = [
             symbol
             for symbol in symbols
@@ -633,7 +990,6 @@ class EventScanOrchestrator:
         if scanned_bg:
             self.priority_queue.rotation.mark_evaluated(scanned_bg)
         self.priority_queue.mark_hot_scan_complete()
-
         universe_total = len(self.priority_queue.full_universe) or len(
             self._tier1_symbols
         )
@@ -641,23 +997,14 @@ class EventScanOrchestrator:
             scanned=len(symbols),
             universe_total=max(universe_total, len(symbols)),
         )
-
         dict_results = [c.to_dict() for c in candidates]
         if dict_results:
             self.db.update_watchlist(dict_results)
             scanner_logger.info(
                 "Priority scan dispatching %s execution candidate(s) "
-                "from %s symbols (5s/coin).",
+                "from %s symbols.",
                 len(dict_results),
                 len(symbols),
-            )
-        else:
-            scanner_logger.info(
-                "Priority scan produced 0 execution candidates "
-                "(tier2=%s paged=%s rotating=%s).",
-                self.assignment_manager.tier2_size,
-                len(symbols),
-                len(self.priority_queue.background_symbols),
             )
         return dict_results
 
@@ -1132,5 +1479,20 @@ class EventScanOrchestrator:
             return self._hub.is_scan_halted()
         return False, ""
 
+    def _rest_is_blocked(self) -> bool:
+        exchange = getattr(self, "exchange", None)
+        if exchange is None:
+            return False
+        checker = getattr(exchange, "is_rest_blocked", None)
+        if not callable(checker):
+            return False
+        try:
+            blocked, _reason = checker()
+            return bool(blocked)
+        except Exception:
+            return False
+
     def tier2_summary(self) -> list[tuple[str, str, float]]:
+        if Config.ENABLE_THREE_TIER_FUNNEL:
+            return self.funnel.hot_summary()
         return self.assignment_manager.tier2_summary()

@@ -47,11 +47,22 @@ def _ohlcv(n: int) -> pd.DataFrame:
 
 
 class TestLightweightWatchlist(unittest.TestCase):
-    def test_scan_watchlist_is_sixty_coin_page(self) -> None:
-        self.assertGreaterEqual(Config.scan_cycle_symbol_count(), 60)
-        self.assertGreaterEqual(Config.scan_symbol_delay_seconds(), 5.0)
-        self.assertGreaterEqual(Config.scan_cycle_seconds(), 300.0)
-        self.assertTrue(Config.ENABLE_LIGHTWEIGHT_SCANNER)
+    def test_scan_watchlist_is_funnel_universe(self) -> None:
+        self.assertGreaterEqual(Config.normal_tier_universe_size(), 120)
+        self.assertEqual(Config.NORMAL_TIER_COINS_PER_MINUTE, 2)
+        self.assertEqual(Config.HOT_TIER_COINS_PER_MINUTE, 1)
+        self.assertEqual(Config.SUPER_TIER_COINS_PER_MINUTE, 1)
+        self.assertTrue(Config.ENABLE_THREE_TIER_FUNNEL)
+        self.assertGreaterEqual(Config.scan_cycle_seconds(), 3600.0)
+        self.assertEqual(Config.scan_warmup_seconds(), 0.0)
+
+    def test_backtest_candle_limit_hard_capped_at_600(self) -> None:
+        with patch.object(Config, "BACKTEST_CANDLE_LIMIT", 999):
+            self.assertEqual(Config.backtest_candle_limit(), 600)
+        with patch.object(Config, "BACKTEST_CANDLE_LIMIT", 50):
+            self.assertEqual(Config.backtest_candle_limit(), 200)
+        with patch.object(Config, "BACKTEST_CANDLE_LIMIT", 500):
+            self.assertEqual(Config.backtest_candle_limit(), 500)
 
     def test_execution_scan_ranks_volume_and_caps(self) -> None:
         orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
@@ -93,7 +104,9 @@ class TestLightweightWatchlist(unittest.TestCase):
         orch.assignment_manager = MagicMock()
         orch.assignment_manager.tier2_size = 0
         orch.db = MagicMock()
-        with patch.object(Config, "ENABLE_LIGHTWEIGHT_SCANNER", True):
+        with patch.object(Config, "ENABLE_LIGHTWEIGHT_SCANNER", True), patch.object(
+            Config, "ENABLE_THREE_TIER_FUNNEL", False
+        ):
             orch.process_priority_scan_cycle()
         orch._evaluate_symbols_ws.assert_called_once()
         orch._cycle_scan_symbols.assert_called_once()
@@ -308,7 +321,7 @@ class TestStage3NativeExits(unittest.TestCase):
                 MagicMock(),
                 MagicMock(),
             )
-        self.assertTrue(executor.execute_trade.call_args.kwargs["attach_native_exits"])
+        self.assertFalse(executor.execute_trade.call_args.kwargs["attach_native_exits"])
 
 
 class TestTelegramBacktestLine(unittest.TestCase):

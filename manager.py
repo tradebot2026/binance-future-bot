@@ -190,20 +190,32 @@ class TradeManager:
         from core.ops_heartbeat import touch_monitor_loop
 
         last_rest_refresh = 0.0
-        rest_interval = max(
-            float(Config.MONITOR_INTERVAL_SECONDS),
-            float(Config.MONITOR_REST_MARK_INTERVAL_SECONDS),
-            15.0,
-        )
         while not self._monitor_stop.wait(1.0):
             try:
                 now = time.monotonic()
+                user_ok = False
+                hub = getattr(self.exchange, "_market_data", None)
+                if hub is not None:
+                    user_ok = bool(
+                        hub.user_stream_has_account_data()
+                        and not hub.user_stream_is_stale()
+                    )
+                rest_interval = max(float(Config.MONITOR_INTERVAL_SECONDS), 30.0)
+                if not user_ok:
+                    rest_interval = max(
+                        float(Config.MONITOR_REST_FALLBACK_SECONDS),
+                        rest_interval,
+                        30.0,
+                    )
+                    rest_interval = min(rest_interval, 50.0)
                 rest_due = (now - last_rest_refresh) >= rest_interval
-                if rest_due and not self.exchange.is_rest_blocked()[0]:
+                if rest_due and not user_ok and not self.exchange.is_rest_blocked()[0]:
                     self._prefetch_live_prices_for_open_trades()
                     self.monitor_open_trades(ws_only=False)
                     last_rest_refresh = now
                 else:
+                    if rest_due:
+                        last_rest_refresh = now
                     self.monitor_open_trades(ws_only=True)
                 touch_monitor_loop(source="position_monitor")
             except Exception as exc:
@@ -397,6 +409,7 @@ class TradeManager:
             trade = fresh
         if trade.get("status") == TRADE_STATUS_CLOSED:
             return
+        trade = self._ensure_local_exit_memory(trade)
 
         if is_range_strategy(str(trade.get("strategy", ""))):
             if self._check_range_hard_exits(trade, price):
@@ -406,6 +419,56 @@ class TradeManager:
             self._manage_long_trade(trade, price)
         elif position_side == "SHORT":
             self._manage_short_trade(trade, price)
+
+    def _ensure_local_exit_memory(self, trade: dict[str, Any]) -> dict[str, Any]:
+        """Rebuild local TP/SL in memory if they were never stored (no exchange orders)."""
+        sl = safe_float(trade.get("stop_loss"))
+        tp1 = safe_float(trade.get("take_profit_1"))
+        if sl > 0 and tp1 > 0:
+            return trade
+        metadata = self.db.parse_trade_metadata(trade)
+        atr = safe_float(metadata.get("atr_at_entry"))
+        entry = safe_float(trade.get("entry_price"))
+        side = str(trade.get("side", "LONG")).upper()
+        if atr <= 0 or entry <= 0:
+            return trade
+        sl_mult = max(float(Config.SL_ATR_MULTIPLIER), 0.25)
+        tp1_mult = max(float(Config.TP1_ATR_MULTIPLIER), sl_mult)
+        tp2_mult = max(float(Config.TP2_ATR_MULTIPLIER), tp1_mult)
+        tp3_mult = max(float(Config.TP3_ATR_MULTIPLIER), tp2_mult)
+        if side == "LONG":
+            new_sl = entry - atr * sl_mult
+            new_tp1 = entry + atr * tp1_mult
+            new_tp2 = entry + atr * tp2_mult
+            new_tp3 = entry + atr * tp3_mult
+        else:
+            new_sl = entry + atr * sl_mult
+            new_tp1 = entry - atr * tp1_mult
+            new_tp2 = entry - atr * tp2_mult
+            new_tp3 = entry - atr * tp3_mult
+        patch = {}
+        if sl <= 0:
+            patch["stop_loss"] = new_sl
+            trade["stop_loss"] = new_sl
+        if tp1 <= 0:
+            patch["take_profit_1"] = new_tp1
+            patch["take_profit_2"] = new_tp2
+            patch["take_profit_3"] = new_tp3
+            trade["take_profit_1"] = new_tp1
+            trade["take_profit_2"] = new_tp2
+            trade["take_profit_3"] = new_tp3
+        if patch:
+            try:
+                self.db.update_trade(trade["trade_id"], patch)
+            except Exception:
+                pass
+            trade_logger.info(
+                "[%s] Recalculated local TP/SL in memory | SL=%.6f TP1=%.6f",
+                trade.get("symbol"),
+                safe_float(trade.get("stop_loss")),
+                safe_float(trade.get("take_profit_1")),
+            )
+        return trade
 
     _TF_BAR_SECONDS: dict[str, int] = {
         "1m": 60,

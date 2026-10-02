@@ -36,7 +36,11 @@ class AsyncBacktestValidator:
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._last_process_at = 0.0
+        self._on_funnel: Any = None
         self._thread: Optional[threading.Thread] = None
+
+    def attach_funnel(self, funnel: Any) -> None:
+        self._on_funnel = funnel
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -51,7 +55,7 @@ class AsyncBacktestValidator:
         scanner_logger.info(
             "Async backtest validator started | interval=%.0fs | bars=%s %s | min_wr=%.1f%%",
             Config.BACKTEST_VALIDATION_INTERVAL_SECONDS,
-            Config.BACKTEST_CANDLE_LIMIT,
+            Config.backtest_candle_limit(),
             Config.BACKTEST_TIMEFRAME,
             Config.BACKTEST_MIN_WIN_RATE,
         )
@@ -127,15 +131,48 @@ class AsyncBacktestValidator:
                     trade_logger.warning(
                         "[BACKTEST_REJECTED] %s — queue TTL expired", symbol
                     )
+                    funnel = self._on_funnel
+                    if funnel is not None:
+                        try:
+                            funnel.on_backtest_failed(symbol, "queue_ttl")
+                        except Exception:
+                            pass
                     continue
                 self._wait_rate_limit(interval)
                 if self._stop.is_set():
                     break
+                blocked, block_reason = self.exchange.is_rest_blocked()
+                if blocked:
+                    trade_logger.warning(
+                        "[BACKTEST_DEFERRED] %s — REST blocked (%s); retry next minute",
+                        symbol,
+                        block_reason,
+                    )
+                    funnel = self._on_funnel
+                    if funnel is not None:
+                        try:
+                            funnel.release_hot_rest(symbol)
+                        except Exception:
+                            pass
+                    continue
                 approved = self._validate(item.payload)
                 if approved is not None:
                     self._approved.put(approved)
+                else:
+                    funnel = self._on_funnel
+                    if funnel is not None:
+                        try:
+                            funnel.on_backtest_failed(symbol, "backtest_rejected")
+                        except Exception:
+                            pass
             except Exception as exc:
                 error_logger.error("Backtest validator failed for %s: %s", symbol, exc)
+                funnel = self._on_funnel
+                if funnel is not None:
+                    try:
+                        funnel.on_backtest_failed(symbol, "validator_error")
+                    except Exception:
+                        pass
             finally:
                 with self._lock:
                     self._pending.discard(symbol)
@@ -151,13 +188,6 @@ class AsyncBacktestValidator:
 
     def _validate(self, candidate: dict[str, Any]) -> Optional[dict[str, Any]]:
         symbol = str(candidate.get("symbol", "")).upper()
-        blocked, reason = self.exchange.is_rest_blocked()
-        if blocked:
-            trade_logger.warning(
-                "[BACKTEST_REJECTED] %s — REST blocked (%s)", symbol, reason
-            )
-            return None
-
         df = self._fetch_15m_history(symbol)
         result = run_15m_backtest(df)
         if not result.passed:
@@ -211,7 +241,7 @@ class AsyncBacktestValidator:
 
     def _fetch_15m_history(self, symbol: str) -> Optional[Any]:
         timeframe = str(Config.BACKTEST_TIMEFRAME or "15m")
-        fetch_limit = max(int(Config.BACKTEST_CANDLE_LIMIT), 200)
+        fetch_limit = Config.backtest_candle_limit()
         min_bars = backtest_min_bars()
         hub = getattr(self.exchange, "_market_data", None)
         cached = None

@@ -119,7 +119,7 @@ class MarketScanner:
         return self.orchestrator.refresh_tier1_universe(force=True, allow_rest=False)
 
     def bootstrap_scan_universe(self) -> list[str]:
-        """One-shot REST universe seed + Tier-1 watchlist at startup/warmup."""
+        """One-shot REST universe seed + Tier-1 watchlist at startup."""
         if self.orchestrator is None:
             return []
         return self.orchestrator.bootstrap_watchlist_once()
@@ -205,12 +205,18 @@ class MarketScanner:
                 "tier2_near_miss": [],
             }
         orchestrator = self.orchestrator
+        funnel = getattr(orchestrator, "funnel", None)
         return {
-            "tier1_hot": orchestrator.priority_queue.hot_symbols,
+            "tier1_hot": list(getattr(funnel, "hot_symbols", None) or orchestrator.priority_queue.hot_symbols),
             "tier1_background": orchestrator.priority_queue.background_symbols,
-            "tier1_full": orchestrator.tier1_symbols,
+            "tier1_full": list(getattr(funnel, "normal_symbols", None) or orchestrator.tier1_symbols),
             "rotation_evaluated": orchestrator.priority_queue.rotation.evaluated_count,
-            "rotation_cycle": orchestrator.priority_queue.rotation.rotation_cycle,
+            "rotation_cycle": int(
+                getattr(funnel, "lock_cycle", None)
+                or orchestrator.priority_queue.rotation.rotation_cycle
+            ),
+            "lock_cycle": int(getattr(funnel, "lock_cycle", 0) or 0),
             "tier2": orchestrator.tier2_summary(),
+            "super": funnel.super_summary() if funnel is not None else [],
             "tier2_near_miss": orchestrator.assignment_manager.near_miss_summary(),
         }

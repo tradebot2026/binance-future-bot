@@ -195,11 +195,11 @@ class Config:
         os.getenv("ENTRY_TIMEFRAME", "5m"),
         os.getenv("TREND_TIMEFRAME", "1h"),
     ]
-    SCAN_INTERVAL_SECONDS: int = _env_int("SCAN_INTERVAL_SECONDS", 15)
+    SCAN_INTERVAL_SECONDS: int = _env_int("SCAN_INTERVAL_SECONDS", 30)
     SCAN_ALIGN_TO_MINUTE: bool = _env_bool("SCAN_ALIGN_TO_MINUTE", False)
     SCAN_MINUTE_OFFSET_SECONDS: float = _env_float("SCAN_MINUTE_OFFSET_SECONDS", 1.0)
     LOOP_IDLE_SECONDS: float = _env_float("LOOP_IDLE_SECONDS", 0.5)
-    SCAN_WARMUP_SECONDS: float = _env_float("SCAN_WARMUP_SECONDS", 300.0)
+    SCAN_WARMUP_SECONDS: float = _env_float("SCAN_WARMUP_SECONDS", 0.0)
     POSITION_GRACE_PERIOD_SECONDS: float = _env_float(
         "POSITION_GRACE_PERIOD_SECONDS", 120.0
     )
@@ -207,7 +207,10 @@ class Config:
     POSITION_RECONCILE_MISS_THRESHOLD: int = _env_int(
         "POSITION_RECONCILE_MISS_THRESHOLD", 8
     )
-    MONITOR_INTERVAL_SECONDS: int = _env_int("MONITOR_INTERVAL_SECONDS", 20)
+    MONITOR_INTERVAL_SECONDS: int = _env_int("MONITOR_INTERVAL_SECONDS", 30)
+    MONITOR_REST_FALLBACK_SECONDS: int = _env_int(
+        "MONITOR_REST_FALLBACK_SECONDS", 50
+    )
     RECONCILIATION_INTERVAL_SECONDS: int = _env_int("RECONCILIATION_INTERVAL_SECONDS", 900)
     MAX_POSITIONS: int = _env_int("MAX_OPEN_POSITIONS", 12)
     MAX_LEVERAGE: int = _env_int("MAX_LEVERAGE", 25)
@@ -523,11 +526,18 @@ class Config:
     # ---------------- Event-driven scan & tier management ----------------
     ENABLE_EVENT_DRIVEN_SCAN: bool = _env_bool("ENABLE_EVENT_DRIVEN_SCAN", True)
     SCAN_TRIGGER_TIMEFRAMES: str = os.getenv("SCAN_TRIGGER_TIMEFRAMES", "5m,15m")
-    TIER1_WATCHLIST_SIZE: int = _env_int("TIER1_WATCHLIST_SIZE", 100)
-    SCAN_WATCHLIST_SIZE: int = _env_int("SCAN_WATCHLIST_SIZE", 60)
-    HOT_SCAN_SIZE: int = _env_int("HOT_SCAN_SIZE", 60)
+    TIER1_WATCHLIST_SIZE: int = _env_int("TIER1_WATCHLIST_SIZE", 120)
+    SCAN_WATCHLIST_SIZE: int = _env_int("SCAN_WATCHLIST_SIZE", 120)
+    HOT_SCAN_SIZE: int = _env_int("HOT_SCAN_SIZE", 16)
     ENABLE_LIGHTWEIGHT_SCANNER: bool = _env_bool("ENABLE_LIGHTWEIGHT_SCANNER", True)
-    HOT_SCAN_INTERVAL_SECONDS: float = _env_float("HOT_SCAN_INTERVAL_SECONDS", 300.0)
+    HOT_SCAN_INTERVAL_SECONDS: float = _env_float("HOT_SCAN_INTERVAL_SECONDS", 60.0)
+    ENABLE_THREE_TIER_FUNNEL: bool = _env_bool("ENABLE_THREE_TIER_FUNNEL", True)
+    NORMAL_TIER_UNIVERSE_SIZE: int = _env_int("NORMAL_TIER_UNIVERSE_SIZE", 120)
+    NORMAL_TIER_COINS_PER_MINUTE: int = _env_int("NORMAL_TIER_COINS_PER_MINUTE", 2)
+    NORMAL_TIER_LOCK_HOURS: float = _env_float("NORMAL_TIER_LOCK_HOURS", 3.0)
+    HOT_TIER_COINS_PER_MINUTE: int = _env_int("HOT_TIER_COINS_PER_MINUTE", 1)
+    SUPER_TIER_COINS_PER_MINUTE: int = _env_int("SUPER_TIER_COINS_PER_MINUTE", 1)
+    MAX_ORDER_REQUESTS_PER_MINUTE: int = _env_int("MAX_ORDER_REQUESTS_PER_MINUTE", 4)
     BACKGROUND_SCAN_BATCH_SIZE: int = _env_int("BACKGROUND_SCAN_BATCH_SIZE", 10)
     BACKGROUND_SCAN_BATCH_DELAY_SECONDS: float = _env_float(
         "BACKGROUND_SCAN_BATCH_DELAY_SECONDS", 10.0
@@ -545,7 +555,7 @@ class Config:
     EVENT_EVAL_STAGGER_MS: float = _env_float("EVENT_EVAL_STAGGER_MS", 50.0)
     EVENT_CATCHUP_INTERVAL_SECONDS: int = _env_int("EVENT_CATCHUP_INTERVAL_SECONDS", 60)
     TIER1_REFRESH_INTERVAL_SECONDS: int = _env_int(
-        "TIER1_REFRESH_INTERVAL_SECONDS", 1800
+        "TIER1_REFRESH_INTERVAL_SECONDS", 10800
     )
     REST_BUDGET_WEIGHT_PER_MINUTE: int = _env_int("REST_BUDGET_WEIGHT_PER_MINUTE", 200)
     REST_BUDGET_MIN_REMAINING_FRACTION: float = _env_float(
@@ -634,7 +644,7 @@ class Config:
         ["BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT", "XRPUSDT"],
     )
     BLACKLIST_CACHE_SECONDS: float = _env_float("BLACKLIST_CACHE_SECONDS", 60.0)
-    TOP_UNIVERSE_POOL_SIZE: int = _env_int("TOP_UNIVERSE_POOL_SIZE", 60)
+    TOP_UNIVERSE_POOL_SIZE: int = _env_int("TOP_UNIVERSE_POOL_SIZE", 120)
     ROTATION_EXTENDED_POOL_SIZE: int = _env_int("ROTATION_EXTENDED_POOL_SIZE", 60)
     ROTATION_EVALUATED_MEMORY_MIN_MINUTES: int = _env_int(
         "ROTATION_EVALUATED_MEMORY_MIN_MINUTES", 45
@@ -690,7 +700,7 @@ class Config:
     BACKTEST_QUEUE_TTL_SECONDS: float = _env_float("BACKTEST_QUEUE_TTL_SECONDS", 180.0)
     BACKTEST_QUEUE_MAX: int = _env_int("BACKTEST_QUEUE_MAX", 8)
     ATTACH_NATIVE_TP_SL_AFTER_VALIDATION: bool = _env_bool(
-        "ATTACH_NATIVE_TP_SL_AFTER_VALIDATION", True
+        "ATTACH_NATIVE_TP_SL_AFTER_VALIDATION", False
     )
     MIN_24H_VOLUME_USDT: float = _env_float("MIN_24H_VOLUME_USDT", 10_000_000.0)
     MAX_SPREAD_PERCENT: float = _env_float("MAX_SPREAD_PERCENT", 0.08)
@@ -749,8 +759,8 @@ class Config:
     ENABLE_DAILY_REPORT: bool = _env_bool("ENABLE_DAILY_REPORT", True)
     ENABLE_WEEKLY_REPORT: bool = _env_bool("ENABLE_WEEKLY_REPORT", True)
     ENABLE_MONTHLY_REPORT: bool = _env_bool("ENABLE_MONTHLY_REPORT", True)
-    MAX_SCAN_UNIVERSE: int = _env_int("MAX_SCAN_UNIVERSE", 60)
-    MAX_ENTRIES_PER_CYCLE: int = _env_int("MAX_ENTRIES_PER_CYCLE", 3)
+    MAX_SCAN_UNIVERSE: int = _env_int("MAX_SCAN_UNIVERSE", 120)
+    MAX_ENTRIES_PER_CYCLE: int = _env_int("MAX_ENTRIES_PER_CYCLE", 1)
     MULTI_CONFLUENCE_MIN_SCORE: float = _env_float("MULTI_CONFLUENCE_MIN_SCORE", 65.0)
     NEAR_MISS_SCORE_MIN: float = _env_float("NEAR_MISS_SCORE_MIN", 65.0)
     NEAR_MISS_SCORE_MAX: float = _env_float("NEAR_MISS_SCORE_MAX", 69.0)
@@ -859,17 +869,24 @@ class Config:
 
     @classmethod
     def scan_cycle_seconds(cls) -> float:
-        """One full 60-coin page at 5s/symbol = 300s (5m candle aligned)."""
+        """Seconds for one Normal-tier round (120 coins at 2/min = 3600s)."""
+        if cls.ENABLE_THREE_TIER_FUNNEL:
+            per_min = max(int(cls.NORMAL_TIER_COINS_PER_MINUTE), 1)
+            return (float(cls.normal_tier_universe_size()) / per_min) * 60.0
         return float(cls.scan_cycle_symbol_count()) * cls.scan_symbol_delay_seconds()
 
     @classmethod
     def hot_scan_interval_seconds(cls) -> float:
-        """Full-universe page interval — one 5s/coin pass (~300s)."""
+        """Hot-tier cadence — 1 coin per minute in the 3-tier funnel."""
+        if cls.ENABLE_THREE_TIER_FUNNEL:
+            return 60.0 / max(int(cls.HOT_TIER_COINS_PER_MINUTE), 1)
         return max(float(cls.HOT_SCAN_INTERVAL_SECONDS), cls.scan_cycle_seconds())
 
     @classmethod
     def scan_cycle_symbol_count(cls) -> int:
-        """Coins evaluated per smooth scan pass (60 × 5s = 5 minutes)."""
+        """Coins evaluated per main-loop tick (funnel: 2 Normal coins/min)."""
+        if cls.ENABLE_THREE_TIER_FUNNEL:
+            return max(int(cls.NORMAL_TIER_COINS_PER_MINUTE), 1)
         return max(
             int(cls.TOP_UNIVERSE_POOL_SIZE),
             int(cls.SCAN_WATCHLIST_SIZE),
@@ -878,13 +895,25 @@ class Config:
         )
 
     @classmethod
+    def normal_tier_universe_size(cls) -> int:
+        return max(
+            int(cls.NORMAL_TIER_UNIVERSE_SIZE),
+            int(cls.TOP_UNIVERSE_POOL_SIZE),
+            1,
+        )
+
+    @classmethod
     def scan_watchlist_size(cls) -> int:
-        """Per-cycle scan cap — 60-coin page by default."""
+        """Watchlist cap — 120-coin Normal universe in funnel mode."""
+        if cls.ENABLE_THREE_TIER_FUNNEL:
+            return cls.normal_tier_universe_size()
         return cls.scan_cycle_symbol_count()
 
     @classmethod
     def scan_symbol_delay_seconds(cls) -> float:
-        """Pause between scanner symbol evaluations (strictly 5.0s)."""
+        """Legacy inter-symbol sleep; funnel pacing uses MinuteWindow instead."""
+        if cls.ENABLE_THREE_TIER_FUNNEL:
+            return 0.0
         return max(float(getattr(cls, "SCAN_SYMBOL_DELAY_SECONDS", 5.0)), 5.0)
 
     @classmethod
@@ -911,11 +940,13 @@ class Config:
 
     @classmethod
     def scan_warmup_seconds(cls) -> float:
-        """Startup scanner idle window (5 minutes) so WS caches can fill."""
-        raw = float(cls.SCAN_WARMUP_SECONDS)
-        if raw <= 0:
-            return 0.0
-        return min(max(raw, 180.0), 300.0)
+        """Warmup delay is disabled — Normal-tier scanning starts immediately."""
+        return 0.0
+
+    @classmethod
+    def backtest_candle_limit(cls) -> int:
+        """Hot-tier history fetch size (200–600 bars; default 500)."""
+        return min(max(int(cls.BACKTEST_CANDLE_LIMIT), 200), 600)
 
     @classmethod
     def warmup_kline_fetch_limit(cls) -> int:

@@ -554,7 +554,9 @@ class TestWsStaleReconnect(unittest.TestCase):
         orch._drain_due_event_symbols = lambda: ({}, [])  # type: ignore[method-assign]
         orch._cycle_scan_symbols = lambda extra: []  # type: ignore[method-assign]
         orch.assignment_manager = MagicMock(tier2_size=0)
-        with patch("pipeline.event_scan_orchestrator.scanner_logger") as log:
+        with patch.object(Config, "ENABLE_THREE_TIER_FUNNEL", False), patch(
+            "pipeline.event_scan_orchestrator.scanner_logger"
+        ) as log:
             orch.process_priority_scan_cycle()
             orch.process_priority_scan_cycle()
         self.assertEqual(log.info.call_count, 1)

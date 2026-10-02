@@ -354,7 +354,7 @@ class TestOrderStateSafety(unittest.TestCase):
                     attach_native_exits=True,
                 )
             self.assertIsNotNone(result)
-            place_native.assert_called()
+            place_native.assert_not_called()
 
     def test_duplicate_execution_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
