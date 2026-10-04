@@ -95,8 +95,11 @@ class Config:
     WS_STALE_RECONNECT_COOLDOWN_SECONDS: float = _env_float(
         "WS_STALE_RECONNECT_COOLDOWN_SECONDS", 45.0
     )
-    WS_PING_INTERVAL_SECONDS: float = _env_float("WS_PING_INTERVAL_SECONDS", 15.0)
+    WS_PING_INTERVAL_SECONDS: float = _env_float("WS_PING_INTERVAL_SECONDS", 20.0)
     WS_PING_TIMEOUT_SECONDS: float = _env_float("WS_PING_TIMEOUT_SECONDS", 10.0)
+    WS_EMERGENCY_REST_INTERVAL_SECONDS: float = _env_float(
+        "WS_EMERGENCY_REST_INTERVAL_SECONDS", 20.0
+    )
     WS_USER_STALE_SECONDS: int = _env_int("WS_USER_STALE_SECONDS", 120)
     WS_USER_IDLE_RECONNECT_SECONDS: int = _env_int(
         "WS_USER_IDLE_RECONNECT_SECONDS", 1800
@@ -918,15 +921,20 @@ class Config:
 
     @classmethod
     def ws_ping_interval_seconds(cls) -> float:
-        """Binance WS protocol ping interval (15–20s) to keep Testnet sockets alive."""
-        return min(max(float(getattr(cls, "WS_PING_INTERVAL_SECONDS", 15.0)), 15.0), 20.0)
+        """Binance WS protocol ping interval (fixed 20s keep-alive)."""
+        return min(max(float(getattr(cls, "WS_PING_INTERVAL_SECONDS", 20.0)), 15.0), 20.0)
 
     @classmethod
     def ws_ping_timeout_seconds(cls) -> float:
         """Must stay below ping interval so websockets ping/pong stays valid."""
         interval = cls.ws_ping_interval_seconds()
         raw = max(float(getattr(cls, "WS_PING_TIMEOUT_SECONDS", 10.0)), 5.0)
-        return min(raw, max(interval - 1.0, 5.0))
+        return min(raw, max(interval - 1.0, 5.0), 10.0)
+
+    @classmethod
+    def ws_emergency_rest_interval_seconds(cls) -> float:
+        """Minimum gap between emergency ticker REST bridges during a WS drop."""
+        return max(float(cls.WS_EMERGENCY_REST_INTERVAL_SECONDS), 15.0)
 
     @classmethod
     def ws_degraded_rest_min_interval_seconds(cls) -> float:

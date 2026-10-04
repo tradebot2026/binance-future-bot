@@ -390,10 +390,109 @@ class TestWsStaleReconnect(unittest.TestCase):
             self.assertEqual(Config.ws_ping_interval_seconds(), 15.0)
         with patch.object(Config, "WS_PING_INTERVAL_SECONDS", 30.0):
             self.assertEqual(Config.ws_ping_interval_seconds(), 20.0)
-        with patch.object(Config, "WS_PING_INTERVAL_SECONDS", 15.0):
-            self.assertEqual(Config.ws_ping_interval_seconds(), 15.0)
+        with patch.object(Config, "WS_PING_INTERVAL_SECONDS", 20.0):
+            self.assertEqual(Config.ws_ping_interval_seconds(), 20.0)
         with patch.object(Config, "WS_PING_TIMEOUT_SECONDS", 30.0):
+            self.assertEqual(Config.ws_ping_timeout_seconds(), 10.0)
             self.assertLess(Config.ws_ping_timeout_seconds(), Config.ws_ping_interval_seconds())
+
+    def test_protocol_ping_stamps_ticker_book_so_180s_stale_does_not_fire(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._last_ticker_event_at = time.monotonic() - 200.0
+        hub._last_book_event_at = time.monotonic() - 200.0
+        hub._last_ws_seen_at = time.monotonic() - 200.0
+        hub._last_protocol_ping_at = 0.0
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        hub._ws_loop = loop
+        ping = MagicMock()
+        sock = SimpleNamespace(ws=SimpleNamespace(ping=ping))
+        hub._ws_manager = SimpleNamespace(
+            _bsm=SimpleNamespace(_conns={"miniTicker": sock})
+        )
+        with patch.object(Config, "USE_TESTNET", True), patch.object(
+            Config, "WS_STALE_SECONDS_TESTNET", 180
+        ), patch.object(Config, "ENABLE_WS_BOOK_STREAM", True), patch(
+            "market_data_hub.asyncio.run_coroutine_threadsafe"
+        ) as scheduled:
+            self.assertTrue(hub.ws_is_stale())
+            hub._maybe_protocol_ping()
+            self.assertTrue(scheduled.called)
+            self.assertFalse(hub.ws_is_stale())
+            self.assertFalse(hub._book_stream_is_stale())
+            self.assertFalse(hub._should_reconnect_for_stale_ticker())
+            self.assertLess(hub.ticker_cache_age_seconds(), 2.0)
+
+    def test_expired_ban_timestamp_clears_halt_and_hard_resubscribes(self) -> None:
+        hub = _hub_with_running_ws()
+        expired_ms = int((time.time() - 5.0) * 1000)
+        hub.block_rest_for_ban("banned until %s" % expired_ms, banned_until_ms=expired_ms)
+        self.assertTrue(hub._rest_ban_active)
+        self.assertGreater(hub._rest_blocked_until, time.time())
+        with patch.object(hub, "force_hard_resubscribe") as hard:
+            blocked, _ = hub.is_rest_blocked()
+            halted, _ = hub.is_scan_halted()
+        self.assertFalse(blocked)
+        self.assertFalse(halted)
+        self.assertFalse(hub._rest_ban_active)
+        self.assertIsNone(hub.get_ban_status())
+        hard.assert_called()
+
+    def test_force_hard_resubscribe_starts_worker(self) -> None:
+        hub = _hub_with_running_ws()
+        with patch.object(Config, "WS_RECONNECT_ENABLED", True), patch.object(
+            Config, "ENABLE_WEBSOCKET_STREAMS", True
+        ), patch("market_data_hub.threading.Thread") as thread_cls:
+            hub.force_hard_resubscribe("REST ban expired — hard WS resubscribe")
+        thread_cls.assert_called_once()
+        self.assertTrue(hub._reconnect_in_progress)
+        self.assertEqual(
+            thread_cls.call_args.kwargs["args"],
+            ("REST ban expired — hard WS resubscribe", False, True),
+        )
+
+    def test_emergency_rest_bridge_runs_when_ws_stale(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._last_ticker_event_at = time.monotonic() - 200.0
+        hub._last_emergency_rest_at = 0.0
+        fetcher = MagicMock(return_value={"BTCUSDT": {"lastPrice": "1"}})
+        hub.set_ticker_rest_fetcher(fetcher)
+        with patch.object(Config, "USE_TESTNET", True), patch.object(
+            Config, "WS_STALE_SECONDS_TESTNET", 60
+        ), patch.object(Config, "ENABLE_WS_BOOK_STREAM", False):
+            self.assertEqual(hub.get_ws_health_snapshot()["state"], "STALE")
+            count = hub.maybe_emergency_rest_bridge()
+        self.assertGreater(count, 0)
+        fetcher.assert_called_once()
+
+    def test_emergency_rest_bridge_skips_when_healthy(self) -> None:
+        hub = _hub_with_running_ws()
+        now = time.monotonic()
+        hub._last_ticker_event_at = now
+        hub._last_book_event_at = now
+        fetcher = MagicMock(return_value={"BTCUSDT": {"lastPrice": "1"}})
+        hub.set_ticker_rest_fetcher(fetcher)
+        self.assertEqual(hub.maybe_emergency_rest_bridge(), 0)
+        fetcher.assert_not_called()
+
+    def test_listener_dispatch_is_off_ws_thread(self) -> None:
+        hub = _hub_with_running_ws()
+        seen: list[tuple[str, float]] = []
+        hub.register_price_tick_listener(lambda s, p: seen.append((s, p)))
+        hub._emit_price_tick("BTCUSDT", 1.25)
+        deadline = time.monotonic() + 2.0
+        while not seen and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertEqual(seen, [("BTCUSDT", 1.25)])
+
+    def test_kline_bootstrap_log_tag_is_not_warmup(self) -> None:
+        import inspect
+
+        from pipeline import event_scan_orchestrator as orch_mod
+
+        source = inspect.getsource(orch_mod)
+        self.assertNotIn("SCAN_KLINE_WARMUP", source)
+        self.assertIn("SCAN_KLINE_BOOTSTRAP", source)
 
     def test_scan_ws_only_forbids_healthy_ticker_and_kline_rest(self) -> None:
         hub = _hub_with_running_ws()

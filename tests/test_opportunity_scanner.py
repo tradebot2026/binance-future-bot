@@ -20,7 +20,6 @@ from core.opportunity_tracker import (
 )
 from core.minute_clock import MinuteScanClock
 from core.scan_priority_queue import ScanPriorityQueue
-from core.scan_warmup import ScanWarmupGate
 from core.types import CandleCloseEvent, CoinLifecycle, SignalCandidate
 from database import DatabaseManager
 from exceptions import DatabaseError
@@ -459,20 +458,10 @@ class TestMinuteScanClock(unittest.TestCase):
 
 
 class TestScanWarmupGate(unittest.TestCase):
-    def test_warmup_holds_then_announces_active(self) -> None:
-        gate = ScanWarmupGate(180.0)
-        gate._started_at = time.monotonic() - 10.0
-        self.assertTrue(gate.in_warmup())
-        self.assertFalse(gate.just_finished())
-        gate._started_at = time.monotonic() - 181.0
-        self.assertFalse(gate.in_warmup())
-        self.assertTrue(gate.just_finished())
-        self.assertFalse(gate.just_finished())
+    def test_legacy_warmup_module_removed(self) -> None:
+        from pathlib import Path
 
-    def test_zero_duration_skips_warmup(self) -> None:
-        gate = ScanWarmupGate(0.0)
-        self.assertFalse(gate.in_warmup())
-        self.assertFalse(gate.just_finished())
+        self.assertFalse((Path(__file__).resolve().parents[1] / "core" / "scan_warmup.py").exists())
 
     def test_config_bypasses_warmup_window(self) -> None:
         with patch.object(Config, "SCAN_WARMUP_SECONDS", 60.0):

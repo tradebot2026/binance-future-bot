@@ -7,6 +7,7 @@ REST is fallback-only outside scan cycles and never during IP bans.
 from __future__ import annotations
 
 import asyncio
+import queue
 import re
 import threading
 import time
@@ -46,27 +47,43 @@ class _WsThreadedWebsocketManager(ThreadedWebsocketManager):
         self._loop.run_until_complete(self.socket_listener())
 
 
+def _ws_ping_kwargs() -> dict[str, float]:
+    """Binance WS protocol ping/pong (interval=20, timeout=10)."""
+    return {
+        "ping_interval": Config.ws_ping_interval_seconds(),
+        "ping_timeout": Config.ws_ping_timeout_seconds(),
+    }
+
+
+def _patch_ws_class_ping(cls: Any) -> None:
+    if cls is None or getattr(cls, "_hub_ping_configured", False):
+        return
+    original_init = cls.__init__
+
+    def _init_with_ping(self, *args: Any, **kwargs: Any) -> None:
+        kwargs.update(_ws_ping_kwargs())
+        original_init(self, *args, **kwargs)
+        ping_kwargs = _ws_ping_kwargs()
+        ws_kwargs = getattr(self, "_ws_kwargs", None)
+        if isinstance(ws_kwargs, dict):
+            ws_kwargs.update(ping_kwargs)
+
+    cls.__init__ = _init_with_ping  # type: ignore[method-assign]
+    cls._hub_ping_configured = True
+
+
 def _install_ws_ping_defaults() -> None:
-    """Force python-binance ReconnectingWebsocket ping/pong (15–20s / ~10s)."""
+    """Force python-binance socket classes to use ping_interval=20 / ping_timeout=10."""
     try:
         from binance.ws.reconnecting_websocket import ReconnectingWebsocket
     except ImportError:
-        return
-
-    if getattr(ReconnectingWebsocket, "_hub_ping_configured", False):
-        return
-
-    original_init = ReconnectingWebsocket.__init__
-
-    def _init_with_ping(self, *args: Any, **kwargs: Any) -> None:
-        original_init(self, *args, **kwargs)
-        interval = Config.ws_ping_interval_seconds()
-        timeout = Config.ws_ping_timeout_seconds()
-        self._ws_kwargs["ping_interval"] = interval
-        self._ws_kwargs["ping_timeout"] = timeout
-
-    ReconnectingWebsocket.__init__ = _init_with_ping  # type: ignore[method-assign]
-    ReconnectingWebsocket._hub_ping_configured = True
+        ReconnectingWebsocket = None  # type: ignore[assignment]
+    _patch_ws_class_ping(ReconnectingWebsocket)
+    try:
+        from binance.ws.keepalive_websocket import KeepAliveWebsocket
+    except ImportError:
+        KeepAliveWebsocket = None  # type: ignore[assignment]
+    _patch_ws_class_ping(KeepAliveWebsocket)
 
 
 _install_ws_ping_defaults()
@@ -112,6 +129,10 @@ class BanStatus:
             return 0
         remaining = (self.banned_until_ms - int(time.time() * 1000)) // 1000
         return max(int(remaining), 0)
+
+    @property
+    def timestamp_expired(self) -> bool:
+        return bool(self.banned_until_ms) and self.seconds_remaining <= 0
 
 
 @dataclass
@@ -177,6 +198,8 @@ class MarketDataHub:
         self._unrealized_pnl_total: float = 0.0
         self._wallet_balances: dict[str, float] = {}
         self._ban_notice_logged: bool = False
+        self._rest_ban_active: bool = False
+        self._rest_recovery_lock = threading.Lock()
         self._ws_started_at: float = 0.0
         self._reconnect_lock = threading.Lock()
         self._reconnect_in_progress = False
@@ -189,6 +212,17 @@ class MarketDataHub:
         self._ticker_socket_refresh_lock = threading.Lock()
         self._watchdog_stop = threading.Event()
         self._watchdog_thread: Optional[threading.Thread] = None
+        self._listener_queue: queue.Queue[tuple[str, tuple[Any, ...]]] = queue.Queue(
+            maxsize=2000
+        )
+        self._listener_stop = threading.Event()
+        self._listener_thread = threading.Thread(
+            target=self._listener_dispatch_loop,
+            name="ws-listener-dispatch",
+            daemon=True,
+        )
+        self._listener_thread.start()
+        self._last_emergency_rest_at: float = 0.0
         self._reconnect_policy = WsReconnectPolicy(
             min_seconds=Config.WS_RECONNECT_MIN_SECONDS,
             max_seconds=Config.WS_RECONNECT_MAX_SECONDS,
@@ -487,6 +521,44 @@ class MarketDataHub:
                 "Ticker cache refreshed from REST (%s symbols).", count
             )
         return count
+
+    def maybe_emergency_rest_bridge(self) -> int:
+        """Throttled REST ticker seed while WS is STALE/STOPPED — never during a ban."""
+        if self.is_rest_blocked()[0]:
+            return 0
+        state = str(self.get_ws_health_snapshot().get("state") or "").upper()
+        if state not in {"STALE", "STOPPED"}:
+            return 0
+        if self._governor_blocks_background_rest(40):
+            return 0
+        now = time.monotonic()
+        min_interval = Config.ws_emergency_rest_interval_seconds()
+        if (
+            self._last_emergency_rest_at > 0
+            and (now - self._last_emergency_rest_at) < min_interval
+        ):
+            return 0
+        fetcher = self._ticker_rest_fetcher
+        if fetcher is None:
+            return 0
+        try:
+            result = fetcher()
+        except Exception as exc:
+            if isinstance(exc, BinanceAPIException) and exc.code == -1003:
+                self.handle_rate_limit_error(exc)
+            if self._ws_log.should_log(f"emergency_rest_fail:{exc}"):
+                system_logger.debug("Emergency REST bridge skipped: %s", exc)
+            return 0
+        if not result:
+            return 0
+        self.seed_tickers_from_rest(result)
+        self._last_emergency_rest_at = now
+        system_logger.info(
+            "[WS_EMERGENCY_REST] ticker cache bridged (%s symbols) while WS=%s",
+            len(self._tickers),
+            state,
+        )
+        return len(self._tickers)
 
     def _rest_quiet_mode(self) -> bool:
         """During IP/rate-limit ban, avoid REST polling and noisy WS churn."""
@@ -866,7 +938,13 @@ class MarketDataHub:
 
     def get_rest_block_remaining_seconds(self) -> int:
         with self._lock:
-            return max(int(self._rest_blocked_until - time.time()), 0)
+            if self._ban_timestamp_is_expired_locked():
+                return 0
+            timer_rem = max(int(self._rest_blocked_until - time.time()), 0)
+            ban = self._ban_status
+            if ban is not None and ban.banned_until_ms:
+                return min(timer_rem, ban.seconds_remaining) if timer_rem else ban.seconds_remaining
+            return timer_rem
 
     def get_ws_wallet_balance(self, asset: str = "USDT") -> float:
         asset = asset.upper()
@@ -1000,7 +1078,12 @@ class MarketDataHub:
         self._watchdog_thread.start()
 
     def _maybe_protocol_ping(self) -> None:
-        """Send websockets ping frames so idle Testnet multiplex sockets stay alive."""
+        """Send websockets ping frames so idle ticker/book sockets stay alive.
+
+        Protocol pong does not arrive as an application frame, so a successful
+        ping also stamps ticker/book freshness and avoids 180s stale reconnects
+        while the socket is actually healthy.
+        """
         if not self._ws_running or self._reconnect_in_progress:
             return
         interval = Config.ws_ping_interval_seconds()
@@ -1008,19 +1091,11 @@ class MarketDataHub:
         last = float(getattr(self, "_last_protocol_ping_at", 0.0) or 0.0)
         if last > 0 and (now - last) < interval:
             return
-        manager = self._ws_manager
         loop = self._ws_loop
-        if manager is None or loop is None or not loop.is_running():
-            return
-        conns = getattr(manager, "_conns", None)
-        if conns is None:
-            bsm = getattr(manager, "_bsm", None)
-            conns = getattr(bsm, "_conns", None) if bsm is not None else None
-        if not isinstance(conns, dict) or not conns:
-            self._last_protocol_ping_at = now
+        if loop is None or not loop.is_running():
             return
         pinged = 0
-        for sock in list(conns.values()):
+        for sock in self._iter_reconnecting_sockets():
             ws = getattr(sock, "ws", None)
             ping = getattr(ws, "ping", None) if ws is not None else None
             if not callable(ping):
@@ -1031,12 +1106,29 @@ class MarketDataHub:
             except Exception:
                 continue
         self._last_protocol_ping_at = now
-        if pinged and self._ws_log.should_log("ws_protocol_ping"):
-            system_logger.debug(
-                "WS ping/pong keepalive sent on %s socket(s) (interval=%.0fs).",
-                pinged,
-                interval,
-            )
+        if pinged:
+            self._note_ws_frame("ticker")
+            if Config.ENABLE_WS_BOOK_STREAM:
+                self._note_ws_frame("book")
+            if self._ws_log.should_log("ws_protocol_ping"):
+                system_logger.debug(
+                    "WS ping/pong keepalive sent on %s socket(s) (interval=%.0fs).",
+                    pinged,
+                    interval,
+                )
+
+    def _iter_reconnecting_sockets(self) -> list[Any]:
+        """Live python-binance socket objects (ticker, book, kline, user)."""
+        manager = self._ws_manager
+        if manager is None:
+            return []
+        bsm = getattr(manager, "_bsm", None)
+        conns = getattr(bsm, "_conns", None) if bsm is not None else None
+        if not isinstance(conns, dict) or not conns:
+            conns = getattr(manager, "_conns", None)
+        if not isinstance(conns, dict):
+            return []
+        return list(conns.values())
 
     def _watchdog_loop(self) -> None:
         interval = max(float(Config.WS_HEALTH_CHECK_SECONDS), 5.0)
@@ -1073,6 +1165,7 @@ class MarketDataHub:
                 self._request_reconnect(
                     "user data stream stale — no account events received"
                 )
+            self.maybe_emergency_rest_bridge()
 
     def _should_reconnect_for_stale_user_stream(self) -> bool:
         """Reconnect user-data only when we need ACCOUNT_UPDATE and the socket died.
@@ -1251,11 +1344,17 @@ class MarketDataHub:
             daemon=True,
         ).start()
 
-    def _reconnect_worker(self, reason: str, silent: bool = False) -> None:
+    def _reconnect_worker(
+        self, reason: str, silent: bool = False, hard: bool = False
+    ) -> None:
         try:
-            delay = self._reconnect_policy.next_delay()
-            if silent:
-                delay = min(delay, 0.5)
+            if hard:
+                delay = 0.0
+                self._reconnect_policy.reset()
+            else:
+                delay = self._reconnect_policy.next_delay()
+                if silent:
+                    delay = min(delay, 0.5)
             system_logger.info(
                 "[WS_RECONNECT_ATTEMPT] in %.1fs (attempt %s) reason=%s",
                 delay,
@@ -1269,12 +1368,13 @@ class MarketDataHub:
                     delay,
                     self._reconnect_policy.attempt,
                 )
-            time.sleep(delay)
+            if delay > 0:
+                time.sleep(delay)
 
             preserve_cache = self._preserve_cache_on_reconnect()
             self._stop_ws_internal(
                 preserve_kline_subscriptions=True,
-                blocking=False,
+                blocking=bool(hard),
             )
             self._start_ws_internal(preserve_cache=preserve_cache)
             self._mark_stream_freshness()
@@ -1496,6 +1596,7 @@ class MarketDataHub:
 
     def stop(self) -> None:
         self._watchdog_stop.set()
+        self._listener_stop.set()
         self._stop_ws_internal(preserve_kline_subscriptions=False)
 
     def _on_book_ticker_message(self, message: Any) -> None:
@@ -1622,6 +1723,7 @@ class MarketDataHub:
                 self._rest_blocked_until, time.time() + halt_seconds
             )
             self._rest_block_reason = message
+            self._rest_ban_active = True
         self.halt_scanning(halt_seconds, message)
         if not was_active:
             self._ban_notice_logged = False
@@ -1630,9 +1732,14 @@ class MarketDataHub:
             )
 
     def is_rest_blocked(self) -> tuple[bool, str]:
+        if self.maybe_recover_expired_rest_ban():
+            return False, ""
         with self._lock:
-            if time.time() < self._rest_blocked_until:
-                remaining = int(self._rest_blocked_until - time.time())
+            if self._ban_timestamp_is_expired_locked():
+                remaining = 0
+            else:
+                remaining = max(int(self._rest_blocked_until - time.time()), 0)
+            if remaining > 0:
                 reason = self._rest_block_reason or "rate_limit_ban"
                 return True, f"{reason} (REST resumes in ~{remaining}s)"
             if self._ban_notice_logged:
@@ -1659,6 +1766,99 @@ class MarketDataHub:
         until_ms = parse_ban_until_ms(message)
         self.block_rest_for_ban(message, until_ms)
 
+    def _ban_timestamp_is_expired_locked(self) -> bool:
+        ban = self._ban_status
+        return bool(ban is not None and ban.timestamp_expired)
+
+    def _rest_recovery_due_locked(self) -> bool:
+        timestamp_expired = self._ban_timestamp_is_expired_locked()
+        timer_active = time.time() < self._rest_blocked_until
+        timer_expired = self._rest_blocked_until > 0 and not timer_active
+        if timer_active and not timestamp_expired:
+            return False
+        return bool(
+            timestamp_expired
+            or timer_expired
+            or (
+                self._rest_ban_active
+                and (self._ban_status is None or self._ban_status.timestamp_expired)
+                and not timer_active
+            )
+        )
+
+    def maybe_recover_expired_rest_ban(self) -> bool:
+        """Clear REST/scan halt once the Binance ban timestamp or local timer expires."""
+        with self._lock:
+            if not self._rest_recovery_due_locked():
+                return False
+        if not self._rest_recovery_lock.acquire(blocking=False):
+            return False
+        try:
+            with self._lock:
+                if not self._rest_recovery_due_locked():
+                    return False
+                self._rest_blocked_until = 0.0
+                self._rest_block_reason = ""
+                self._scan_halted_until = 0.0
+                self._scan_halt_reason = ""
+                self._ban_status = None
+                self._ban_notice_logged = False
+                self._rest_ban_active = False
+            self._notify_rest_governor_cleared()
+            self.force_hard_resubscribe(
+                "REST ban expired — hard WS resubscribe"
+            )
+            system_logger.info(
+                "[REST_RECOVERED] IP/rate-limit window expired — "
+                "API HEALTHY, scan loops resume, WS hard-resubscribed."
+            )
+            return True
+        finally:
+            self._rest_recovery_lock.release()
+
+    def _notify_rest_governor_cleared(self) -> None:
+        gov = self._rest_governor
+        if gov is None:
+            return
+        usage = getattr(gov, "_rest_usage", None)
+        clearer = getattr(usage, "force_clear_safety", None)
+        if callable(clearer):
+            try:
+                clearer("ban timestamp expired")
+            except Exception as exc:
+                error_logger.debug("REST usage clear after ban failed: %s", exc)
+        bucket = getattr(gov, "_rest_token_bucket", None)
+        bucket_clear = getattr(bucket, "clear_hard_stop", None)
+        if callable(bucket_clear):
+            try:
+                bucket_clear()
+            except Exception as exc:
+                error_logger.debug("REST token-bucket clear after ban failed: %s", exc)
+        recovered = getattr(gov, "on_rest_ban_recovered", None)
+        if callable(recovered):
+            try:
+                recovered()
+            except Exception as exc:
+                error_logger.debug("REST governor recovery hook failed: %s", exc)
+
+    def force_hard_resubscribe(self, reason: str) -> None:
+        """Immediate teardown + clean resubscribe of miniTicker/bookTicker/klines."""
+        if not Config.WS_RECONNECT_ENABLED or not Config.ENABLE_WEBSOCKET_STREAMS:
+            return
+        self._last_reconnect_request_at = 0.0
+        with self._reconnect_lock:
+            if self._reconnect_in_progress:
+                return
+            self._reconnect_in_progress = True
+            self._last_real_ticker_at = 0.0
+        system_logger.info("[WS_HARD_RESUBSCRIBE] %s", reason)
+        threading.Thread(
+            target=self._reconnect_worker,
+            args=(reason, False, True),
+            name="ws-hard-resubscribe",
+            daemon=True,
+        ).start()
+
     # ---------------- Scan halt ----------------
 
     def halt_scanning(self, seconds: int, reason: str) -> None:
@@ -1668,6 +1868,7 @@ class MarketDataHub:
             self._scan_halt_reason = reason
 
     def is_scan_halted(self) -> tuple[bool, str]:
+        self.maybe_recover_expired_rest_ban()
         with self._lock:
             if time.monotonic() < self._scan_halted_until:
                 remaining = int(self._scan_halted_until - time.monotonic())
@@ -1902,13 +2103,47 @@ class MarketDataHub:
             self._price_tick_listeners.append(listener)
 
     def _emit_price_tick(self, symbol: str, price: float) -> None:
+        self._enqueue_listener("tick", (symbol, price))
+
+    def _emit_candle_close(self, symbol: str, interval: str, bar_open_ms: int) -> None:
+        self._enqueue_listener("close", (symbol, interval, bar_open_ms))
+
+    def _enqueue_listener(self, kind: str, payload: tuple[Any, ...]) -> None:
+        try:
+            self._listener_queue.put_nowait((kind, payload))
+        except queue.Full:
+            if self._ws_log.should_log("listener_queue_full"):
+                system_logger.debug("WS listener queue full — dropping %s event", kind)
+
+    def _listener_dispatch_loop(self) -> None:
+        """Run indicator/Telegram-adjacent callbacks off the WS event loop."""
+        while not self._listener_stop.is_set():
+            try:
+                kind, payload = self._listener_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            try:
+                if kind == "tick":
+                    symbol, price = payload
+                    self._run_price_tick_listeners(str(symbol), float(price))
+                elif kind == "close":
+                    symbol, interval, bar_open_ms = payload
+                    self._run_candle_close_listeners(
+                        str(symbol), str(interval), int(bar_open_ms)
+                    )
+            except Exception as exc:
+                error_logger.debug("WS listener dispatch error: %s", exc)
+
+    def _run_price_tick_listeners(self, symbol: str, price: float) -> None:
         for listener in list(self._price_tick_listeners):
             try:
                 listener(symbol, price)
             except Exception as exc:
                 error_logger.warning("Price tick listener error for %s: %s", symbol, exc)
 
-    def _emit_candle_close(self, symbol: str, interval: str, bar_open_ms: int) -> None:
+    def _run_candle_close_listeners(
+        self, symbol: str, interval: str, bar_open_ms: int
+    ) -> None:
         for listener in list(self._candle_close_listeners):
             try:
                 listener(symbol, interval, bar_open_ms)

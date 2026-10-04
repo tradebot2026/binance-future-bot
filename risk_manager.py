@@ -89,6 +89,7 @@ def compute_daily_pnl_metrics(
     date_str: str,
     *,
     force_wallet_refresh: bool = False,
+    allow_rest: bool = True,
 ) -> DailyPnLMetrics:
     """
     Compute today's PnL metrics.
@@ -97,7 +98,7 @@ def compute_daily_pnl_metrics(
     stats = db.get_daily_stats(date_str) or {}
     start_balance = safe_float(stats.get("start_balance"))
     current_wallet = resolve_current_wallet_balance(
-        exchange, force=force_wallet_refresh
+        exchange, force=force_wallet_refresh and allow_rest
     )
 
     equity_day_pnl = 0.0
@@ -124,7 +125,11 @@ def compute_daily_pnl_metrics(
         db_realized_pnl = safe_float(stats.get("total_pnl"))
 
     unrealized_pnl = exchange.get_unrealized_pnl_total()
-    if unrealized_pnl == 0 and exchange.get_open_positions_count() > 0:
+    if (
+        allow_rest
+        and unrealized_pnl == 0
+        and exchange.get_open_positions_count() > 0
+    ):
         unrealized_pnl = exchange.get_unrealized_pnl_total(force_refresh=True)
 
     db_total_pnl = db_realized_pnl + unrealized_pnl

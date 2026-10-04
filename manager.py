@@ -152,12 +152,8 @@ class TradeManager:
             return
         symbol = symbol.upper()
         with self._monitored_lock:
-            monitored = symbol in self._monitored_symbols
-        if not monitored:
-            if not self.db.get_open_trades_for_symbol(symbol):
+            if symbol not in self._monitored_symbols:
                 return
-            with self._monitored_lock:
-                self._monitored_symbols.add(symbol)
         with self._tick_lock:
             self._latest_ticks[symbol] = price
         self._tick_event.set()

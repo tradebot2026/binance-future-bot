@@ -19,12 +19,14 @@ def format_runtime_health_block(exchange: Any = None, scanner: Any = None) -> st
     ws_state = "UNKNOWN"
     api_state = "UNKNOWN"
     exec_state = "UNKNOWN"
-    scan_line = "n/a"
+    scan_line = "3-TIER ACTIVE" if Config.ENABLE_THREE_TIER_FUNNEL else "ACTIVE"
     open_positions = 0
     if exchange is not None:
         hub = None
         if hasattr(exchange, "get_market_data_hub"):
             hub = exchange.get_market_data_hub()
+        if hub is None:
+            hub = getattr(exchange, "_market_data", None)
         if hub is not None and hasattr(hub, "get_ws_health_snapshot"):
             snap = hub.get_ws_health_snapshot() or {}
             ws_state = str(snap.get("state", "UNKNOWN")).upper()
@@ -40,12 +42,20 @@ def format_runtime_health_block(exchange: Any = None, scanner: Any = None) -> st
             except Exception as exc:
                 error_logger.debug("Open-position count for Telegram failed: %s", exc)
     if scanner is not None and hasattr(scanner, "get_watchlist_tiers"):
-        tiers = scanner.get_watchlist_tiers()
-        scan_line = (
-            f"cycle {tiers.get('rotation_cycle', 0)} | "
-            f"evaluated {tiers.get('rotation_evaluated', 0)} | "
-            f"hot {len(tiers.get('tier1_hot') or [])}"
-        )
+        try:
+            tiers = scanner.get_watchlist_tiers() or {}
+            if Config.ENABLE_THREE_TIER_FUNNEL:
+                scan_line = "3-TIER ACTIVE"
+            else:
+                scan_line = (
+                    f"cycle {tiers.get('rotation_cycle', 0)} | "
+                    f"evaluated {tiers.get('rotation_evaluated', 0)} | "
+                    f"hot {len(tiers.get('tier1_hot') or [])}"
+                )
+        except Exception as exc:
+            error_logger.debug("Scanner tier snapshot for Telegram failed: %s", exc)
+            if Config.ENABLE_THREE_TIER_FUNNEL:
+                scan_line = "3-TIER ACTIVE"
     ledger = get_execution_ledger().recent_summary()
     queued = get_execution_ledger().queued_count()
     return (
@@ -189,6 +199,7 @@ def format_daily_status_message(
     *,
     today: Optional[str] = None,
     engine_status: str = "RUNNING",
+    scanner: Any = None,
 ) -> str:
     """Build /status reply — single cohesive daily performance summary."""
     date_str = today or utc_today_str()
@@ -197,7 +208,13 @@ def format_daily_status_message(
     pf = analytics.get("profit_factor", 0.0)
     pf_display = "∞" if pf == float("inf") else f"{pf:.2f}"
 
-    metrics = compute_daily_pnl_metrics(exchange, db, date_str, force_wallet_refresh=True)
+    metrics = compute_daily_pnl_metrics(
+        exchange,
+        db,
+        date_str,
+        force_wallet_refresh=False,
+        allow_rest=False,
+    )
     daily_start = metrics.start_balance
     day_pnl = metrics.equity_day_pnl
     daily_pct = metrics.equity_day_pnl_percent
@@ -237,7 +254,7 @@ def format_daily_status_message(
         f"🚀 <b>Entries:</b> {entries}/{Config.MAX_DAILY_TRADES} | "
         f"<b>Closes:</b> {closes}\n"
         f"⚙️ <b>Bot Status:</b> {engine_label} / {daily_status}\n"
-        f"{format_runtime_health_block(exchange)}"
+        f"{format_runtime_health_block(exchange, scanner)}"
     )
 
 
@@ -395,6 +412,7 @@ def format_watchlist_message(
     exchange: Any = None,
     super_rows: Optional[list[tuple[str, str, float]]] = None,
     lock_cycle: int = 0,
+    scanner: Any = None,
 ) -> str:
     """Format /watchlist — Normal / Hot / Super funnel."""
     lines = ["📡 <b>3-Tier Scan Funnel</b>\n"]
@@ -457,5 +475,5 @@ def format_watchlist_message(
             )
 
     _ = (tier1_hot, tier1_background, hot_scan_interval, rotation_evaluated)
-    lines.append(format_runtime_health_block(exchange))
+    lines.append(format_runtime_health_block(exchange, scanner))
     return "\n".join(lines)

@@ -136,6 +136,7 @@ class TelegramManager:
         workers = (
             ("TelegramOutbound", self._outbound_loop),
             ("TelegramCommands", self._command_loop),
+            ("TelegramCommands-2", self._command_loop),
         )
         for name, target in workers:
             if any(t.name == name and t.is_alive() for t in self._worker_threads):
@@ -158,18 +159,37 @@ class TelegramManager:
                 handler, message = self._commands.get(timeout=0.5)
             except queue.Empty:
                 continue
-            try:
-                handler(message)
-            except Exception as exc:
-                error_logger.error("Telegram command worker error: %s", exc)
+            worker = threading.Thread(
+                target=self._run_command,
+                args=(handler, message),
+                name="TelegramCommandExec",
+                daemon=True,
+            )
+            worker.start()
+            worker.join(timeout=8.0)
+            if worker.is_alive():
                 try:
                     self._reply(
                         message,
-                        "⚠️ Command failed, but Telegram is still online. "
-                        "Binance/API issues do not freeze this chat.",
+                        "⚠️ Command is still gathering data. "
+                        "Telegram stays online — try /ping or /watchlist.",
                     )
                 except Exception:
                     pass
+
+    def _run_command(self, handler: Callable[..., None], message: Any) -> None:
+        try:
+            handler(message)
+        except Exception as exc:
+            error_logger.error("Telegram command worker error: %s", exc)
+            try:
+                self._reply(
+                    message,
+                    "⚠️ Command failed, but Telegram is still online. "
+                    "Binance/API issues do not freeze this chat.",
+                )
+            except Exception:
+                pass
 
     def _send_now(self, text: str) -> None:
         if not self.enabled or self.bot is None:
@@ -200,6 +220,7 @@ class TelegramManager:
                     timeout=10,
                     long_polling_timeout=5,
                     skip_pending=True,
+                    none_stop=True,
                 )
             except Exception as exc:
                 error_logger.error(
@@ -567,22 +588,41 @@ class TelegramManager:
     def _register_handlers(self) -> None:
         assert self.bot is not None
 
-        def authorized(handler: Callable[..., None]) -> Callable[..., None]:
-            def wrapper(message: telebot.types.Message) -> None:
-                if not self._authorized(message):
-                    return
-                try:
-                    self._commands.put_nowait((handler, message))
-                except queue.Full:
-                    self._reply(
-                        message,
-                        "⚠️ Command queue busy — Telegram is still online. Retry shortly.",
-                    )
+        def authorized(
+            handler: Callable[..., None] = None,
+            *,
+            instant: bool = False,
+        ) -> Callable[..., None]:
+            def decorate(fn: Callable[..., None]) -> Callable[..., None]:
+                def wrapper(message: telebot.types.Message) -> None:
+                    if not self._authorized(message):
+                        return
+                    if instant:
+                        try:
+                            fn(message)
+                        except Exception as exc:
+                            error_logger.error("Telegram instant command error: %s", exc)
+                            self._reply(
+                                message,
+                                "⚠️ Command failed, but Telegram is still online.",
+                            )
+                        return
+                    try:
+                        self._commands.put_nowait((fn, message))
+                    except queue.Full:
+                        self._reply(
+                            message,
+                            "⚠️ Command queue busy — Telegram is still online. Retry shortly.",
+                        )
 
-            return wrapper
+                return wrapper
+
+            if handler is not None:
+                return decorate(handler)
+            return decorate
 
         @self.bot.message_handler(commands=["ping"])
-        @authorized
+        @authorized(instant=True)
         def ping_handler(message: telebot.types.Message) -> None:
             mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
             dry = " | DRY_RUN" if Config.DRY_RUN else ""
@@ -632,6 +672,7 @@ class TelegramManager:
                 stats,
                 today=today,
                 engine_status=engine_status,
+                scanner=getattr(self, "scanner", None),
             )
             self._reply(message, msg)
 
@@ -883,6 +924,7 @@ class TelegramManager:
                 exchange=self.exchange,
                 super_rows=tiers.get("super", []),
                 lock_cycle=int(tiers.get("lock_cycle") or 0),
+                scanner=scanner,
             )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"
@@ -907,7 +949,7 @@ class TelegramManager:
             self._reply(message, result)
 
         @self.bot.message_handler(commands=["help"])
-        @authorized
+        @authorized(instant=True)
         def help_handler(message: telebot.types.Message) -> None:
             self._reply(
                 message,

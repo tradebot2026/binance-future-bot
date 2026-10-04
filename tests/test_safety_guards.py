@@ -283,6 +283,64 @@ class TestRestBanDoesNotFreezeScan(unittest.TestCase):
         slept.assert_not_called()
         market_data.log_ban_pause_once.assert_called_once()
 
+    def test_wait_for_rest_unblock_recovers_when_timer_elapsed(self) -> None:
+        import main as main_mod
+
+        market_data = MagicMock()
+        market_data.is_rest_blocked.return_value = (True, "ban")
+        market_data.get_rest_block_remaining_seconds.return_value = 0
+        controller = MagicMock()
+        controller.is_shutdown_requested.return_value = False
+        blocked = main_mod._wait_for_rest_unblock(market_data, controller)
+        self.assertFalse(blocked)
+        market_data.maybe_recover_expired_rest_ban.assert_called()
+
+
+class TestTelegramStatusFormatter(unittest.TestCase):
+    def test_runtime_health_shows_three_tier_active(self) -> None:
+        from telegram_alerts import format_runtime_health_block
+
+        text = format_runtime_health_block()
+        self.assertIn("SCANNER: 3-TIER ACTIVE", text)
+        self.assertNotIn("SCANNER: n/a", text)
+
+    def test_daily_status_does_not_force_wallet_rest(self) -> None:
+        from telegram_alerts import format_daily_status_message
+
+        exchange = MagicMock()
+        exchange.get_market_data_hub.return_value = None
+        exchange.rest_usage_snapshot.return_value = {"state": "HEALTHY"}
+        exchange.get_execution_safety.return_value = ("OK", "")
+        exchange.get_all_open_positions.return_value = []
+        db = MagicMock()
+        db.get_daily_trade_analytics.return_value = {
+            "profit_factor": 1.0,
+            "win_rate": 0.0,
+            "wins": 0,
+            "losses": 0,
+            "closes": 0,
+            "total_pnl": 0.0,
+        }
+        with patch(
+            "telegram_alerts.compute_daily_pnl_metrics",
+            return_value=MagicMock(
+                start_balance=1000.0,
+                equity_day_pnl=0.0,
+                equity_day_pnl_percent=0.0,
+                current_wallet=1000.0,
+                unrealized_pnl=0.0,
+            ),
+        ) as metrics:
+            text = format_daily_status_message(
+                exchange,
+                db,
+                {"status": "ACTIVE", "entries_count": 0, "trades_count": 0},
+                today="2026-10-04",
+            )
+        self.assertIn("SCANNER: 3-TIER ACTIVE", text)
+        self.assertEqual(metrics.call_args.kwargs.get("force_wallet_refresh"), False)
+        self.assertEqual(metrics.call_args.kwargs.get("allow_rest"), False)
+
 
 class TestEnginesPackage(unittest.TestCase):
     def test_signal_engines_import_from_package(self) -> None:

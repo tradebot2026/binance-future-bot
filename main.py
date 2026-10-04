@@ -103,6 +103,9 @@ def _wait_for_rest_unblock(
 
     remaining = market_data.get_rest_block_remaining_seconds()
     if remaining <= 0:
+        recover = getattr(market_data, "maybe_recover_expired_rest_ban", None)
+        if callable(recover):
+            recover()
         return False
 
     if controller is not None and controller.is_shutdown_requested():
@@ -546,10 +549,13 @@ def _handle_loop_error(
                     )
         if market_data and not market_data.is_rest_blocked()[0]:
             _handle_loop_error._ban_alert_sent = False
-        sleep_for = max(
-            market_data.get_rest_block_remaining_seconds() if market_data else 0,
-            Config.RATE_LIMIT_HALT_SECONDS,
+        remaining = (
+            market_data.get_rest_block_remaining_seconds() if market_data else 0
         )
+        if remaining > 0:
+            sleep_for = min(float(remaining), 5.0)
+        else:
+            sleep_for = min(float(Config.RESTART_DELAY_SECONDS), 5.0)
     elif isinstance(exc, (ExchangeError, DatabaseError)):
         sleep_for = min(Config.RESTART_DELAY_SECONDS * 2, 90)
     else:

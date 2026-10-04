@@ -208,6 +208,17 @@ class TestRestUsageTracker(unittest.TestCase):
         self.assertEqual(snap["state"], "HEALTHY")
         self.assertTrue(tracker.allows_background_rest())
 
+    def test_force_clear_safety_returns_healthy_after_ip_ban(self) -> None:
+        tracker = RestUsageTracker()
+        tracker.note_http_response(SimpleNamespace(status_code=418, headers={}))
+        self.assertEqual(tracker.snapshot()["state"], "IP_BANNED")
+        self.assertTrue(tracker.in_safety_mode())
+        self.assertTrue(tracker.force_clear_safety("ban timestamp expired"))
+        snap = tracker.snapshot()
+        self.assertEqual(snap["state"], "HEALTHY")
+        self.assertFalse(tracker.in_safety_mode())
+        self.assertEqual(tracker.safety_remaining(), 0.0)
+
 
 class TestRestBlockedUsesSnapshotState(unittest.TestCase):
     def test_is_rest_blocked_does_not_use_missing_health_state(self) -> None:
@@ -244,8 +255,31 @@ class TestRestBlockedUsesSnapshotState(unittest.TestCase):
         self.assertTrue(blocked)
         self.assertIn("weight", reason.lower())
 
+    def test_hub_recovery_clears_ip_banned_to_healthy(self) -> None:
+        from exchange import BinanceExchangeManager
 
-class TestLastKnownBalanceOnRateLimit(unittest.TestCase):
+        exchange = BinanceExchangeManager.__new__(BinanceExchangeManager)
+        exchange._rest_usage = RestUsageTracker()
+        exchange._rest_usage.note_http_response(
+            SimpleNamespace(status_code=418, headers={})
+        )
+        self.assertEqual(exchange._rest_usage.snapshot()["state"], "IP_BANNED")
+        exchange._startup_ban = SimpleNamespace(is_banned=True, seconds_remaining=0)
+        exchange._ws_rest_ready = False
+        exchange._market_data = SimpleNamespace(
+            maybe_recover_expired_rest_ban=lambda: True,
+            is_rest_blocked=lambda: (False, ""),
+        )
+        exchange._rest_token_bucket = SimpleNamespace(
+            is_hard_stopped=lambda: False,
+            hard_stop_remaining=lambda: 0,
+            clear_hard_stop=lambda: None,
+        )
+        blocked, _reason = exchange.is_rest_blocked()
+        self.assertFalse(blocked)
+        self.assertEqual(exchange._rest_usage.snapshot()["state"], "HEALTHY")
+        self.assertTrue(exchange._ws_rest_ready)
+        self.assertFalse(exchange._startup_ban.is_banned)
     def test_fallback_keeps_expired_cache_on_rate_limit(self) -> None:
         from exchange import AccountRestCache, BalanceCache, BinanceExchangeManager
 

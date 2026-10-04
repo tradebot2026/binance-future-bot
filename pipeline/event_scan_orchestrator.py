@@ -99,8 +99,8 @@ class EventScanOrchestrator:
         self._kline_cache_misses = self._kline_cache_misses[n:]
         return taken
 
-    def _log_kline_warmup_pending(self, symbol: str) -> None:
-        """Rate-limited notice — not SCAN_REJECTED. Cache is warming, not a setup fail."""
+    def _log_kline_bootstrap_pending(self, symbol: str) -> None:
+        """Rate-limited notice — not SCAN_REJECTED. Cache is bootstrapping, not a setup fail."""
         key = str(symbol or "").upper()
         if not key:
             return
@@ -110,7 +110,7 @@ class EventScanOrchestrator:
             return
         self._kline_pending_log_at[key] = now
         scanner_logger.info(
-            "[SCAN_KLINE_WARMUP] %s — snapshot deferred, REST/WS kline bootstrap queued",
+            "[SCAN_KLINE_BOOTSTRAP] %s — snapshot deferred, REST/WS kline bootstrap queued",
             key,
         )
 
@@ -137,7 +137,7 @@ class EventScanOrchestrator:
     ) -> None:
         for symbol in symbols:
             self.note_kline_cache_miss(symbol)
-            self._log_kline_warmup_pending(symbol)
+            self._log_kline_bootstrap_pending(symbol)
             event = (events or {}).get(symbol)
             if event is not None:
                 self.event_scheduler.requeue(event, delay_seconds=2.0)
@@ -269,14 +269,14 @@ class EventScanOrchestrator:
                 )
         except Exception as exc:
             scanner_logger.warning(
-                "[SCAN_KLINE_WARMUP] %s REST populate failed — %s",
+                "[SCAN_KLINE_BOOTSTRAP] %s REST populate failed — %s",
                 target,
                 exc,
             )
             return 0
         if seeded:
             scanner_logger.info(
-                "[SCAN_KLINE_WARMUP] %s populated %s series (limit=%s).",
+                "[SCAN_KLINE_BOOTSTRAP] %s populated %s series (limit=%s).",
                 target,
                 seeded,
                 Config.warmup_kline_fetch_limit(),
@@ -876,7 +876,7 @@ class EventScanOrchestrator:
         snapshot = self._build_eval_snapshot(symbol, ticker_map, book_map)
         if snapshot is None:
             self.note_kline_cache_miss(symbol)
-            self._log_kline_warmup_pending(symbol)
+            self._log_kline_bootstrap_pending(symbol)
             return []
         bar_open_ms = 0
         if self._hub:
@@ -1161,7 +1161,7 @@ class EventScanOrchestrator:
         )
         if snapshot is None:
             self.note_kline_cache_miss(symbol)
-            self._log_kline_warmup_pending(symbol)
+            self._log_kline_bootstrap_pending(symbol)
             if mark_event is not None:
                 self.event_scheduler.requeue(mark_event, delay_seconds=2.0)
             return None

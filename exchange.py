@@ -516,6 +516,27 @@ class BinanceExchangeManager:
     def get_startup_ban_status(self) -> Any:
         return getattr(self, "_startup_ban", None)
 
+    def on_rest_ban_recovered(self) -> None:
+        """Clear leftover REST client halt flags after the ban timestamp expires."""
+        usage = getattr(self, "_rest_usage", None)
+        clearer = getattr(usage, "force_clear_safety", None)
+        if callable(clearer):
+            clearer("ban timestamp expired")
+        bucket = getattr(self, "_rest_token_bucket", None)
+        bucket_clear = getattr(bucket, "clear_hard_stop", None)
+        if callable(bucket_clear):
+            bucket_clear()
+        ban = getattr(self, "_startup_ban", None)
+        if ban is not None and getattr(ban, "is_banned", False):
+            remaining = int(getattr(ban, "seconds_remaining", 0) or 0)
+            if remaining <= 0:
+                ban.is_banned = False
+                ban.message = "ban window expired"
+        self.mark_ws_rest_ready()
+        system_logger.info(
+            "[API_HEALTH] HEALTHY | REST client unblocked after ban expiry"
+        )
+
     def ensure_initialized(self) -> bool:
         """Run deferred REST init (account mode + symbol rules) once API is reachable."""
         if self._full_init_done:
@@ -527,8 +548,13 @@ class BinanceExchangeManager:
             return False
 
         ban = self.get_startup_ban_status()
-        if ban and ban.is_banned:
-            return False
+        if ban and getattr(ban, "is_banned", False):
+            remaining = int(getattr(ban, "seconds_remaining", 0) or 0)
+            if remaining > 0:
+                return False
+            if self._market_data and self._market_data.is_rest_blocked()[0]:
+                return False
+            ban.is_banned = False
 
         self._init_rest_pause()
         self._configure_account()
@@ -718,6 +744,10 @@ class BinanceExchangeManager:
     def is_rest_blocked(self) -> tuple[bool, str]:
         """True when REST must not be attempted (IP ban / hard-stop)."""
         try:
+            hub = self._market_data
+            recover = getattr(hub, "maybe_recover_expired_rest_ban", None) if hub else None
+            if callable(recover) and recover() is True:
+                self.on_rest_ban_recovered()
             usage = self._rest_usage
             in_safety = bool(getattr(usage, "in_safety_mode", lambda: False)())
             if in_safety:

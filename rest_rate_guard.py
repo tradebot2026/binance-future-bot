@@ -219,6 +219,23 @@ class RestUsageTracker:
         with self._lock:
             return max(self._safety_until - time.monotonic(), 0.0)
 
+    def force_clear_safety(self, reason: str = "ban timestamp expired") -> bool:
+        """Strictly clear IP_BANNED / API_RATE_LIMITED so REST can resume."""
+        with self._lock:
+            was_halted = self._state in {
+                ApiHealthState.API_RATE_LIMITED,
+                ApiHealthState.IP_BANNED,
+            } or self._safety_until > 0
+            if not was_halted:
+                return False
+            self._safety_until = 0.0
+            self._retry_after_seconds = 0.0
+            self._last_error_code = 0
+            self._state = ApiHealthState.HEALTHY
+            self._reason = (reason or "ban window expired")[:200]
+            self._log_state_locked(len(self._window), Config.rest_ip_request_limit())
+            return True
+
     def weight_throttle_remaining(self) -> float:
         with self._lock:
             return max(self._weight_throttle_until - time.monotonic(), 0.0)
@@ -462,6 +479,13 @@ class RestTokenBucket:
 
     def is_hard_stopped(self) -> bool:
         return self.hard_stop_remaining() > 0.0
+
+    def clear_hard_stop(self) -> None:
+        """Release a leftover REST hard-stop after the ban window expires."""
+        with self._lock:
+            self._hard_stop_until = 0.0
+            self._tokens = self._capacity
+            self._last_refill = time.monotonic()
 
     def acquire(self, weight: int = 1) -> None:
         """Block until `weight` tokens are available (never spin-retry on ban)."""
