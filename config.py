@@ -879,6 +879,16 @@ class Config:
         return float(cls.scan_cycle_symbol_count()) * cls.scan_symbol_delay_seconds()
 
     @classmethod
+    def normal_tier_ingest_interval_seconds(cls) -> float:
+        """Seconds between Normal ingest/scan slots (2/min → 30s)."""
+        return 60.0 / max(int(cls.NORMAL_TIER_COINS_PER_MINUTE), 1)
+
+    @classmethod
+    def normal_tier_passes_per_lock(cls) -> int:
+        """Full Normal rotations inside one lock window (3h → 3 passes)."""
+        return max(int(round(float(cls.NORMAL_TIER_LOCK_HOURS))), 1)
+
+    @classmethod
     def hot_scan_interval_seconds(cls) -> float:
         """Hot-tier cadence — 1 coin per minute in the 3-tier funnel."""
         if cls.ENABLE_THREE_TIER_FUNNEL:

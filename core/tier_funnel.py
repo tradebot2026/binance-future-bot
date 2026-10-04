@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import math
+import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
@@ -38,18 +41,29 @@ class SuperRecord:
 
 class TierFunnel:
     """
-    Normal: 120-coin lock for 3 hours, 2 coins/min, lightweight scores.
-    Hot: promoted coins, 1 coin/min, 1 REST history fetch/min via validator.
-    Super: 1 coin/min precise setup; execution is gated separately (4 orders/min).
+    Normal: paced ingest of 2 coins/min (1 every 30s) up to a 120-coin
+    candidate lock, then 3 scan passes over 3 hours. Newest scan sits at
+    the front of recently_scanned_queue. Hot/Super stay across flushes.
     """
 
     def __init__(self, *, notify: Optional[NotifyFn] = None) -> None:
         self._notify = notify
+        self._candidates: list[str] = []
         self._normal: list[str] = []
         self._demoted_hold: list[str] = []
         self._normal_index: int = 0
+        self._ingest_index: int = 0
         self._lock_started: float = 0.0
         self._lock_cycle: int = 0
+        self._pass_number: int = 1
+        self._scans_this_window: int = 0
+        self._current_index: int = 0
+        self._current_symbol: str = ""
+        self._last_normal_take: float = 0.0
+        self._last_flushed: list[str] = []
+        self._recently_scanned: deque[str] = deque(
+            maxlen=max(int(Config.NORMAL_TIER_UNIVERSE_SIZE), 1)
+        )
         self._hot: dict[str, HotRecord] = {}
         self._hot_order: list[str] = []
         self._hot_index: int = 0
@@ -65,6 +79,38 @@ class TierFunnel:
     @property
     def normal_symbols(self) -> list[str]:
         return list(self._normal)
+
+    @property
+    def candidate_symbols(self) -> list[str]:
+        return list(self._candidates)
+
+    @property
+    def has_candidate_universe(self) -> bool:
+        return bool(self._candidates)
+
+    @property
+    def recently_scanned(self) -> list[str]:
+        return list(self._recently_scanned)
+
+    @property
+    def pass_number(self) -> int:
+        return int(self._pass_number)
+
+    @property
+    def current_index(self) -> int:
+        return int(self._current_index)
+
+    @property
+    def current_symbol(self) -> str:
+        return self._current_symbol
+
+    @property
+    def ingested_count(self) -> int:
+        return len(self._normal)
+
+    @property
+    def last_flushed(self) -> list[str]:
+        return list(self._last_flushed)
 
     @property
     def hot_symbols(self) -> list[str]:
@@ -84,36 +130,95 @@ class TierFunnel:
         return max(now - self._lock_started, 0.0)
 
     def lock_expired(self, now: float) -> bool:
-        hours = max(float(Config.NORMAL_TIER_LOCK_HOURS), 0.25)
-        if not self._normal:
+        if not self._candidates and self._lock_started <= 0:
             return True
+        if self._lock_started <= 0:
+            return True
+        passes = max(int(Config.normal_tier_passes_per_lock()), 1)
+        universe = max(len(self._candidates), 1)
+        if self._candidates and self._scans_this_window >= passes * universe:
+            return True
+        hours = max(float(Config.NORMAL_TIER_LOCK_HOURS), 0.25)
         return self.lock_age_seconds(now) >= hours * 3600.0
 
-    def replace_normal_universe(self, symbols: list[str], *, now: float) -> list[str]:
-        """Flush Normal memory and lock a new top-N set for the 3-hour cycle."""
-        cap = max(int(Config.NORMAL_TIER_UNIVERSE_SIZE), 1)
+    def flush_minutes_remaining(self, now: float) -> int:
+        hours = max(float(Config.NORMAL_TIER_LOCK_HOURS), 0.25)
+        remaining = max(hours * 3600.0 - self.lock_age_seconds(now), 0.0)
+        if self.lock_expired(now):
+            return 0
+        return int(math.ceil(remaining / 60.0))
+
+    def flush_non_setup(self, *, keep: Optional[set[str]] = None) -> list[str]:
+        """Wipe Normal/candidate memory; keep Hot, Super, and active symbols."""
+        keep_keys = {str(s).upper() for s in (keep or set()) if s}
+        keep_keys.update(self._hot)
+        keep_keys.update(self._super)
+        outgoing: list[str] = []
         seen: set[str] = set()
-        locked: list[str] = []
-        for raw in symbols:
-            key = str(raw or "").upper()
-            if not key or key in seen:
+        for raw in self._normal + self._demoted_hold + self._candidates:
+            key = str(raw).upper()
+            if not key or key in keep_keys or key in seen:
                 continue
             seen.add(key)
-            locked.append(key)
-            if len(locked) >= cap:
+            outgoing.append(key)
+        self._normal = [s for s in self._normal if s in keep_keys]
+        self._demoted_hold = [s for s in self._demoted_hold if s in keep_keys]
+        self._candidates = []
+        self._ingest_index = 0
+        self._normal_index = 0
+        self._scans_this_window = 0
+        self._pass_number = 1
+        self._current_index = 0
+        self._current_symbol = ""
+        self._last_normal_take = 0.0
+        self._last_flushed = list(outgoing)
+        self._recently_scanned.clear()
+        if outgoing:
+            scanner_logger.info(
+                "[TIER_NORMAL] flushed %s non-setup symbol(s); kept hot=%s super=%s.",
+                len(outgoing),
+                len(self._hot),
+                len(self._super),
+            )
+        return list(outgoing)
+
+    def replace_normal_universe(
+        self,
+        symbols: list[str],
+        *,
+        now: float,
+        keep: Optional[set[str]] = None,
+    ) -> list[str]:
+        """Seed a fresh top-N candidate pool. Ingest happens at 2 coins/min."""
+        self.flush_non_setup(keep=keep)
+        cap = max(int(Config.NORMAL_TIER_UNIVERSE_SIZE), 1)
+        blocked = set(self._hot) | set(self._super)
+        seen: set[str] = set()
+        candidates: list[str] = []
+        for raw in symbols:
+            key = str(raw or "").upper()
+            if not key or key in seen or key in blocked:
+                continue
+            seen.add(key)
+            candidates.append(key)
+            if len(candidates) >= cap:
                 break
-        self._normal = locked
-        self._demoted_hold = []
+        self._candidates = candidates
+        self._ingest_index = 0
         self._normal_index = 0
         self._lock_started = now
         self._lock_cycle += 1
+        self._pass_number = 1
+        self._scans_this_window = 0
+        self._recently_scanned = deque(maxlen=cap)
         scanner_logger.info(
-            "[TIER_NORMAL] locked %s symbols for %.1fh (cycle=%s).",
-            len(self._normal),
+            "[TIER_NORMAL] seeded %s candidates for %.1fh paced ingest "
+            "(2 coins/min, cycle=%s). Scan queue starts empty.",
+            len(self._candidates),
             Config.NORMAL_TIER_LOCK_HOURS,
             self._lock_cycle,
         )
-        return list(self._normal)
+        return list(self._candidates)
 
     def is_in_hot(self, symbol: str) -> bool:
         return str(symbol).upper() in self._hot
@@ -138,21 +243,87 @@ class TierFunnel:
         return out
 
     def take_normal(self, now: float | None = None) -> list[str]:
+        stamp = time.monotonic() if now is None else now
+        if self.lock_expired(stamp):
+            return []
+        interval = Config.normal_tier_ingest_interval_seconds()
+        if self._last_normal_take > 0 and (stamp - self._last_normal_take) < interval:
+            return []
+        if self._normal_clock.take(1, now=stamp) < 1:
+            return []
+        symbol = self._next_normal_symbol()
+        if not symbol:
+            return []
+        self._last_normal_take = stamp
+        self._note_scanned(symbol)
+        return [symbol]
+
+    def _next_normal_symbol(self) -> str:
+        if self._ingest_index < len(self._candidates):
+            ingested = self._ingest_one()
+            if ingested:
+                return ingested
         pool = self.scan_pool()
         if not pool:
-            return []
-        n = self._normal_clock.take(Config.NORMAL_TIER_COINS_PER_MINUTE, now=now)
-        if n <= 0:
-            return []
-        taken: list[str] = []
-        for _ in range(n):
-            if self._normal_index >= len(pool):
-                self._normal_index = 0
-            if not pool:
-                break
-            taken.append(pool[self._normal_index % len(pool)])
-            self._normal_index = (self._normal_index + 1) % max(len(pool), 1)
-        return taken
+            return ""
+        if self._normal_index >= len(pool):
+            self._normal_index = 0
+        symbol = pool[self._normal_index % len(pool)]
+        self._normal_index = (self._normal_index + 1) % max(len(pool), 1)
+        return symbol
+
+    def _ingest_one(self) -> str:
+        blocked = set(self._hot) | set(self._super)
+        while self._ingest_index < len(self._candidates):
+            key = self._candidates[self._ingest_index]
+            self._ingest_index += 1
+            if not key or key in blocked:
+                continue
+            if key not in self._normal:
+                self._normal.append(key)
+            return key
+        return ""
+
+    def _scan_universe_size(self) -> int:
+        if self._candidates:
+            return max(len(self._candidates), 1)
+        return max(int(Config.NORMAL_TIER_UNIVERSE_SIZE), 1)
+
+    def _note_scanned(self, symbol: str) -> None:
+        key = str(symbol).upper()
+        if not key:
+            return
+        cap = self._recently_scanned.maxlen or max(
+            int(Config.NORMAL_TIER_UNIVERSE_SIZE), 1
+        )
+        self._recently_scanned = deque(
+            [key, *[s for s in self._recently_scanned if s != key]],
+            maxlen=cap,
+        )
+        self._current_symbol = key
+        self._scans_this_window += 1
+        universe = self._scan_universe_size()
+        self._current_index = ((self._scans_this_window - 1) % universe) + 1
+        passes = max(int(Config.normal_tier_passes_per_lock()), 1)
+        self._pass_number = min(
+            passes,
+            ((self._scans_this_window - 1) // universe) + 1,
+        )
+
+    def watchlist_snapshot(self, now: float | None = None) -> dict[str, Any]:
+        stamp = time.monotonic() if now is None else now
+        universe = max(self._scan_universe_size(), int(Config.NORMAL_TIER_UNIVERSE_SIZE))
+        return {
+            "pass_number": self._pass_number,
+            "passes_total": max(int(Config.normal_tier_passes_per_lock()), 1),
+            "current_index": self._current_index,
+            "universe_size": universe,
+            "ingested_count": len(self._normal),
+            "currently_scanning": self._current_symbol,
+            "recently_scanned": list(self._recently_scanned),
+            "flush_minutes": self.flush_minutes_remaining(stamp),
+            "lock_cycle": self._lock_cycle,
+        }
 
     def take_hot_for_rest(self, now: float | None = None) -> Optional[HotRecord]:
         """One Hot coin per minute that still needs the REST backtest fetch."""

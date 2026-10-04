@@ -301,7 +301,7 @@ class TestTelegramStatusFormatter(unittest.TestCase):
         from telegram_alerts import format_runtime_health_block
 
         text = format_runtime_health_block()
-        self.assertIn("SCANNER: 3-TIER ACTIVE", text)
+        self.assertIn("SCANNER: DYNAMIC 2-COIN/MIN ACTIVE", text)
         self.assertNotIn("SCANNER: n/a", text)
 
     def test_daily_status_does_not_force_wallet_rest(self) -> None:
@@ -337,7 +337,7 @@ class TestTelegramStatusFormatter(unittest.TestCase):
                 {"status": "ACTIVE", "entries_count": 0, "trades_count": 0},
                 today="2026-10-04",
             )
-        self.assertIn("SCANNER: 3-TIER ACTIVE", text)
+        self.assertIn("SCANNER: DYNAMIC 2-COIN/MIN ACTIVE", text)
         self.assertEqual(metrics.call_args.kwargs.get("force_wallet_refresh"), False)
         self.assertEqual(metrics.call_args.kwargs.get("allow_rest"), False)
 

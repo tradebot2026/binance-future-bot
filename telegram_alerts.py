@@ -14,12 +14,21 @@ from logger import error_logger
 from utils import escape_html, safe_float, utc_today_str
 
 
-def format_runtime_health_block(exchange: Any = None, scanner: Any = None) -> str:
-    """Compact WS/API/scanner/execution lines for /status and /watchlist."""
+def format_runtime_health_block(
+    exchange: Any = None,
+    scanner: Any = None,
+    *,
+    compact: bool = False,
+) -> str:
+    """WS/API/scanner/execution lines for /status and /watchlist."""
     ws_state = "UNKNOWN"
     api_state = "UNKNOWN"
     exec_state = "UNKNOWN"
-    scan_line = "3-TIER ACTIVE" if Config.ENABLE_THREE_TIER_FUNNEL else "ACTIVE"
+    scan_line = (
+        "DYNAMIC 2-COIN/MIN ACTIVE"
+        if Config.ENABLE_THREE_TIER_FUNNEL
+        else "ACTIVE"
+    )
     open_positions = 0
     if exchange is not None:
         hub = None
@@ -45,7 +54,7 @@ def format_runtime_health_block(exchange: Any = None, scanner: Any = None) -> st
         try:
             tiers = scanner.get_watchlist_tiers() or {}
             if Config.ENABLE_THREE_TIER_FUNNEL:
-                scan_line = "3-TIER ACTIVE"
+                scan_line = "DYNAMIC 2-COIN/MIN ACTIVE"
             else:
                 scan_line = (
                     f"cycle {tiers.get('rotation_cycle', 0)} | "
@@ -55,9 +64,16 @@ def format_runtime_health_block(exchange: Any = None, scanner: Any = None) -> st
         except Exception as exc:
             error_logger.debug("Scanner tier snapshot for Telegram failed: %s", exc)
             if Config.ENABLE_THREE_TIER_FUNNEL:
-                scan_line = "3-TIER ACTIVE"
+                scan_line = "DYNAMIC 2-COIN/MIN ACTIVE"
     ledger = get_execution_ledger().recent_summary()
     queued = get_execution_ledger().queued_count()
+    if compact:
+        return (
+            f"\n🤖 <b>RUNTIME STATUS:</b>\n"
+            f"WS: {escape_html(ws_state)} | API: {escape_html(api_state)}\n"
+            f"RATE LIMIT: {escape_html(api_state)}\n"
+            f"SCANNER: {escape_html(scan_line)}"
+        )
     return (
         f"\n🛰 <b>RUNTIME</b>\n"
         f"WS: {escape_html(ws_state)} | API: {escape_html(api_state)}\n"
@@ -413,31 +429,47 @@ def format_watchlist_message(
     super_rows: Optional[list[tuple[str, str, float]]] = None,
     lock_cycle: int = 0,
     scanner: Any = None,
+    pass_number: int = 1,
+    passes_total: int = 3,
+    current_index: int = 0,
+    universe_size: int = 120,
+    ingested_count: int = 0,
+    currently_scanning: str = "",
+    recently_scanned: Optional[list[str]] = None,
+    flush_minutes: int = 180,
 ) -> str:
-    """Format /watchlist — Normal / Hot / Super funnel."""
-    lines = ["📡 <b>3-Tier Scan Funnel</b>\n"]
-    if lock_cycle or rotation_cycle:
-        lines.append(
-            f"🔄 <b>Normal lock cycle:</b> {lock_cycle or rotation_cycle} "
-            f"| 3h universe {len(tier1_full)}"
-        )
+    """Format /watchlist — paced Normal ingest plus Hot / Super."""
+    universe = max(int(universe_size or Config.NORMAL_TIER_UNIVERSE_SIZE), 1)
+    ingested = int(ingested_count or 0)
+    recent = list(recently_scanned or tier1_full or [])
+    scanning = str(currently_scanning or "").upper()
+    if not scanning and recent:
+        scanning = str(recent[0]).upper()
+    index = int(current_index or 0)
+    pass_n = max(int(pass_number or 1), 1)
+    pass_total = max(int(passes_total or 3), 1)
+    flush_m = max(int(flush_minutes or 0), 0)
 
-    lines.append(
-        f"📋 <b>Normal Tier</b> ({len(tier1_full)}) "
-        f"<i>2 coins/min · 3h lock</i>"
-    )
-    if tier1_full:
-        preview = ", ".join(escape_html(s) for s in tier1_full[:20])
-        if len(tier1_full) > 20:
-            preview += f" … +{len(tier1_full) - 20} more"
-        lines.append(preview)
+    lines = [
+        "📡 <b>3-Tier Dynamic Scan Funnel</b>",
+        "─────────────────────────────────",
+        f"🔄 Scan Window: Pass {pass_n} of {pass_total} | 3h Flush in {flush_m} mins",
+        f"🎯 Currently Scanning: [#{index}/{universe}] {escape_html(scanning) or '—'}",
+        "",
+        f"🌐 <b>Normal Tier</b> ({ingested}/{universe}) • 2 coins/min",
+    ]
+    if recent:
+        for i, symbol in enumerate(recent[:10], start=1):
+            marker = " 👈 (Just Scanned)" if i == 1 else ""
+            lines.append(f"{i}. {escape_html(symbol)}{marker}")
+        remaining = max(ingested - min(len(recent), 10), 0) + max(universe - ingested, 0)
+        if remaining > 0:
+            lines.append(f"+ {remaining} more queued")
     else:
-        lines.append("<i>Universe not locked yet.</i>")
+        lines.append("<i>Waiting for first 30s ingest…</i>")
 
-    lines.append(
-        f"\n🔥 <b>Hot Tier</b> ({len(tier2_rows)}) "
-        f"<i>1 coin/min · 450–600 bar backtest</i>"
-    )
+    lines.append("")
+    lines.append(f"🔥 <b>Hot Tier</b> ({len(tier2_rows)}) • 1 coin/min")
     if tier2_rows:
         for sym, strat, score in tier2_rows[:tier2_display_limit]:
             lines.append(
@@ -445,13 +477,11 @@ def format_watchlist_message(
                 f"| {score:.0f}"
             )
     else:
-        lines.append("<i>No Hot promotions yet.</i>")
+        lines.append("<i>No Hot promotions yet</i>")
 
     super_list = super_rows or []
-    lines.append(
-        f"\n⭐ <b>Super Tier</b> ({len(super_list)}) "
-        f"<i>1 coin/min · local TP/SL</i>"
-    )
+    lines.append("")
+    lines.append(f"⭐ <b>Super Tier</b> ({len(super_list)}) • Local TP/SL")
     if super_list:
         for sym, strat, score in super_list[:12]:
             lines.append(
@@ -459,21 +489,16 @@ def format_watchlist_message(
                 f"| {score:.0f}"
             )
     else:
-        lines.append("<i>No Super setups ready.</i>")
+        lines.append("<i>No Super setups ready</i>")
 
-    near_miss = tier2_near_miss or []
-    if near_miss and not tier2_rows:
-        lines.append(f"\n📊 <b>Recent Normal scores (not yet promoted)</b>")
-        for row in near_miss[:8]:
-            if len(row) >= 4:
-                sym, strat, norm, raw = row[0], row[1], row[2], row[3]
-            else:
-                continue
-            lines.append(
-                f"• {escape_html(sym)} | {escape_html(strategy_display_label(strat))} "
-                f"| raw={raw:.1f}"
-            )
-
-    _ = (tier1_hot, tier1_background, hot_scan_interval, rotation_evaluated)
-    lines.append(format_runtime_health_block(exchange, scanner))
+    _ = (
+        tier1_hot,
+        tier1_background,
+        hot_scan_interval,
+        rotation_cycle,
+        rotation_evaluated,
+        lock_cycle,
+        tier2_near_miss,
+    )
+    lines.append(format_runtime_health_block(exchange, scanner, compact=True))
     return "\n".join(lines)

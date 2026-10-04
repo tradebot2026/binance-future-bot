@@ -82,6 +82,24 @@ class EventScanOrchestrator:
         if callable(send):
             send(text)
 
+    def _seed_funnel_universe(self, now: float) -> None:
+        """Flush inactive Normal memory, seed candidates, GC flushed kline streams."""
+        keep = self._open_symbols()
+        self.funnel.replace_normal_universe(self._tier1_symbols, now=now, keep=keep)
+        self._gc_flushed_klines(self.funnel.last_flushed)
+
+    def _gc_flushed_klines(self, symbols: list[str]) -> None:
+        if not symbols or self._hub is None:
+            return
+        batch = getattr(self._hub, "demote_symbols_klines", None)
+        if callable(batch):
+            batch(symbols)
+            return
+        for symbol in symbols:
+            drop = getattr(self._hub, "demote_symbol_klines", None)
+            if callable(drop):
+                drop(symbol)
+
     @property
     def tier1_symbols(self) -> list[str]:
         return list(self._tier1_symbols)
@@ -480,8 +498,8 @@ class EventScanOrchestrator:
         self._tier1_symbols = universe.symbols[:pool_cap]
         if Config.ENABLE_THREE_TIER_FUNNEL:
             now_lock = time.monotonic()
-            if self.funnel.lock_expired(now_lock) or not self.funnel.normal_symbols:
-                self.funnel.replace_normal_universe(self._tier1_symbols, now=now_lock)
+            if self.funnel.lock_expired(now_lock) or not self.funnel.has_candidate_universe:
+                self._seed_funnel_universe(now_lock)
         trigger_scores = dict(universe.opportunity_scores)
         for sym, score in self.assignment_manager._last_best.items():
             trigger_scores.setdefault(sym, score.normalized_score)
@@ -497,7 +515,16 @@ class EventScanOrchestrator:
         self._last_universe_refresh_at = now
 
         if self._hub and self._tier1_symbols:
-            self._hub.subscribe_kline_streams(self._tier1_symbols)
+            if Config.ENABLE_THREE_TIER_FUNNEL:
+                live = (
+                    self.funnel.normal_symbols
+                    + self.funnel.hot_symbols
+                    + self.funnel.super_symbols
+                )
+                if live:
+                    self._hub.subscribe_kline_streams(live)
+            else:
+                self._hub.subscribe_kline_streams(self._tier1_symbols)
 
         scanner_logger.info(
             "Tier1 watchlist refreshed — pool=%s priority=%s rotating=%s "
@@ -613,7 +640,7 @@ class EventScanOrchestrator:
 
     def process_priority_scan_cycle(self) -> list[dict[str, Any]]:
         """
-        3-tier funnel tick: 2 Normal coins/min, 1 Hot REST/min, 1 Super eval/min.
+        3-tier funnel tick: 1 Normal coin / 30s (2/min), 1 Hot REST/min, 1 Super eval/min.
         Only Super-tier candidates are returned for execution.
         Normal/Hot always tick (even when entries are paused or REST is banned).
         """
@@ -626,7 +653,7 @@ class EventScanOrchestrator:
                 return []
 
         if funnel_on and rest_blocked:
-            if not self._tier1_symbols and not self.funnel.normal_symbols:
+            if not self._tier1_symbols and not self.funnel.has_candidate_universe:
                 self._log_empty_universe()
         else:
             self.maybe_refresh_tier1_periodic()
@@ -648,8 +675,14 @@ class EventScanOrchestrator:
 
     def _process_funnel_cycle(self) -> list[dict[str, Any]]:
         now = time.monotonic()
-        if not self.funnel.normal_symbols and self._tier1_symbols:
-            self.funnel.replace_normal_universe(self._tier1_symbols, now=now)
+        if (
+            self._tier1_symbols
+            and (
+                self.funnel.lock_expired(now)
+                or not self.funnel.has_candidate_universe
+            )
+        ):
+            self._seed_funnel_universe(now)
 
         open_symbols = self._open_symbols()
         ticker_map = self._ws_ticker_map()
@@ -658,6 +691,8 @@ class EventScanOrchestrator:
         primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
 
         normal_due = self.funnel.take_normal(now=now)
+        if normal_due and self._hub:
+            self._hub.subscribe_kline_streams(normal_due)
         ready, missing = self._partition_kline_ready(normal_due)
         self._note_missing_scan_klines(missing)
         for symbol in ready:
@@ -725,7 +760,7 @@ class EventScanOrchestrator:
                 len(self.funnel.hot_symbols),
                 len(self.funnel.super_symbols),
             )
-        elif not self.funnel.normal_symbols and not self._tier1_symbols:
+        elif not self.funnel.has_candidate_universe and not self._tier1_symbols:
             self._log_empty_universe()
         else:
             self._log_zero_candidates_quiet(

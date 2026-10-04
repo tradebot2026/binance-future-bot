@@ -925,6 +925,14 @@ class TelegramManager:
                 super_rows=tiers.get("super", []),
                 lock_cycle=int(tiers.get("lock_cycle") or 0),
                 scanner=scanner,
+                pass_number=int(tiers.get("pass_number") or 1),
+                passes_total=int(tiers.get("passes_total") or 3),
+                current_index=int(tiers.get("current_index") or 0),
+                universe_size=int(tiers.get("universe_size") or 120),
+                ingested_count=int(tiers.get("ingested_count") or 0),
+                currently_scanning=str(tiers.get("currently_scanning") or ""),
+                recently_scanned=list(tiers.get("recently_scanned") or []),
+                flush_minutes=int(tiers.get("flush_minutes") or 0),
             )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"
@@ -968,7 +976,7 @@ class TelegramManager:
                 f"{int(Config.TELEGRAM_ERROR_LOG_MAX_AGE_HOURS)} hours\n"
                 "/balance — live futures balance\n"
                 "/active — open positions (DB + Binance REST)\n"
-                "/watchlist — Normal / Hot / Super funnel\n"
+                "/watchlist — 3-tier dynamic scan funnel\n"
                 "/health — system diagnostics (alias /pulse)\n"
                 "/testtrade SYMBOL — Testnet min-size market order (REST price)\n"
                 "/ping — quick online check\n"

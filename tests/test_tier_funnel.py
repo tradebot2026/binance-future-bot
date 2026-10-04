@@ -64,16 +64,106 @@ class TestTierFunnel(unittest.TestCase):
     def test_normal_lock_and_two_coins_per_minute(self) -> None:
         funnel = TierFunnel()
         symbols = [f"S{i:03d}USDT" for i in range(120)]
-        locked = funnel.replace_normal_universe(symbols, now=10.0)
-        self.assertEqual(len(locked), 120)
+        seeded = funnel.replace_normal_universe(symbols, now=10.0)
+        self.assertEqual(len(seeded), 120)
+        self.assertEqual(funnel.normal_symbols, [])
         first = funnel.take_normal(now=10.0)
-        self.assertEqual(len(first), 2)
+        self.assertEqual(first, ["S000USDT"])
+        self.assertEqual(funnel.normal_symbols, ["S000USDT"])
         self.assertEqual(funnel.take_normal(now=20.0), [])
+        second = funnel.take_normal(now=40.0)
+        self.assertEqual(second, ["S001USDT"])
+        self.assertEqual(funnel.recently_scanned[0], "S001USDT")
+        self.assertEqual(funnel.take_normal(now=50.0), [])
         later = funnel.take_normal(now=70.0)
-        self.assertEqual(len(later), 2)
-        self.assertNotEqual(first, later)
+        self.assertEqual(later, ["S002USDT"])
+        self.assertEqual(funnel.ingested_count, 3)
+        self.assertEqual(funnel.current_index, 3)
+        self.assertEqual(funnel.pass_number, 1)
         self.assertFalse(funnel.lock_expired(10.0 + 3 * 3600.0 - 1))
         self.assertTrue(funnel.lock_expired(10.0 + 3 * 3600.0))
+
+    def test_three_passes_flush_keeps_hot(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["AAAUSDT", "BBBUSDT"], now=1.0)
+        t = 1.0
+        last = ""
+        for _ in range(6):
+            got = funnel.take_normal(now=t)
+            self.assertEqual(len(got), 1)
+            last = got[0]
+            t += 30.0
+        self.assertEqual(funnel.recently_scanned[0], last)
+        self.assertEqual(funnel.pass_number, 3)
+        self.assertTrue(funnel.lock_expired(t))
+        funnel.promote_from_normal("AAAUSDT", [_score("AAAUSDT", "SMC_TREND", 72.0)])
+        flushed = funnel.flush_non_setup()
+        self.assertIn("AAAUSDT", funnel.hot_symbols)
+        self.assertFalse(funnel.has_candidate_universe)
+        self.assertNotIn("BBBUSDT", funnel.normal_symbols)
+        self.assertIn("BBBUSDT", flushed)
+        self.assertNotIn("AAAUSDT", flushed)
+        self.assertEqual(funnel.last_flushed, flushed)
+
+    def test_hub_batch_kline_gc_rebuilds_once(self) -> None:
+        import threading
+        from collections import deque
+
+        from market_data_hub import MarketDataHub
+
+        hub = MarketDataHub.__new__(MarketDataHub)
+        hub._lock = threading.RLock()
+        hub._subscribed_kline_streams = {
+            "btcusdt@kline_5m",
+            "ethusdt@kline_5m",
+            "solusdt@kline_5m",
+        }
+        hub._kline_bars = {
+            ("BTCUSDT", "5m"): deque(),
+            ("ETHUSDT", "5m"): deque(),
+            ("SOLUSDT", "5m"): deque(),
+        }
+        hub._candles = {("BTCUSDT", "5m"): object()}
+        hub._bootstrapped_pairs = {("BTCUSDT", "5m")}
+        hub._ws_manager = object()
+        hub._ws_running = True
+        hub._rebuild_kline_socket_pool = MagicMock()
+        with patch.object(Config, "get_ws_kline_intervals", return_value=["5m"]):
+            dropped = hub.demote_symbols_klines(["BTCUSDT", "ETHUSDT"])
+        self.assertEqual(dropped, 2)
+        self.assertEqual(hub._subscribed_kline_streams, {"solusdt@kline_5m"})
+        self.assertNotIn(("BTCUSDT", "5m"), hub._kline_bars)
+        self.assertNotIn(("ETHUSDT", "5m"), hub._kline_bars)
+        self.assertIn(("SOLUSDT", "5m"), hub._kline_bars)
+        hub._rebuild_kline_socket_pool.assert_called_once()
+
+    def test_watchlist_format_shows_pass_and_just_scanned(self) -> None:
+        from telegram_alerts import format_watchlist_message
+
+        text = format_watchlist_message(
+            tier1_hot=[],
+            tier1_background=[],
+            tier1_full=["ETHUSDT", "BTCUSDT"],
+            tier2_rows=[],
+            hot_scan_interval=60.0,
+            recently_scanned=["ETHUSDT", "BTCUSDT"],
+            pass_number=2,
+            current_index=42,
+            universe_size=120,
+            ingested_count=42,
+            currently_scanning="ETHUSDT",
+            flush_minutes=97,
+        )
+        self.assertIn("3-Tier Dynamic Scan Funnel", text)
+        self.assertIn("Pass 2 of 3", text)
+        self.assertIn("3h Flush in 97 mins", text)
+        self.assertIn("[#42/120] ETHUSDT", text)
+        self.assertIn("Normal Tier</b> (42/120)", text)
+        self.assertIn("1. ETHUSDT 👈 (Just Scanned)", text)
+        self.assertIn("No Hot promotions yet", text)
+        self.assertIn("No Super setups ready", text)
+        self.assertIn("SCANNER: DYNAMIC 2-COIN/MIN ACTIVE", text)
+        self.assertIn("RUNTIME STATUS", text)
 
     def test_promote_remembers_until_hot_demotes(self) -> None:
         funnel = TierFunnel()
@@ -245,6 +335,23 @@ class TestFunnelOrchestratorEmptyLog(unittest.TestCase):
         info_msgs = [c[0][0] for c in log.info.call_args_list]
         empty = [m for m in info_msgs if "empty universe" in m]
         self.assertEqual(len(empty), 1)
+
+
+class TestFunnelKlineFlushGc(unittest.TestCase):
+    def test_seed_funnel_gcs_flushed_klines_once(self) -> None:
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch._hub = MagicMock()
+        orch._tier1_symbols = ["CCCUSDT", "DDDUSDT"]
+        orch.funnel = TierFunnel()
+        orch.funnel.replace_normal_universe(["AAAUSDT", "BBBUSDT"], now=1.0)
+        orch.funnel.take_normal(now=1.0)
+        orch._open_symbols = lambda: set()  # type: ignore[method-assign]
+        orch._seed_funnel_universe(100.0)
+        orch._hub.demote_symbols_klines.assert_called_once()
+        flushed = orch._hub.demote_symbols_klines.call_args[0][0]
+        self.assertIn("AAAUSDT", flushed)
+        self.assertIn("BBBUSDT", flushed)
+        self.assertTrue(orch.funnel.has_candidate_universe)
 
 
 class TestFunnelScanIndependentOfRestBan(unittest.TestCase):

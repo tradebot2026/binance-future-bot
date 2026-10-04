@@ -194,22 +194,49 @@ class MarketScanner:
             return []
         return self.orchestrator.tier2_summary()
 
+    def gc_flushed_klines(self, symbols: list[str]) -> int:
+        """Drop flushed Normal kline streams/buffers in one hub rebuild."""
+        hub = self._hub
+        if hub is None or not symbols:
+            return 0
+        batch = getattr(hub, "demote_symbols_klines", None)
+        if callable(batch):
+            return int(batch(symbols) or 0)
+        drop = getattr(hub, "demote_symbol_klines", None)
+        if not callable(drop):
+            return 0
+        for symbol in symbols:
+            drop(symbol)
+        return len(symbols)
+
     def get_watchlist_tiers(self) -> dict[str, Any]:
-        """Return Tier-1 hot/background/full universe and Tier-2 candidates."""
+        """Return live Normal ingest progress plus Hot/Super snapshots."""
+        empty = {
+            "tier1_hot": [],
+            "tier1_background": [],
+            "tier1_full": [],
+            "tier2": [],
+            "tier2_near_miss": [],
+            "pass_number": 1,
+            "passes_total": 3,
+            "current_index": 0,
+            "universe_size": 120,
+            "ingested_count": 0,
+            "currently_scanning": "",
+            "recently_scanned": [],
+            "flush_minutes": 180,
+        }
         if self.orchestrator is None:
-            return {
-                "tier1_hot": [],
-                "tier1_background": [],
-                "tier1_full": [],
-                "tier2": [],
-                "tier2_near_miss": [],
-            }
+            return empty
         orchestrator = self.orchestrator
         funnel = getattr(orchestrator, "funnel", None)
+        snap = funnel.watchlist_snapshot() if funnel is not None else {}
+        recently = list(snap.get("recently_scanned") or [])
+        ingested = list(getattr(funnel, "normal_symbols", None) or [])
         return {
             "tier1_hot": list(getattr(funnel, "hot_symbols", None) or orchestrator.priority_queue.hot_symbols),
             "tier1_background": orchestrator.priority_queue.background_symbols,
-            "tier1_full": list(getattr(funnel, "normal_symbols", None) or orchestrator.tier1_symbols),
+            "tier1_full": recently or ingested,
             "rotation_evaluated": orchestrator.priority_queue.rotation.evaluated_count,
             "rotation_cycle": int(
                 getattr(funnel, "lock_cycle", None)
@@ -219,4 +246,12 @@ class MarketScanner:
             "tier2": orchestrator.tier2_summary(),
             "super": funnel.super_summary() if funnel is not None else [],
             "tier2_near_miss": orchestrator.assignment_manager.near_miss_summary(),
+            "pass_number": int(snap.get("pass_number") or 1),
+            "passes_total": int(snap.get("passes_total") or 3),
+            "current_index": int(snap.get("current_index") or 0),
+            "universe_size": int(snap.get("universe_size") or 120),
+            "ingested_count": int(snap.get("ingested_count") or len(ingested)),
+            "currently_scanning": str(snap.get("currently_scanning") or ""),
+            "recently_scanned": recently,
+            "flush_minutes": int(snap.get("flush_minutes") or 0),
         }

@@ -2165,29 +2165,48 @@ class MarketDataHub:
         return None
 
     def demote_symbol_klines(self, symbol: str) -> None:
-        """GC demoted symbol — flush buffers and rebuild WS kline subscriptions."""
-        symbol = symbol.upper()
-        sym_lower = symbol.lower()
-        ws_intervals = Config.get_ws_kline_intervals()
-        to_remove = {f"{sym_lower}@kline_{iv}" for iv in ws_intervals}
+        """GC one demoted symbol — flush buffers and rebuild WS kline subscriptions."""
+        self.demote_symbols_klines([symbol])
 
+    def demote_symbols_klines(self, symbols: list[str]) -> int:
+        """GC many flushed symbols in one pass — one socket-pool rebuild."""
+        keys: list[str] = []
+        seen: set[str] = set()
+        for raw in symbols:
+            key = str(raw or "").upper()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+        if not keys:
+            return 0
+
+        ws_intervals = Config.get_ws_kline_intervals()
+        to_remove = {
+            f"{symbol.lower()}@kline_{iv}"
+            for symbol in keys
+            for iv in ws_intervals
+        }
+        removed: set[str] = set()
         with self._lock:
+            removed = self._subscribed_kline_streams & to_remove
             self._subscribed_kline_streams -= to_remove
-            for key in [k for k in self._kline_bars if k[0] == symbol]:
-                del self._kline_bars[key]
-            for key in [k for k in self._candles if k[0] == symbol]:
-                del self._candles[key]
-            for pair in [p for p in self._bootstrapped_pairs if p[0] == symbol]:
+            drop_syms = set(keys)
+            for cache in (self._kline_bars, self._candles):
+                for key in [k for k in cache if k[0] in drop_syms]:
+                    del cache[key]
+            for pair in [p for p in self._bootstrapped_pairs if p[0] in drop_syms]:
                 self._bootstrapped_pairs.discard(pair)
 
-        if to_remove and self._ws_manager and self._ws_running:
+        if removed and self._ws_manager and self._ws_running:
             self._rebuild_kline_socket_pool()
 
-        system_logger.debug(
-            "GC demoted symbol %s — removed %s kline stream(s).",
-            symbol,
-            len(to_remove),
+        system_logger.info(
+            "GC flushed %s symbol(s) — dropped %s kline stream(s).",
+            len(keys),
+            len(removed),
         )
+        return len(keys)
 
     def _rebuild_kline_socket_pool(self) -> None:
         """Close and reopen all kline multiplex sockets from subscription set."""
@@ -2260,7 +2279,9 @@ class MarketDataHub:
         intervals: Optional[list[str]] = None,
     ) -> None:
         """
-        Subscribe WS kline streams for scan universe (pooled multiplex sockets).
+        Subscribe WS kline streams for the active scan set (pooled multiplex).
+        Call incrementally for newly ingested symbols — do not dump the full
+        120-coin candidate list on boot. Already-subscribed streams are skipped.
         Uses Config.get_ws_kline_intervals() by default (entry TF only when enabled).
         """
         if not self._ws_manager or not self._ws_running:
