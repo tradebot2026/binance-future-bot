@@ -232,6 +232,7 @@ def run_batched_kline_bootstrap(
         return BootstrapResult()
 
     batch_size = max(max_symbols_per_batch or Config.KLINE_BOOTSTRAP_BATCH_SYMBOLS, 1)
+    batch_size = min(batch_size, 2)
     if batch_cooldown_seconds is None:
         batch_pause = max(float(Config.KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS), 0.0)
     else:
@@ -307,6 +308,17 @@ def run_batched_kline_bootstrap(
                     break
                 if warmup_mode and used_weight_fn is not None:
                     maybe_pause_warmup_rest(used_weight_fn())
+                elif used_weight_fn is not None:
+                    weight = int(used_weight_fn() or 0)
+                    throttle = Config.rest_weight_throttle_threshold()
+                    if weight >= throttle:
+                        system_logger.warning(
+                            "Kline bootstrap paused — used_weight=%s over throttle %s.",
+                            weight,
+                            throttle,
+                        )
+                        aborted = True
+                        break
                 try:
                     df = rest_fetcher(sym, interval, limit)
                 except ExchangeRateLimitError as exc:

@@ -66,7 +66,10 @@ def _bootstrap_scan_universe_at_startup(
             seeded = scanner.bootstrap_hot_symbols_at_startup()
             hot = scanner.orchestrator.priority_queue.hot_symbols
             timeframes = Config.get_scan_kline_intervals()
-            expected = len(hot) * len(timeframes)
+            expected = min(
+                Config.kline_bootstrap_coins_per_minute(),
+                max(len(hot), 1),
+            ) * len(timeframes)
         else:
             symbols, _ = scanner.get_tradable_symbols()
             if not symbols:
@@ -75,10 +78,12 @@ def _bootstrap_scan_universe_at_startup(
                 )
                 return
             timeframes = Config.get_scan_kline_intervals()
-            expected = len(symbols) * len(timeframes)
+            expected = Config.kline_bootstrap_coins_per_minute() * len(timeframes)
             seeded = scanner.ensure_scan_klines_ready(symbols)
         system_logger.info(
-            "Startup hot kline bootstrap finished — %s/%s symbol series ready.",
+            "Startup kline bootstrap paced at %s coins/min — seeded %s/%s series "
+            "(remaining coins wait for the Normal funnel).",
+            Config.kline_bootstrap_coins_per_minute(),
             seeded,
             expected,
         )

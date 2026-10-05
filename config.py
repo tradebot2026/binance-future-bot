@@ -267,7 +267,7 @@ class Config:
     KLINE_REST_MIN_INTERVAL_SECONDS: float = _env_float(
         "KLINE_REST_MIN_INTERVAL_SECONDS", 1.0
     )
-    KLINE_BOOTSTRAP_BATCH_SYMBOLS: int = _env_int("KLINE_BOOTSTRAP_BATCH_SYMBOLS", 5)
+    KLINE_BOOTSTRAP_BATCH_SYMBOLS: int = _env_int("KLINE_BOOTSTRAP_BATCH_SYMBOLS", 1)
     KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS: float = _env_float(
         "KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS", 10.0
     )
@@ -290,7 +290,10 @@ class Config:
     )
     ENABLE_PACED_KLINE_BOOTSTRAP: bool = _env_bool("ENABLE_PACED_KLINE_BOOTSTRAP", True)
     KLINE_BOOTSTRAP_MAX_SERIES_PER_MINUTE: int = _env_int(
-        "KLINE_BOOTSTRAP_MAX_SERIES_PER_MINUTE", 12
+        "KLINE_BOOTSTRAP_MAX_SERIES_PER_MINUTE", 6
+    )
+    KLINE_BOOTSTRAP_COINS_PER_MINUTE: int = _env_int(
+        "KLINE_BOOTSTRAP_COINS_PER_MINUTE", 2
     )
     UNCERTAIN_ORDER_RECONCILE_SECONDS: float = _env_float(
         "UNCERTAIN_ORDER_RECONCILE_SECONDS", 30.0
@@ -965,6 +968,28 @@ class Config:
     def backtest_candle_limit(cls) -> int:
         """Hot-tier history fetch size (200–600 bars; default 500)."""
         return min(max(int(cls.BACKTEST_CANDLE_LIMIT), 200), 600)
+
+    @classmethod
+    def kline_bootstrap_coins_per_minute(cls) -> int:
+        """REST kline backfill: 2 coins/min, matching Normal ingest."""
+        configured = int(
+            getattr(cls, "KLINE_BOOTSTRAP_COINS_PER_MINUTE", cls.NORMAL_TIER_COINS_PER_MINUTE)
+        )
+        return max(min(configured, int(cls.NORMAL_TIER_COINS_PER_MINUTE)), 1)
+
+    @classmethod
+    def kline_bootstrap_max_series_per_minute(cls) -> int:
+        """Series cap cannot exceed coins/min × scan timeframes."""
+        coins = cls.kline_bootstrap_coins_per_minute()
+        tfs = max(len(cls.get_scan_kline_intervals()), 1)
+        configured = max(int(cls.KLINE_BOOTSTRAP_MAX_SERIES_PER_MINUTE), 1)
+        return min(configured, coins * tfs)
+
+    @classmethod
+    def scan_kline_fetch_limit(cls) -> int:
+        """Bars for Normal-tier REST seed (250–499 keeps futures_klines weight at 2)."""
+        need = max(int(getattr(cls, "WS_KLINE_BOOTSTRAP_MIN_BARS", 250)), 250)
+        return min(max(int(cls.CANDLE_FETCH_LIMIT), need), 499)
 
     @classmethod
     def warmup_kline_fetch_limit(cls) -> int:

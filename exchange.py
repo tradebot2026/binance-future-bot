@@ -533,6 +533,7 @@ class BinanceExchangeManager:
                 ban.is_banned = False
                 ban.message = "ban window expired"
         self.mark_ws_rest_ready()
+        self.resume_kline_bootstrap("API HEALTHY after ban expiry")
         system_logger.info(
             "[API_HEALTH] HEALTHY | REST client unblocked after ban expiry"
         )
@@ -1024,7 +1025,7 @@ class BinanceExchangeManager:
         return getattr(func, "__name__", "") == "futures_klines"
 
     def is_kline_bootstrap_halted(self) -> bool:
-        return self._kline_bootstrap_halted
+        return bool(getattr(self, "_kline_bootstrap_halted", False))
 
     def halt_kline_bootstrap(self, reason: str) -> None:
         self._kline_bootstrap_halted = True
@@ -1035,9 +1036,53 @@ class BinanceExchangeManager:
                 reason,
             )
 
+    def resume_kline_bootstrap(self, reason: str = "API HEALTHY") -> bool:
+        """Re-enable paced kline REST after a halt (missed coins retry)."""
+        if not getattr(self, "_kline_bootstrap_halted", False):
+            return False
+        self._kline_bootstrap_halted = False
+        system_logger.info(
+            "[SCAN_KLINE_BOOTSTRAP] REST resume — %s",
+            reason,
+        )
+        return True
+
+    def maybe_resume_kline_bootstrap(self) -> bool:
+        """Clear the kline REST halt once API health is HEALTHY and weight is under 600."""
+        if not getattr(self, "_kline_bootstrap_halted", False):
+            return False
+        if self._market_data is not None:
+            blocked, _ = self._market_data.is_rest_blocked()
+            if blocked:
+                return False
+        bucket = getattr(self, "_rest_token_bucket", None)
+        if bucket is not None and getattr(bucket, "is_hard_stopped", lambda: False)():
+            return False
+        usage = getattr(self, "_rest_usage", None)
+        if usage is None:
+            return False
+        if getattr(usage, "in_safety_mode", lambda: False)():
+            return False
+        allows = getattr(usage, "allows_background_rest", None)
+        if callable(allows) and not allows():
+            return False
+        snap = usage.snapshot() if callable(getattr(usage, "snapshot", None)) else {}
+        state = str((snap or {}).get("state") or "HEALTHY").upper()
+        weight = 0
+        projected = getattr(usage, "projected_used_weight", None)
+        if callable(projected):
+            try:
+                weight = int(projected() or 0)
+            except Exception:
+                weight = 0
+        return self.resume_kline_bootstrap(
+            f"API {state} used_weight_1m={weight}"
+        )
+
     def can_bootstrap_klines_rest(self) -> bool:
         """True when bootstrap may issue another futures_klines REST call."""
-        if self._kline_bootstrap_halted:
+        self.maybe_resume_kline_bootstrap()
+        if getattr(self, "_kline_bootstrap_halted", False):
             return False
         if self._ws_reconnect_or_warmup():
             return False

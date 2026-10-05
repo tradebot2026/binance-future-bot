@@ -89,9 +89,15 @@ def _weight_pause_seconds(used_weight: int) -> float:
 
 
 def kline_rest_delay_seconds(used_weight: int = 0) -> float:
-    """Strict 1.0s gap between kline REST calls (rate-limit safety)."""
-    del used_weight
-    return max(float(getattr(Config, "KLINE_REST_MIN_INTERVAL_SECONDS", 1.0)), 1.0)
+    """Gap between kline REST calls; stretch slightly as used-weight climbs."""
+    base = max(float(getattr(Config, "KLINE_REST_MIN_INTERVAL_SECONDS", 1.0)), 1.0)
+    weight = int(used_weight or 0)
+    throttle = Config.rest_weight_throttle_threshold()
+    if weight >= throttle:
+        return min(base + 1.0, 2.5)
+    if weight >= max(throttle // 2, 300):
+        return min(base + 0.5, 2.0)
+    return base
 
 
 def maybe_pause_warmup_rest(used_weight: int) -> bool:

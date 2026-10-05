@@ -935,6 +935,7 @@ class TelegramManager:
                 flush_minutes=int(tiers.get("flush_minutes") or 0),
                 flush_count=int(tiers.get("flush_count") or 0),
                 normal_scores=dict(tiers.get("normal_scores") or {}),
+                kline_pending=list(tiers.get("kline_pending") or []),
             )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"

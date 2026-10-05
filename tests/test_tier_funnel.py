@@ -110,6 +110,19 @@ class TestTierFunnel(unittest.TestCase):
         funnel.replace_normal_universe(["CCCUSDT"], now=2.0)
         self.assertEqual(funnel.flush_count, 2)
 
+    def test_unscored_ingest_stays_pending_not_zero(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["ADAUSDT"], now=1.0)
+        self.assertEqual(funnel.take_normal(now=1.0), ["ADAUSDT"])
+        snap = funnel.watchlist_snapshot(now=1.0)
+        self.assertIn("ADAUSDT", snap["kline_pending"])
+        self.assertNotIn("ADAUSDT", snap["normal_scores"])
+        funnel.note_kline_pending("ADAUSDT")
+        funnel.note_normal_score("ADAUSDT", 0.0)
+        snap = funnel.watchlist_snapshot(now=1.0)
+        self.assertIn("ADAUSDT", snap["kline_pending"])
+        self.assertNotIn("ADAUSDT", snap["normal_scores"])
+
     def test_watchlist_uses_final_or_raw_score(self) -> None:
         funnel = TierFunnel()
         funnel.replace_normal_universe(["AAAUSDT", "BBBUSDT"], now=1.0)
@@ -236,6 +249,63 @@ class TestTierFunnel(unittest.TestCase):
         self.assertIn("No Super setups ready", text)
         self.assertIn("SCANNER: DYNAMIC 2-COIN/MIN ACTIVE", text)
         self.assertIn("RUNTIME STATUS", text)
+
+    def test_watchlist_shows_pending_until_klines_score(self) -> None:
+        from telegram_alerts import format_watchlist_message
+
+        text = format_watchlist_message(
+            tier1_hot=[],
+            tier1_background=[],
+            tier1_full=["ETHUSDT", "BTCUSDT"],
+            tier2_rows=[],
+            hot_scan_interval=60.0,
+            recently_scanned=["ETHUSDT", "BTCUSDT"],
+            pass_number=1,
+            current_index=1,
+            universe_size=120,
+            ingested_count=1,
+            currently_scanning="ETHUSDT",
+            flush_minutes=180,
+            flush_count=1,
+            normal_scores={"ETHUSDT": 0.0, "BTCUSDT": 62.0},
+            kline_pending=["ETHUSDT"],
+        )
+        self.assertIn("1. ETHUSDT [Pending] 👈 (Just Scanned)", text)
+        self.assertIn("2. BTCUSDT [62%]", text)
+        self.assertNotIn("ETHUSDT [0%]", text)
+
+        missing = format_watchlist_message(
+            tier1_hot=[],
+            tier1_background=[],
+            tier1_full=["ADAUSDT"],
+            tier2_rows=[],
+            hot_scan_interval=60.0,
+            recently_scanned=["ADAUSDT"],
+            pass_number=1,
+            current_index=1,
+            universe_size=120,
+            ingested_count=1,
+            currently_scanning="ADAUSDT",
+            flush_minutes=180,
+            flush_count=1,
+            normal_scores={},
+            kline_pending=[],
+        )
+        self.assertIn("1. ADAUSDT [Pending]", missing)
+        self.assertNotIn("ADAUSDT [0%]", missing)
+
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["AAAUSDT"], now=1.0)
+        funnel.take_normal(now=1.0)
+        funnel.note_kline_pending("AAAUSDT")
+        snap = funnel.watchlist_snapshot(now=1.0)
+        self.assertIn("AAAUSDT", snap["kline_pending"])
+        funnel.record_normal_scan(
+            "AAAUSDT", [_score("AAAUSDT", "SMC_TREND", 62.0)]
+        )
+        snap = funnel.watchlist_snapshot(now=1.0)
+        self.assertNotIn("AAAUSDT", snap["kline_pending"])
+        self.assertAlmostEqual(snap["normal_scores"]["AAAUSDT"], 62.0)
 
     def test_promote_remembers_until_hot_demotes(self) -> None:
         funnel = TierFunnel()
@@ -399,6 +469,7 @@ class TestFunnelOrchestratorEmptyLog(unittest.TestCase):
         orch._ws_book_map = lambda _t: {}  # type: ignore[method-assign]
         orch._partition_kline_ready = lambda s: ([], list(s))  # type: ignore[method-assign]
         orch._note_missing_scan_klines = lambda *a, **k: None  # type: ignore[method-assign]
+        orch._bootstrap_missing_scan_klines = lambda *_a, **_k: 0  # type: ignore[method-assign]
         with patch.object(Config, "ENABLE_THREE_TIER_FUNNEL", True), patch(
             "pipeline.event_scan_orchestrator.scanner_logger"
         ) as log:
@@ -449,6 +520,7 @@ class TestFunnelScanIndependentOfRestBan(unittest.TestCase):
         orch._ws_book_map = lambda _t: {}  # type: ignore[method-assign]
         orch._partition_kline_ready = lambda s: (list(s), [])  # type: ignore[method-assign]
         orch._note_missing_scan_klines = lambda *a, **k: None  # type: ignore[method-assign]
+        orch._bootstrap_missing_scan_klines = lambda *_a, **_k: 0  # type: ignore[method-assign]
         orch._score_symbol = MagicMock(return_value=[])
         with patch.object(Config, "ENABLE_THREE_TIER_FUNNEL", True), patch(
             "pipeline.event_scan_orchestrator.touch_scan_cycle"
@@ -457,6 +529,139 @@ class TestFunnelScanIndependentOfRestBan(unittest.TestCase):
         orch.maybe_refresh_tier1_periodic.assert_not_called()
         orch.bootstrap_watchlist_once.assert_not_called()
         self.assertTrue(orch._score_symbol.called)
+
+
+class TestFunnelFastTrackKlines(unittest.TestCase):
+    def test_missing_klines_bootstrap_then_score_and_promote(self) -> None:
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch._hub = MagicMock()
+        orch._tier1_symbols = ["AAAUSDT"]
+        orch._last_empty_universe_log_at = 0.0
+        orch._last_zero_candidate_log_at = 0.0
+        orch._scan_gate_open = lambda: (False, "")  # type: ignore[method-assign]
+        orch.maybe_refresh_tier1_periodic = lambda: None  # type: ignore[method-assign]
+        orch.bootstrap_watchlist_once = lambda: []  # type: ignore[method-assign]
+        orch.run_catchup = lambda: 0  # type: ignore[method-assign]
+        orch.conflict_guard = MagicMock()
+        orch.funnel = TierFunnel()
+        orch.funnel.replace_normal_universe(["AAAUSDT"], now=1.0)
+        orch._validator = None
+        orch._telegram = None
+        orch.db = MagicMock()
+        orch.exchange = MagicMock()
+        orch.exchange.is_rest_blocked.return_value = (False, "")
+        orch._open_symbols = lambda: set()  # type: ignore[method-assign]
+        orch._ws_ticker_map = lambda: {}  # type: ignore[method-assign]
+        orch._ws_book_map = lambda _t: {}  # type: ignore[method-assign]
+        orch._partition_kline_ready = MagicMock(
+            side_effect=[([], ["AAAUSDT"]), (["AAAUSDT"], [])]
+        )
+        orch._note_missing_scan_klines = lambda *a, **k: None  # type: ignore[method-assign]
+        orch._bootstrap_missing_scan_klines = MagicMock(return_value=3)
+        orch._score_symbol = MagicMock(
+            return_value=[_score("AAAUSDT", "SMC_TREND", 62.0)]
+        )
+        orch._enqueue_due_hot_rest = lambda *_a, **_k: None  # type: ignore[method-assign]
+        orch._ingest_hot_backtests = lambda **_k: None  # type: ignore[method-assign]
+        orch._rescore_due_hot = lambda *_a, **_k: None  # type: ignore[method-assign]
+        with patch.object(Config, "ENABLE_THREE_TIER_FUNNEL", True), patch(
+            "pipeline.event_scan_orchestrator.touch_scan_cycle"
+        ), patch.dict("os.environ", _FUNNEL_SCORE_ENV, clear=False), patch.object(
+            Config, "USE_TESTNET", False
+        ), patch.object(Config, "TESTNET_RELAX_STRATEGY_THRESHOLDS", False):
+            orch.process_priority_scan_cycle()
+        orch._bootstrap_missing_scan_klines.assert_called_once_with(["AAAUSDT"])
+        self.assertTrue(orch._score_symbol.called)
+        self.assertIn("AAAUSDT", orch.funnel.hot_symbols)
+        self.assertAlmostEqual(orch.funnel.normal_score("AAAUSDT"), 62.0)
+
+    def test_retry_pending_bootstrap_then_score_same_tick(self) -> None:
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch._hub = MagicMock()
+        orch._kline_cache_misses = ["SAFEUSDT"]
+        orch.snapshot_factory = MagicMock()
+        complete = {"SAFEUSDT": False}
+        orch.snapshot_factory.has_complete_klines.side_effect = (
+            lambda s: complete.get(str(s).upper(), False)
+        )
+        orch.funnel = TierFunnel()
+        orch.funnel.replace_normal_universe(["SAFEUSDT"], now=1.0)
+        orch.funnel.take_normal(now=1.0)
+        orch.funnel.note_kline_pending("SAFEUSDT")
+
+        def _boot(_symbols: list[str]) -> int:
+            complete["SAFEUSDT"] = True
+            return 3
+
+        orch._bootstrap_missing_scan_klines = _boot  # type: ignore[method-assign]
+        orch._score_symbol = MagicMock(
+            return_value=[_score("SAFEUSDT", "SMC_TREND", 62.0)]
+        )
+        orch._open_symbols = lambda: set()  # type: ignore[method-assign]
+        orch._ws_ticker_map = lambda: {}  # type: ignore[method-assign]
+        orch._ws_book_map = lambda _t: {}  # type: ignore[method-assign]
+        with patch.dict("os.environ", _FUNNEL_SCORE_ENV, clear=False), patch.object(
+            Config, "USE_TESTNET", False
+        ), patch.object(Config, "TESTNET_RELAX_STRATEGY_THRESHOLDS", False):
+            seeded = orch._retry_pending_kline_bootstrap(exclude=set())
+            orch._score_ready_pending(
+                already=[],
+                timeframe="5m",
+                open_symbols=set(),
+                ticker_map={},
+                book_map={},
+            )
+        self.assertEqual(seeded, 1)
+        self.assertTrue(complete["SAFEUSDT"])
+        self.assertIn("SAFEUSDT", orch.funnel.hot_symbols)
+        self.assertAlmostEqual(orch.funnel.normal_score("SAFEUSDT"), 62.0)
+        self.assertNotIn("SAFEUSDT", orch.funnel.watchlist_snapshot(now=1.0)["kline_pending"])
+
+    def test_incomplete_snapshot_does_not_record_zero(self) -> None:
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch.funnel = TierFunnel()
+        orch.funnel.replace_normal_universe(["ORCAUSDT"], now=1.0)
+        orch.funnel.take_normal(now=1.0)
+        orch.funnel.note_kline_pending("ORCAUSDT")
+        orch._score_symbol = MagicMock(return_value=None)
+        scored = orch._score_and_promote_symbol(
+            "ORCAUSDT",
+            timeframe="5m",
+            open_symbols=set(),
+            ticker_map={},
+            book_map={},
+        )
+        self.assertFalse(scored)
+        self.assertIn("ORCAUSDT", orch.funnel.watchlist_snapshot(now=1.0)["kline_pending"])
+        self.assertNotIn("ORCAUSDT", orch.funnel.watchlist_snapshot(now=1.0)["normal_scores"])
+        self.assertEqual(orch.funnel.hot_symbols, [])
+
+
+class TestStartupKlinePace(unittest.TestCase):
+    def test_ensure_scan_klines_ready_caps_two_coins(self) -> None:
+        from scanner import MarketScanner
+
+        scanner = MarketScanner.__new__(MarketScanner)
+        scanner.exchange = MagicMock()
+        scanner.exchange.in_scan_mode = False
+        scanner.exchange.bootstrap_context.return_value.__enter__ = MagicMock()
+        scanner.exchange.bootstrap_context.return_value.__exit__ = MagicMock(
+            return_value=False
+        )
+        scanner.exchange.fetch_bootstrap_klines_df = MagicMock()
+        scanner._hub = MagicMock()
+        scanner._hub.bootstrap_klines_for_symbols.return_value = 4
+        scanner.orchestrator = None
+        with patch.object(Config, "ENABLE_WS_KLINE_STARTUP_BOOTSTRAP", True):
+            seeded = scanner.ensure_scan_klines_ready(
+                ["AAAUSDT", "BBBUSDT", "CCCUSDT", "DDDUSDT"]
+            )
+        self.assertEqual(seeded, 4)
+        scanner._hub.subscribe_kline_streams.assert_called_once()
+        batch = scanner._hub.subscribe_kline_streams.call_args[0][0]
+        self.assertEqual(batch, ["AAAUSDT", "BBBUSDT"])
+        rest_batch = scanner._hub.bootstrap_klines_for_symbols.call_args[0][0]
+        self.assertEqual(rest_batch, ["AAAUSDT", "BBBUSDT"])
 
 
 if __name__ == "__main__":

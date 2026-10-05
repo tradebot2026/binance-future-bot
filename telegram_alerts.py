@@ -439,6 +439,7 @@ def format_watchlist_message(
     flush_minutes: int = 180,
     flush_count: int = 0,
     normal_scores: Optional[dict[str, float]] = None,
+    kline_pending: Optional[list[str]] = None,
 ) -> str:
     """Format /watchlist — paced Normal ingest plus Hot / Super."""
     universe = max(int(universe_size or Config.NORMAL_TIER_UNIVERSE_SIZE), 1)
@@ -453,6 +454,7 @@ def format_watchlist_message(
     flush_m = max(int(flush_minutes or 0), 0)
     flush_n = max(int(flush_count or lock_cycle or 0), 0)
     scores = {str(k).upper(): float(v or 0.0) for k, v in (normal_scores or {}).items()}
+    pending = {str(k).upper() for k in (kline_pending or []) if k}
 
     lines = [
         "📡 <b>3-Tier Dynamic Scan Funnel</b>",
@@ -468,9 +470,13 @@ def format_watchlist_message(
     if recent:
         for i, symbol in enumerate(recent[:10], start=1):
             key = str(symbol).upper()
-            pct = int(round(max(scores.get(key, 0.0), 0.0)))
+            if key in pending or key not in scores:
+                label = "[Pending]"
+            else:
+                pct = int(round(max(scores.get(key, 0.0), 0.0)))
+                label = f"[{pct}%]"
             marker = " 👈 (Just Scanned)" if i == 1 else ""
-            lines.append(f"{i}. {escape_html(key)} [{pct}%]{marker}")
+            lines.append(f"{i}. {escape_html(key)} {label}{marker}")
         remaining = max(ingested - min(len(recent), 10), 0) + max(universe - ingested, 0)
         if remaining > 0:
             lines.append(f"+ {remaining} more queued")

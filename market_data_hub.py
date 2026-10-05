@@ -190,6 +190,7 @@ class MarketDataHub:
         self._last_ws_seen_at: float = 0.0
         self._pending_order_fills: list[dict[str, Any]] = []
         self._bootstrap_series_window: deque[float] = deque()
+        self._bootstrap_coin_window: deque[float] = deque()
         self._last_user_event_at: float = 0.0
         self._last_user_socket_at: float = 0.0
         self._listen_key: str = ""
@@ -326,8 +327,68 @@ class MarketDataHub:
         if warmup or self.in_scan_warmup():
             limit = Config.warmup_kline_fetch_limit()
             return limit, limit, complete
-        limit = int(Config.CANDLE_FETCH_LIMIT)
+        limit = int(Config.scan_kline_fetch_limit())
         return limit, complete, complete
+
+    def _trim_bootstrap_pending(
+        self, pending: list[tuple[str, str]], *, warmup: bool
+    ) -> list[tuple[str, str]]:
+        """Keep REST kline backfill at 2 coins/min (and the matching series budget)."""
+        if warmup or not pending:
+            return list(pending)
+        now = time.monotonic()
+        if not hasattr(self, "_bootstrap_coin_window"):
+            self._bootstrap_coin_window = deque()
+        while self._bootstrap_series_window and self._bootstrap_series_window[0] < now - 60.0:
+            self._bootstrap_series_window.popleft()
+        while self._bootstrap_coin_window and self._bootstrap_coin_window[0] < now - 60.0:
+            self._bootstrap_coin_window.popleft()
+
+        series_fn = getattr(Config, "kline_bootstrap_max_series_per_minute", None)
+        if callable(series_fn):
+            per_series = max(int(series_fn()), 1)
+        else:
+            per_series = max(int(getattr(Config, "KLINE_BOOTSTRAP_MAX_SERIES_PER_MINUTE", 6)), 1)
+        remaining_series = per_series - len(self._bootstrap_series_window)
+        if remaining_series <= 0:
+            system_logger.info(
+                "Kline bootstrap paced — %s series already requested in the last 60s.",
+                per_series,
+            )
+            return []
+
+        coins_fn = getattr(Config, "kline_bootstrap_coins_per_minute", None)
+        coins_per_min = max(int(coins_fn()), 1) if callable(coins_fn) else 2
+        remaining_coins = coins_per_min - len(self._bootstrap_coin_window)
+        if remaining_coins <= 0:
+            system_logger.info(
+                "Kline bootstrap paced — %s coins already fetched in the last 60s.",
+                coins_per_min,
+            )
+            return []
+
+        allowed_syms: list[str] = []
+        seen: set[str] = set()
+        for sym, _interval in pending:
+            key = str(sym).upper()
+            if not key or key in seen:
+                continue
+            if len(allowed_syms) >= remaining_coins:
+                break
+            seen.add(key)
+            allowed_syms.append(key)
+        allowed = set(allowed_syms)
+        trimmed = [
+            (str(sym).upper(), interval)
+            for sym, interval in pending
+            if str(sym).upper() in allowed
+        ][:remaining_series]
+        used_coins = {str(sym).upper() for sym, _interval in trimmed}
+        for _ in used_coins:
+            self._bootstrap_coin_window.append(now)
+        for _ in trimmed:
+            self._bootstrap_series_window.append(now)
+        return trimmed
 
     def ws_is_degraded(self) -> bool:
         """True during reconnect, STOPPED, or warmup — REST market-data must not storm."""
@@ -2458,6 +2519,10 @@ class MarketDataHub:
         if not pending:
             return ws_seeded
 
+        pending = self._trim_bootstrap_pending(pending, warmup=warmup)
+        if not pending:
+            return ws_seeded
+
         exchange = getattr(rest_fetcher, "__self__", None)
         can_fetch = None
         if exchange is not None and hasattr(exchange, "can_bootstrap_klines_rest"):
@@ -2477,13 +2542,14 @@ class MarketDataHub:
             seed_fn=self.seed_klines_from_dataframe,
             mark_bootstrapped=_mark_bootstrapped,
             can_fetch=can_fetch,
+            max_symbols_per_batch=1,
             request_delay_seconds=(
                 Config.warmup_kline_delay_seconds()
                 if warmup
-                else kline_rest_delay_seconds(0)
+                else kline_rest_delay_seconds(self._warmup_used_weight())
             ),
             warmup_mode=warmup,
-            used_weight_fn=self._warmup_used_weight if warmup else None,
+            used_weight_fn=self._warmup_used_weight,
             warmup_seed_fn=_mark_warmup_seeded if warmup else None,
             complete_min_bars=complete_bars,
         )
@@ -2524,21 +2590,9 @@ class MarketDataHub:
         if not pending:
             return 0
 
-        now = time.monotonic()
-        while self._bootstrap_series_window and self._bootstrap_series_window[0] < now - 60.0:
-            self._bootstrap_series_window.popleft()
-        if not warmup:
-            per_minute = max(int(getattr(Config, "KLINE_BOOTSTRAP_MAX_SERIES_PER_MINUTE", 12)), 1)
-            remaining = per_minute - len(self._bootstrap_series_window)
-            if remaining <= 0:
-                system_logger.info(
-                    "Kline bootstrap paced — %s series already requested in the last 60s.",
-                    per_minute,
-                )
-                return 0
-            pending = pending[:remaining]
-            for _ in pending:
-                self._bootstrap_series_window.append(now)
+        pending = self._trim_bootstrap_pending(pending, warmup=warmup)
+        if not pending:
+            return 0
 
         exchange = getattr(rest_fetcher, "__self__", None)
         can_fetch = None
@@ -2560,13 +2614,14 @@ class MarketDataHub:
             mark_bootstrapped=_mark_bootstrapped,
             can_fetch=can_fetch,
             max_pairs=max_pairs,
+            max_symbols_per_batch=1,
             request_delay_seconds=(
                 Config.warmup_kline_delay_seconds()
                 if warmup
-                else kline_rest_delay_seconds(0)
+                else kline_rest_delay_seconds(self._warmup_used_weight())
             ),
             warmup_mode=warmup,
-            used_weight_fn=self._warmup_used_weight if warmup else None,
+            used_weight_fn=self._warmup_used_weight,
             warmup_seed_fn=_mark_warmup_seeded if warmup else None,
             complete_min_bars=complete_bars,
         )

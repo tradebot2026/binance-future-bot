@@ -63,6 +63,7 @@ class TierFunnel:
         self._last_flushed: list[str] = []
         self._flush_count: int = 0
         self._normal_scores: dict[str, float] = {}
+        self._kline_pending: set[str] = set()
         self._recently_scanned: deque[str] = deque(
             maxlen=max(int(Config.NORMAL_TIER_UNIVERSE_SIZE), 1)
         )
@@ -118,21 +119,45 @@ class TierFunnel:
     def flush_count(self) -> int:
         return int(self._flush_count)
 
+    def note_kline_pending(self, symbol: str) -> None:
+        """Watchlist shows [Pending] until klines are warm enough to score."""
+        key = str(symbol or "").upper()
+        if key:
+            self._kline_pending.add(key)
+
+    def clear_kline_pending(self, symbol: str) -> None:
+        self._kline_pending.discard(str(symbol or "").upper())
+
+    def is_kline_pending(self, symbol: str) -> bool:
+        return str(symbol or "").upper() in self._kline_pending
+
+    def pending_kline_symbols(self) -> list[str]:
+        return [key for key in self._recently_scanned if key in self._kline_pending]
+
     def note_normal_score(self, symbol: str, score: float) -> None:
         key = str(symbol or "").upper()
         if not key:
             return
         incoming = max(float(score or 0.0), 0.0)
         if incoming <= 0:
+            if key in self._kline_pending:
+                return
             self._normal_scores.setdefault(key, 0.0)
             return
         self._normal_scores[key] = incoming
+        self._kline_pending.discard(key)
 
     def record_normal_scan(
         self, symbol: str, scores: list[StrategyScore]
     ) -> Optional[HotRecord]:
-        """Store the display score, then promote when Hot-band is met."""
-        self.note_normal_score(str(symbol).upper(), _display_score(scores))
+        """Store a real evaluation, then promote when Hot-band is met.
+
+        Callers must invoke this only after scan klines are complete.
+        Incomplete snapshots stay in `_kline_pending` and must not land here.
+        """
+        key = str(symbol).upper()
+        self.clear_kline_pending(key)
+        self.note_normal_score(key, _display_score(scores))
         if not scores:
             return None
         return self.promote_from_normal(symbol, scores)
@@ -204,6 +229,7 @@ class TierFunnel:
         self._normal_scores = {
             key: val for key, val in self._normal_scores.items() if key in keep_keys
         }
+        self._kline_pending = {key for key in self._kline_pending if key in keep_keys}
         if outgoing:
             scanner_logger.info(
                 "[TIER_NORMAL] flushed %s non-setup symbol(s); kept hot=%s super=%s.",
@@ -354,9 +380,15 @@ class TierFunnel:
             "currently_scanning": self._current_symbol,
             "recently_scanned": list(self._recently_scanned),
             "normal_scores": {
-                key: float(self._normal_scores.get(key, 0.0))
+                key: float(self._normal_scores[key])
                 for key in self._recently_scanned
+                if key in self._normal_scores
             },
+            "kline_pending": [
+                key
+                for key in self._recently_scanned
+                if key in self._kline_pending or key not in self._normal_scores
+            ],
             "flush_minutes": self.flush_minutes_remaining(stamp),
             "flush_count": self._flush_count,
             "lock_cycle": self._lock_cycle,

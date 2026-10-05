@@ -426,6 +426,45 @@ class TestWatchdogAndWs(unittest.TestCase):
         self.assertEqual(seeded, 0)
         self.assertEqual(called, [])
 
+    def test_kline_bootstrap_caps_two_coins_per_minute(self) -> None:
+        hub = _ready_hub()
+        hub._bootstrap_series_window = deque()
+        hub._bootstrap_coin_window = deque()
+        called: list[str] = []
+
+        def fetcher(symbol: str, interval: str, limit: int) -> pd.DataFrame:
+            called.append(symbol)
+            n = 250
+            return pd.DataFrame(
+                {
+                    "timestamp": list(range(n)),
+                    "open": [1.0] * n,
+                    "high": [1.1] * n,
+                    "low": [0.9] * n,
+                    "close": [1.0] * n,
+                    "volume": [1.0] * n,
+                }
+            )
+
+        pending = [
+            ("AAAUSDT", "5m"),
+            ("AAAUSDT", "15m"),
+            ("BBBUSDT", "5m"),
+            ("BBBUSDT", "15m"),
+            ("CCCUSDT", "5m"),
+            ("CCCUSDT", "15m"),
+        ]
+        with patch.object(hub, "is_rest_blocked", return_value=(False, "")), patch.object(
+            hub, "_pending_bootstrap_pairs", return_value=pending
+        ), patch("kline_bootstrap.time.sleep"), patch.object(
+            Config, "KLINE_BOOTSTRAP_COINS_PER_MINUTE", 2
+        ), patch.object(Config, "NORMAL_TIER_COINS_PER_MINUTE", 2):
+            hub.bootstrap_klines_for_symbols(
+                ["AAAUSDT", "BBBUSDT", "CCCUSDT"], ["5m", "15m"], fetcher
+            )
+        self.assertEqual(sorted(set(called)), ["AAAUSDT", "BBBUSDT"])
+        self.assertNotIn("CCCUSDT", called)
+
     def test_warmup_kline_bootstrap_paces_timeframes_and_pauses_on_weight(self) -> None:
         from kline_bootstrap import run_batched_kline_bootstrap
 
@@ -478,6 +517,34 @@ class TestWatchdogAndWs(unittest.TestCase):
         self.assertGreaterEqual(max(sleeps), 5.0)
         self.assertTrue(any(abs(s - 0.5) < 1e-9 for s in sleeps))
 
+    def test_non_warmup_bootstrap_aborts_over_weight_throttle(self) -> None:
+        from kline_bootstrap import run_batched_kline_bootstrap
+
+        calls: list[tuple[str, str]] = []
+
+        def fetcher(symbol: str, interval: str, limit: int):
+            calls.append((symbol, interval))
+            return pd.DataFrame()
+
+        with patch("kline_bootstrap.time.sleep"), patch.object(
+            Config, "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 600
+        ), patch.object(Config, "REST_OPERATIONAL_WEIGHT_CAP", 600):
+            result = run_batched_kline_bootstrap(
+                [("AAAUSDT", "5m"), ("AAAUSDT", "15m")],
+                fetcher,
+                limit=250,
+                min_bars=250,
+                seed_fn=lambda *_args: None,
+                mark_bootstrapped=lambda *_args: None,
+                warmup_mode=False,
+                used_weight_fn=lambda: 2513,
+                request_delay_seconds=1.0,
+                max_symbols_per_batch=1,
+                batch_cooldown_seconds=0.0,
+            )
+        self.assertTrue(result.aborted)
+        self.assertEqual(calls, [])
+
     def test_scan_warmup_flag_gates_hub(self) -> None:
         hub = _ready_hub()
         hub.begin_scan_warmup(30.0)
@@ -495,6 +562,54 @@ class TestWatchdogAndWs(unittest.TestCase):
         orch.note_kline_cache_miss("BBUSDT")
         self.assertEqual(orch.take_kline_cache_misses(2), ["ENAUSDT", "BBUSDT"])
         self.assertEqual(orch.take_kline_cache_misses(1), [])
+
+
+class TestKlineBootstrapHaltResume(unittest.TestCase):
+    def test_halt_resumes_when_api_healthy(self) -> None:
+        from exchange import BinanceExchangeManager
+
+        exchange = BinanceExchangeManager.__new__(BinanceExchangeManager)
+        exchange._kline_bootstrap_halted = True
+        exchange._market_data = None
+        exchange._rest_token_bucket = MagicMock()
+        exchange._rest_token_bucket.is_hard_stopped.return_value = False
+        exchange._rest_usage = MagicMock()
+        exchange._rest_usage.in_safety_mode.return_value = False
+        exchange._rest_usage.allows_background_rest.return_value = True
+        exchange._rest_usage.snapshot.return_value = {"state": "HEALTHY"}
+        exchange._rest_usage.projected_used_weight.return_value = 0
+        self.assertTrue(exchange.maybe_resume_kline_bootstrap())
+        self.assertFalse(exchange.is_kline_bootstrap_halted())
+
+    def test_halt_stays_while_weight_over_throttle(self) -> None:
+        from exchange import BinanceExchangeManager
+
+        exchange = BinanceExchangeManager.__new__(BinanceExchangeManager)
+        exchange._kline_bootstrap_halted = True
+        exchange._market_data = None
+        exchange._rest_token_bucket = MagicMock()
+        exchange._rest_token_bucket.is_hard_stopped.return_value = False
+        exchange._rest_usage = MagicMock()
+        exchange._rest_usage.in_safety_mode.return_value = False
+        exchange._rest_usage.allows_background_rest.return_value = False
+        exchange._rest_usage.snapshot.return_value = {"state": "RATE_LIMIT_WARNING"}
+        exchange._rest_usage.projected_used_weight.return_value = 2513
+        self.assertFalse(exchange.maybe_resume_kline_bootstrap())
+        self.assertTrue(exchange.is_kline_bootstrap_halted())
+
+    def test_ban_recovery_clears_kline_halt(self) -> None:
+        from exchange import BinanceExchangeManager
+
+        exchange = BinanceExchangeManager.__new__(BinanceExchangeManager)
+        exchange._kline_bootstrap_halted = True
+        exchange._rest_usage = MagicMock()
+        exchange._rest_usage.force_clear_safety.return_value = True
+        exchange._rest_token_bucket = MagicMock()
+        exchange._startup_ban = None
+        exchange.mark_ws_rest_ready = MagicMock()
+        with patch("exchange.system_logger"):
+            exchange.on_rest_ban_recovered()
+        self.assertFalse(exchange.is_kline_bootstrap_halted())
 
 
 class TestStrategiesAndArbitration(unittest.TestCase):

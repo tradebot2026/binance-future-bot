@@ -156,6 +156,9 @@ class EventScanOrchestrator:
         for symbol in symbols:
             self.note_kline_cache_miss(symbol)
             self._log_kline_bootstrap_pending(symbol)
+            funnel = getattr(self, "funnel", None)
+            if funnel is not None:
+                funnel.note_kline_pending(symbol)
             event = (events or {}).get(symbol)
             if event is not None:
                 self.event_scheduler.requeue(event, delay_seconds=2.0)
@@ -212,6 +215,7 @@ class EventScanOrchestrator:
                     timeframes,
                     self.exchange.fetch_bootstrap_klines_df,
                     max_pairs=len(timeframes),
+                    warmup=False,
                 )
         except Exception as exc:
             scanner_logger.warning(
@@ -227,6 +231,97 @@ class EventScanOrchestrator:
             seeded,
         )
         return int(seeded or 0)
+
+    def _score_and_promote_symbol(
+        self,
+        symbol: str,
+        *,
+        timeframe: str,
+        open_symbols: set[str],
+        ticker_map: dict[str, Any],
+        book_map: dict[str, Any],
+    ) -> bool:
+        """Score a kline-ready coin and run Normal→Hot in this tick. False if still pending."""
+        scores = self._score_symbol(
+            symbol,
+            timeframe=timeframe,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+        )
+        if scores is None:
+            funnel = getattr(self, "funnel", None)
+            if funnel is not None:
+                funnel.note_kline_pending(symbol)
+            return False
+        self.funnel.record_normal_scan(symbol, scores)
+        return True
+
+    def _score_ready_pending(
+        self,
+        *,
+        already: list[str],
+        timeframe: str,
+        open_symbols: set[str],
+        ticker_map: dict[str, Any],
+        book_map: dict[str, Any],
+    ) -> None:
+        """Score pending coins whose klines filled, without extra REST."""
+        funnel = getattr(self, "funnel", None)
+        if funnel is None:
+            return
+        pending_fn = getattr(funnel, "pending_kline_symbols", None)
+        leftover = [
+            symbol
+            for symbol in (pending_fn() if callable(pending_fn) else [])
+            if symbol not in already and symbol not in open_symbols
+        ]
+        if not leftover:
+            return
+        ready, _missing = self._partition_kline_ready(leftover)
+        for symbol in ready:
+            self._score_and_promote_symbol(
+                symbol,
+                timeframe=timeframe,
+                open_symbols=open_symbols,
+                ticker_map=ticker_map,
+                book_map=book_map,
+            )
+
+    def _retry_pending_kline_bootstrap(self, *, exclude: set[str]) -> int:
+        """REST-seed leftover pending coins at the 2/min hub cap after HEALTHY resume."""
+        funnel = getattr(self, "funnel", None)
+        queued: list[str] = []
+        seen: set[str] = set()
+        for raw in list(getattr(self, "_kline_cache_misses", []) or []):
+            key = str(raw or "").upper()
+            if not key or key in seen or key in exclude:
+                continue
+            seen.add(key)
+            queued.append(key)
+        if funnel is not None:
+            for key in funnel.pending_kline_symbols():
+                if key not in seen and key not in exclude:
+                    seen.add(key)
+                    queued.append(key)
+        if not queued:
+            return 0
+        _ready, missing = self._partition_kline_ready(queued)
+        remaining = list(missing)
+        seeded_coins = 0
+        cap = max(int(Config.kline_bootstrap_coins_per_minute()), 1)
+        while remaining and seeded_coins < cap:
+            n = self._bootstrap_missing_scan_klines(remaining)
+            if n <= 0:
+                break
+            seeded_coins += 1
+            target = self._next_bootstrap_symbol(remaining)
+            remaining = [symbol for symbol in remaining if symbol != target]
+            if target and not self.snapshot_factory.has_complete_klines(target):
+                self.note_kline_cache_miss(target)
+                if funnel is not None:
+                    funnel.note_kline_pending(target)
+        return seeded_coins
 
     def populate_warmup_klines(self) -> int:
         """One symbol of paced REST klines during WARMUP_MODE cache populate."""
@@ -375,8 +470,11 @@ class EventScanOrchestrator:
                 )
 
         ready, still = self._partition_kline_ready([target])
+        funnel = getattr(self, "funnel", None)
         for symbol in still:
             self.note_kline_cache_miss(symbol)
+            if funnel is not None:
+                funnel.note_kline_pending(symbol)
         if not ready:
             return []
 
@@ -385,6 +483,18 @@ class EventScanOrchestrator:
         book_map = self._ws_book_map(ticker_map)
         trigger_tfs = Config.get_scan_trigger_timeframes()
         primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
+        score_fn = getattr(self, "_score_and_promote_symbol", None)
+        if funnel is not None and callable(score_fn):
+            for symbol in ready:
+                if symbol in open_symbols:
+                    continue
+                score_fn(
+                    symbol,
+                    timeframe=primary_tf,
+                    open_symbols=open_symbols,
+                    ticker_map=ticker_map,
+                    book_map=book_map,
+                )
         candidates = self._evaluate_symbols_ws(
             ready,
             timeframe=primary_tf,
@@ -695,17 +805,30 @@ class EventScanOrchestrator:
             self._hub.subscribe_kline_streams(normal_due)
         ready, missing = self._partition_kline_ready(normal_due)
         self._note_missing_scan_klines(missing)
+        if missing:
+            self._bootstrap_missing_scan_klines(missing)
+            ready, missing = self._partition_kline_ready(normal_due)
+            self._note_missing_scan_klines(missing)
+        self._retry_pending_kline_bootstrap(exclude=set(normal_due))
+        scored: list[str] = []
         for symbol in ready:
             if symbol in open_symbols:
                 continue
-            scores = self._score_symbol(
+            if self._score_and_promote_symbol(
                 symbol,
                 timeframe=primary_tf,
                 open_symbols=open_symbols,
                 ticker_map=ticker_map,
                 book_map=book_map,
-            )
-            self.funnel.record_normal_scan(symbol, scores)
+            ):
+                scored.append(symbol)
+        self._score_ready_pending(
+            already=scored,
+            timeframe=primary_tf,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+        )
 
         if not self._rest_is_blocked():
             self._enqueue_due_hot_rest(now)
@@ -857,6 +980,8 @@ class EventScanOrchestrator:
                 ticker_map=ticker_map,
                 book_map=book_map,
             )
+            if scores is None:
+                continue
             if not scores:
                 self.funnel.on_backtest_failed(symbol, "hot_rescore_empty")
                 continue
@@ -907,12 +1032,14 @@ class EventScanOrchestrator:
         open_symbols: set[str],
         ticker_map: dict[str, Any],
         book_map: dict[str, Any],
-    ) -> list[StrategyScore]:
+    ) -> Optional[list[StrategyScore]]:
+        if not self.snapshot_factory.has_complete_klines(symbol):
+            self._note_missing_scan_klines([symbol])
+            return None
         snapshot = self._build_eval_snapshot(symbol, ticker_map, book_map)
         if snapshot is None:
-            self.note_kline_cache_miss(symbol)
-            self._log_kline_bootstrap_pending(symbol)
-            return []
+            self._note_missing_scan_klines([symbol])
+            return None
         bar_open_ms = 0
         if self._hub:
             closed = self._hub.get_last_closed_bar_open_ms(symbol, timeframe)

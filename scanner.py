@@ -83,8 +83,8 @@ class MarketScanner:
 
     def ensure_scan_klines_ready(self, symbols: Optional[list[str]] = None) -> int:
         """
-        One-time REST kline seed for scan universe — runs outside scan_context.
-        Skips pairs already bootstrapped; safe to call before each scan batch.
+        REST kline seed for at most 2 coins (Normal ingest pace). Remaining
+        symbols wait for the funnel queue so used-weight never spikes.
         """
         if not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP or not self._hub:
             return 0
@@ -92,15 +92,19 @@ class MarketScanner:
             return 0
         if symbols is None:
             symbols, _ = self.get_tradable_symbols()
-        if not symbols:
+        batch = [str(s).upper() for s in (symbols or []) if s]
+        if not batch:
             return 0
-
+        pace = Config.kline_bootstrap_coins_per_minute()
+        batch = batch[:pace]
         timeframes = Config.get_scan_kline_intervals()
+        self._hub.subscribe_kline_streams(batch)
         with self.exchange.bootstrap_context():
-            return self._hub.subscribe_and_bootstrap_klines(
-                symbols,
+            return self._hub.bootstrap_klines_for_symbols(
+                batch,
                 timeframes,
                 self.exchange.fetch_bootstrap_klines_df,
+                max_pairs=len(timeframes) * len(batch),
             )
 
     def refresh_event_universe(self) -> list[str]:
@@ -144,15 +148,16 @@ class MarketScanner:
         return candidates
 
     def bootstrap_hot_symbols_at_startup(self) -> int:
-        """Paced REST bootstrap for Tier-1 hot watchlist only."""
+        """WS-subscribe + REST seed at most 2 coins; funnel paces the rest at 2/min."""
         if not Config.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP or not self._hub:
             return 0
         if self.orchestrator is None:
             return self.ensure_scan_klines_ready()
-        symbols = self.orchestrator.priority_queue.hot_symbols
+        symbols = list(self.orchestrator.priority_queue.hot_symbols or [])
         if not symbols:
-            symbols = self.orchestrator.tier1_symbols[: Config.scan_watchlist_size()]
-        return self.ensure_scan_klines_ready(symbols)
+            symbols = list(self.orchestrator.tier1_symbols or [])
+        pace = Config.kline_bootstrap_coins_per_minute()
+        return self.ensure_scan_klines_ready(symbols[:pace])
 
     def bootstrap_background_klines(self) -> int:
         """Paced REST bootstrap for queued scan misses / one background symbol."""
@@ -162,7 +167,7 @@ class MarketScanner:
             or self.orchestrator is None
         ):
             return 0
-        symbols = self.orchestrator.take_kline_cache_misses(8)
+        symbols = self.orchestrator.take_kline_cache_misses(1)
         if not symbols:
             symbols = self.orchestrator.priority_queue.next_background_bootstrap_symbols(1)
         if not symbols:
@@ -233,6 +238,7 @@ class MarketScanner:
             "currently_scanning": "",
             "recently_scanned": [],
             "normal_scores": {},
+            "kline_pending": [],
             "flush_minutes": 180,
             "flush_count": 0,
         }
@@ -241,7 +247,13 @@ class MarketScanner:
         orchestrator = self.orchestrator
         funnel = getattr(orchestrator, "funnel", None)
         snap = funnel.watchlist_snapshot() if funnel is not None else {}
-        recently = list(snap.get("recently_scanned") or [])
+        recently = [str(s).upper() for s in (snap.get("recently_scanned") or []) if s]
+        scores = {
+            str(k).upper(): float(v)
+            for k, v in dict(snap.get("normal_scores") or {}).items()
+        }
+        pending = {str(k).upper() for k in (snap.get("kline_pending") or []) if k}
+        pending.update(key for key in recently if key not in scores)
         ingested = list(getattr(funnel, "normal_symbols", None) or [])
         flush_count = int(snap.get("flush_count") or 0)
         self._total_flush_count = flush_count
@@ -265,7 +277,8 @@ class MarketScanner:
             "ingested_count": int(snap.get("ingested_count") or len(ingested)),
             "currently_scanning": str(snap.get("currently_scanning") or ""),
             "recently_scanned": recently,
-            "normal_scores": dict(snap.get("normal_scores") or {}),
+            "normal_scores": scores,
+            "kline_pending": [key for key in recently if key in pending],
             "flush_minutes": int(snap.get("flush_minutes") or 0),
             "flush_count": flush_count,
         }
