@@ -705,8 +705,7 @@ class EventScanOrchestrator:
                 ticker_map=ticker_map,
                 book_map=book_map,
             )
-            if scores:
-                self.funnel.promote_from_normal(symbol, scores)
+            self.funnel.record_normal_scan(symbol, scores)
 
         if not self._rest_is_blocked():
             self._enqueue_due_hot_rest(now)
@@ -740,8 +739,9 @@ class EventScanOrchestrator:
                 if signal is not None:
                     candidates.append(signal)
                 else:
-                    self.funnel.demote_super(
-                        super_rec.symbol, reason="super_setup_not_ready"
+                    scanner_logger.info(
+                        "[TIER_SUPER] %s setup not ready this minute — stay Super",
+                        super_rec.symbol,
                     )
 
         universe_total = len(self.funnel.scan_pool()) or len(self._tier1_symbols)
@@ -968,15 +968,17 @@ class EventScanOrchestrator:
             return None
         from core.strategy_score_ranges import score_range_for
 
+        rec = self.funnel._super.get(symbol.upper())
         band = score_range_for(signal.strategy)
-        if not band.meets_super(signal.score):
+        live = float(signal.score or 0.0)
+        remembered = float(rec.score or 0.0) if rec is not None else 0.0
+        if not band.meets_super(max(live, remembered)):
             log_scan_rejected(
                 symbol,
-                f"super score {signal.score:.1f} below {band.super_score:.1f}",
+                f"super score {live:.1f} below {band.super_score:.1f}",
                 strategy=signal.strategy,
             )
             return None
-        rec = self.funnel._super.get(symbol.upper())
         if rec is not None:
             meta = dict(rec.candidate.get("structure_metadata") or {})
             meta.update(signal.structure_metadata or {})

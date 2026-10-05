@@ -61,6 +61,8 @@ class TierFunnel:
         self._current_symbol: str = ""
         self._last_normal_take: float = 0.0
         self._last_flushed: list[str] = []
+        self._flush_count: int = 0
+        self._normal_scores: dict[str, float] = {}
         self._recently_scanned: deque[str] = deque(
             maxlen=max(int(Config.NORMAL_TIER_UNIVERSE_SIZE), 1)
         )
@@ -111,6 +113,32 @@ class TierFunnel:
     @property
     def last_flushed(self) -> list[str]:
         return list(self._last_flushed)
+
+    @property
+    def flush_count(self) -> int:
+        return int(self._flush_count)
+
+    def note_normal_score(self, symbol: str, score: float) -> None:
+        key = str(symbol or "").upper()
+        if not key:
+            return
+        incoming = max(float(score or 0.0), 0.0)
+        if incoming <= 0:
+            self._normal_scores.setdefault(key, 0.0)
+            return
+        self._normal_scores[key] = incoming
+
+    def record_normal_scan(
+        self, symbol: str, scores: list[StrategyScore]
+    ) -> Optional[HotRecord]:
+        """Store the display score, then promote when Hot-band is met."""
+        self.note_normal_score(str(symbol).upper(), _display_score(scores))
+        if not scores:
+            return None
+        return self.promote_from_normal(symbol, scores)
+
+    def normal_score(self, symbol: str) -> float:
+        return float(self._normal_scores.get(str(symbol).upper(), 0.0))
 
     @property
     def hot_symbols(self) -> list[str]:
@@ -173,6 +201,9 @@ class TierFunnel:
         self._last_normal_take = 0.0
         self._last_flushed = list(outgoing)
         self._recently_scanned.clear()
+        self._normal_scores = {
+            key: val for key, val in self._normal_scores.items() if key in keep_keys
+        }
         if outgoing:
             scanner_logger.info(
                 "[TIER_NORMAL] flushed %s non-setup symbol(s); kept hot=%s super=%s.",
@@ -208,6 +239,7 @@ class TierFunnel:
         self._normal_index = 0
         self._lock_started = now
         self._lock_cycle += 1
+        self._flush_count = self._lock_cycle
         self._pass_number = 1
         self._scans_this_window = 0
         self._recently_scanned = deque(maxlen=cap)
@@ -321,7 +353,12 @@ class TierFunnel:
             "ingested_count": len(self._normal),
             "currently_scanning": self._current_symbol,
             "recently_scanned": list(self._recently_scanned),
+            "normal_scores": {
+                key: float(self._normal_scores.get(key, 0.0))
+                for key in self._recently_scanned
+            },
             "flush_minutes": self.flush_minutes_remaining(stamp),
+            "flush_count": self._flush_count,
             "lock_cycle": self._lock_cycle,
         }
 
@@ -384,14 +421,15 @@ class TierFunnel:
         if not ranked:
             return None
         best = ranked[0]
-        if not score_range_for(best.strategy).meets_hot(best.score):
+        best_score = _effective_score(best)
+        if not score_range_for(best.strategy).meets_hot(best_score):
             return None
         backups = tuple(row.strategy for row in ranked[1:3])
         rec = HotRecord(
             symbol=key,
             strategy=best.strategy,
             backup_strategies=backups,
-            score=best.score,
+            score=best_score,
             action=str(best.action or "NEUTRAL"),
             metadata=dict(extra or {}),
         )
@@ -400,7 +438,7 @@ class TierFunnel:
         self._promoted.add(key)
         backup_label = ", ".join(backups) if backups else "none"
         msg = (
-            f"[TIER_HOT] promote {key} | {best.strategy} score={best.score:.1f} "
+            f"[TIER_HOT] promote {key} | {best.strategy} score={best_score:.1f} "
             f"(backups: {backup_label})"
         )
         scanner_logger.info(msg)
@@ -408,7 +446,7 @@ class TierFunnel:
             "🔥 <b>Hot Tier promotion</b>\n"
             f"🪙 {key}\n"
             f"🧠 {best.strategy} ({backup_label})\n"
-            f"📊 score={best.score:.1f}"
+            f"📊 score={best_score:.1f}"
         )
         return rec
 
@@ -467,7 +505,7 @@ class TierFunnel:
         ranked = _ranked_scores(scores)
         by_tag = {row.strategy: row for row in ranked}
         primary = by_tag.get(rec.strategy)
-        primary_score = primary.score if primary else 0.0
+        primary_score = _effective_score(primary) if primary is not None else 0.0
         if primary is not None and score_range_for(rec.strategy).meets_super(
             primary_score
         ):
@@ -478,16 +516,17 @@ class TierFunnel:
             row = by_tag.get(backup)
             if row is None:
                 continue
-            if score_range_for(backup).meets_super(row.score):
+            backup_score = _effective_score(row)
+            if score_range_for(backup).meets_super(backup_score):
                 scanner_logger.info(
                     "[TIER_HOT] %s switch %s → %s score=%.1f (super)",
                     key,
                     rec.strategy,
                     backup,
-                    row.score,
+                    backup_score,
                 )
                 rec.strategy = backup
-                rec.score = row.score
+                rec.score = backup_score
                 rec.action = str(row.action or rec.action)
                 rec.backup_index += 1
                 self._promote_super(rec, row, candidate)
@@ -502,16 +541,17 @@ class TierFunnel:
             row = by_tag.get(backup)
             if row is None:
                 continue
-            if score_range_for(backup).meets_hot(row.score):
+            backup_score = _effective_score(row)
+            if score_range_for(backup).meets_hot(backup_score):
                 scanner_logger.info(
                     "[TIER_HOT] %s switch %s → %s score=%.1f",
                     key,
                     rec.strategy,
                     backup,
-                    row.score,
+                    backup_score,
                 )
                 rec.strategy = backup
-                rec.score = row.score
+                rec.score = backup_score
                 rec.action = str(row.action or rec.action)
                 rec.backup_index += 1
                 return "HOT"
@@ -566,9 +606,10 @@ class TierFunnel:
     ) -> None:
         key = rec.symbol
         payload = dict(candidate or {})
+        effective = _effective_score(score)
         payload.setdefault("symbol", key)
         payload.setdefault("strategy", score.strategy)
-        payload.setdefault("score", score.score)
+        payload.setdefault("score", effective)
         payload.setdefault("action", score.action)
         meta = dict(payload.get("structure_metadata") or {})
         meta["funnel_tier"] = "SUPER"
@@ -586,20 +627,20 @@ class TierFunnel:
             symbol=key,
             strategy=score.strategy,
             backup_strategies=rec.backup_strategies,
-            score=score.score,
+            score=effective,
             candidate=payload,
         )
         scanner_logger.info(
             "[TIER_SUPER] promote %s | %s score=%.1f",
             key,
             score.strategy,
-            score.score,
+            effective,
         )
         self._emit(
             "⭐ <b>Super Tier promotion</b>\n"
             f"🪙 {key}\n"
             f"🧠 {score.strategy}\n"
-            f"📊 score={score.score:.1f}"
+            f"📊 score={effective:.1f}"
         )
 
     def _demote_hot(self, symbol: str, *, reason: str) -> None:
@@ -627,11 +668,30 @@ class TierFunnel:
             pass
 
 
+def _effective_score(row: StrategyScore) -> float:
+    """Watchlist / funnel confidence: best of confluence final vs raw score.
+
+    `final_score or score` treats a stored 0.0 final as missing, but also hid
+    a positive raw score whenever callers ranked on `score > 0` only. Always
+    take the max so /watchlist matches the Hot/Super gate.
+    """
+    return max(float(row.final_score or 0.0), float(row.score or 0.0), 0.0)
+
+
+def _display_score(scores: list[StrategyScore]) -> float:
+    ranked = _ranked_scores(scores)
+    if ranked:
+        return _effective_score(ranked[0])
+    if not scores:
+        return 0.0
+    return _effective_score(max(scores, key=_effective_score))
+
+
 def _ranked_scores(scores: list[StrategyScore]) -> list[StrategyScore]:
-    valid = [row for row in scores if row.score > 0]
+    valid = [row for row in scores if _effective_score(row) > 0]
     valid.sort(
         key=lambda row: (
-            row.final_score or row.score,
+            _effective_score(row),
             row.normalized_score,
             row.score,
             row.adjusted_score,

@@ -14,7 +14,17 @@ from core.types import StrategyScore
 from pipeline.event_scan_orchestrator import EventScanOrchestrator
 
 
-def _score(symbol: str, strategy: str, score: float) -> StrategyScore:
+_FUNNEL_SCORE_ENV = {
+    "SMC_TREND_HOT_SCORE": "",
+    "SMC_TREND_SUPER_SCORE": "",
+    "RANGE_REVERSION_HOT_SCORE": "",
+    "RANGE_REVERSION_SUPER_SCORE": "",
+}
+
+
+def _score(
+    symbol: str, strategy: str, score: float, *, final_score: float = 0.0
+) -> StrategyScore:
     return StrategyScore(
         symbol=symbol,
         strategy=strategy,
@@ -23,22 +33,23 @@ def _score(symbol: str, strategy: str, score: float) -> StrategyScore:
         min_score=70.0,
         normalized_score=score,
         action="LONG",
+        final_score=final_score,
     )
 
 
 class TestStrategyScoreRanges(unittest.TestCase):
     def test_smc_and_range_bands(self) -> None:
-        with patch.object(Config, "USE_TESTNET", False), patch.object(
-            Config, "TESTNET_RELAX_STRATEGY_THRESHOLDS", False
-        ):
+        with patch.dict("os.environ", _FUNNEL_SCORE_ENV, clear=False), patch.object(
+            Config, "USE_TESTNET", False
+        ), patch.object(Config, "TESTNET_RELAX_STRATEGY_THRESHOLDS", False):
             smc = score_range_for("SMC_TREND")
             rng = score_range_for("RANGE_REVERSION")
-        self.assertEqual(smc.classify(69.0), "NORMAL")
-        self.assertEqual(smc.classify(70.0), "HOT")
-        self.assertEqual(smc.classify(80.0), "SUPER")
-        self.assertEqual(rng.classify(64.0), "NORMAL")
-        self.assertEqual(rng.classify(65.0), "HOT")
-        self.assertEqual(rng.classify(75.0), "SUPER")
+        self.assertEqual(smc.classify(61.0), "NORMAL")
+        self.assertEqual(smc.classify(62.0), "HOT")
+        self.assertEqual(smc.classify(72.0), "SUPER")
+        self.assertEqual(rng.classify(57.0), "NORMAL")
+        self.assertEqual(rng.classify(58.0), "HOT")
+        self.assertEqual(rng.classify(68.0), "SUPER")
         self.assertEqual(classify_score("SMC_TREND", 81.0), smc.classify(81.0))
 
 
@@ -82,6 +93,64 @@ class TestTierFunnel(unittest.TestCase):
         self.assertEqual(funnel.pass_number, 1)
         self.assertFalse(funnel.lock_expired(10.0 + 3 * 3600.0 - 1))
         self.assertTrue(funnel.lock_expired(10.0 + 3 * 3600.0))
+        self.assertEqual(funnel.flush_count, 1)
+
+    def test_record_normal_scan_stores_score(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["AAAUSDT", "BBBUSDT"], now=1.0)
+        self.assertEqual(funnel.flush_count, 1)
+        funnel.record_normal_scan(
+            "AAAUSDT", [_score("AAAUSDT", "SMC_TREND", 62.0)]
+        )
+        self.assertAlmostEqual(funnel.normal_score("AAAUSDT"), 62.0)
+        funnel.record_normal_scan("AAAUSDT", [])
+        self.assertAlmostEqual(funnel.normal_score("AAAUSDT"), 62.0)
+        funnel.record_normal_scan("BBBUSDT", [])
+        self.assertEqual(funnel.normal_score("BBBUSDT"), 0.0)
+        funnel.replace_normal_universe(["CCCUSDT"], now=2.0)
+        self.assertEqual(funnel.flush_count, 2)
+
+    def test_watchlist_uses_final_or_raw_score(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["AAAUSDT", "BBBUSDT"], now=1.0)
+        self.assertEqual(funnel.take_normal(now=1.0), ["AAAUSDT"])
+        self.assertEqual(funnel.take_normal(now=31.0), ["BBBUSDT"])
+        funnel.record_normal_scan(
+            "AAAUSDT",
+            [_score("AAAUSDT", "SMC_TREND", 50.0, final_score=71.0)],
+        )
+        self.assertAlmostEqual(funnel.normal_score("AAAUSDT"), 71.0)
+        funnel.record_normal_scan(
+            "BBBUSDT",
+            [_score("BBBUSDT", "SMC_TREND", 62.0, final_score=0.0)],
+        )
+        self.assertAlmostEqual(funnel.normal_score("BBBUSDT"), 62.0)
+        snap = funnel.watchlist_snapshot(now=31.0)
+        self.assertAlmostEqual(snap["normal_scores"]["AAAUSDT"], 71.0)
+        self.assertAlmostEqual(snap["normal_scores"]["BBBUSDT"], 62.0)
+
+    def test_typical_smc_score_promotes_to_hot(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["AAAUSDT", "BBBUSDT"], now=1.0)
+        with patch.dict("os.environ", _FUNNEL_SCORE_ENV, clear=False), patch.object(
+            Config, "USE_TESTNET", False
+        ), patch.object(Config, "TESTNET_RELAX_STRATEGY_THRESHOLDS", False):
+            rec = funnel.promote_from_normal(
+                "AAAUSDT",
+                [_score("AAAUSDT", "SMC_TREND", 50.0, final_score=64.0)],
+            )
+            self.assertIsNotNone(rec)
+            self.assertAlmostEqual(rec.score, 64.0)
+            self.assertIsNone(
+                funnel.promote_from_normal(
+                    "BBBUSDT", [_score("BBBUSDT", "SMC_TREND", 61.0)]
+                )
+            )
+            self.assertIsNotNone(
+                funnel.promote_from_normal(
+                    "BBBUSDT", [_score("BBBUSDT", "SMC_TREND", 62.0)]
+                )
+            )
 
     def test_three_passes_flush_keeps_hot(self) -> None:
         funnel = TierFunnel()
@@ -153,13 +222,16 @@ class TestTierFunnel(unittest.TestCase):
             ingested_count=42,
             currently_scanning="ETHUSDT",
             flush_minutes=97,
+            flush_count=2,
+            normal_scores={"ETHUSDT": 62.0, "BTCUSDT": 0.0},
         )
         self.assertIn("3-Tier Dynamic Scan Funnel", text)
         self.assertIn("Pass 2 of 3", text)
-        self.assertIn("3h Flush in 97 mins", text)
+        self.assertIn("Flush #2 (Next in 97 mins)", text)
         self.assertIn("[#42/120] ETHUSDT", text)
         self.assertIn("Normal Tier</b> (42/120)", text)
-        self.assertIn("1. ETHUSDT 👈 (Just Scanned)", text)
+        self.assertIn("1. ETHUSDT [62%] 👈 (Just Scanned)", text)
+        self.assertIn("2. BTCUSDT [0%]", text)
         self.assertIn("No Hot promotions yet", text)
         self.assertIn("No Super setups ready", text)
         self.assertIn("SCANNER: DYNAMIC 2-COIN/MIN ACTIVE", text)
@@ -251,15 +323,15 @@ class TestTierFunnel(unittest.TestCase):
         parked = funnel.take_hot_for_rescore(now=65.0)
         self.assertIsNotNone(parked)
         self.assertEqual(parked.symbol, "AAAUSDT")
-        with patch.object(Config, "USE_TESTNET", False), patch.object(
-            Config, "TESTNET_RELAX_STRATEGY_THRESHOLDS", False
-        ):
+        with patch.dict("os.environ", _FUNNEL_SCORE_ENV, clear=False), patch.object(
+            Config, "USE_TESTNET", False
+        ), patch.object(Config, "TESTNET_RELAX_STRATEGY_THRESHOLDS", False):
             self.assertEqual(
                 funnel.apply_hot_scores(
                     "AAAUSDT",
                     [
                         _score("AAAUSDT", "SMC_TREND", 60.0),
-                        _score("AAAUSDT", "RANGE_REVERSION", 68.0),
+                        _score("AAAUSDT", "RANGE_REVERSION", 64.0),
                     ],
                 ),
                 "HOT",

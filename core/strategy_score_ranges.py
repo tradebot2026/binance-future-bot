@@ -1,8 +1,8 @@
 """Per-strategy Super / Hot / Normal score thresholds.
 
 Override any strategy with env:
-  {STRATEGY}_SUPER_SCORE=80
-  {STRATEGY}_HOT_SCORE=70
+  {STRATEGY}_SUPER_SCORE=72
+  {STRATEGY}_HOT_SCORE=62
 """
 
 from __future__ import annotations
@@ -42,16 +42,18 @@ class StrategyScoreRange:
         return score >= self.super_score
 
 
+# Funnel floors are below execution min-score so valid mid-setup coins can
+# enter Hot REST / Super rotation instead of stalling in Normal.
 _DEFAULT_SUPER: dict[str, float] = {
-    STRATEGY_SMC_TREND: 80.0,
-    STRATEGY_SMC_LEGACY: 80.0,
-    STRATEGY_RANGE_REVERSION: 75.0,
+    STRATEGY_SMC_TREND: 72.0,
+    STRATEGY_SMC_LEGACY: 72.0,
+    STRATEGY_RANGE_REVERSION: 68.0,
 }
 
 _DEFAULT_HOT: dict[str, float] = {
-    STRATEGY_SMC_TREND: 70.0,
-    STRATEGY_SMC_LEGACY: 70.0,
-    STRATEGY_RANGE_REVERSION: 65.0,
+    STRATEGY_SMC_TREND: 62.0,
+    STRATEGY_SMC_LEGACY: 62.0,
+    STRATEGY_RANGE_REVERSION: 58.0,
 }
 
 _MIN_SCORE_ATTR: dict[str, str] = {

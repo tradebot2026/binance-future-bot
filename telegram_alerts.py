@@ -437,6 +437,8 @@ def format_watchlist_message(
     currently_scanning: str = "",
     recently_scanned: Optional[list[str]] = None,
     flush_minutes: int = 180,
+    flush_count: int = 0,
+    normal_scores: Optional[dict[str, float]] = None,
 ) -> str:
     """Format /watchlist — paced Normal ingest plus Hot / Super."""
     universe = max(int(universe_size or Config.NORMAL_TIER_UNIVERSE_SIZE), 1)
@@ -449,19 +451,26 @@ def format_watchlist_message(
     pass_n = max(int(pass_number or 1), 1)
     pass_total = max(int(passes_total or 3), 1)
     flush_m = max(int(flush_minutes or 0), 0)
+    flush_n = max(int(flush_count or lock_cycle or 0), 0)
+    scores = {str(k).upper(): float(v or 0.0) for k, v in (normal_scores or {}).items()}
 
     lines = [
         "📡 <b>3-Tier Dynamic Scan Funnel</b>",
         "─────────────────────────────────",
-        f"🔄 Scan Window: Pass {pass_n} of {pass_total} | 3h Flush in {flush_m} mins",
+        (
+            f"🔄 Scan Window: Pass {pass_n} of {pass_total} | "
+            f"Flush #{flush_n} (Next in {flush_m} mins)"
+        ),
         f"🎯 Currently Scanning: [#{index}/{universe}] {escape_html(scanning) or '—'}",
         "",
         f"🌐 <b>Normal Tier</b> ({ingested}/{universe}) • 2 coins/min",
     ]
     if recent:
         for i, symbol in enumerate(recent[:10], start=1):
+            key = str(symbol).upper()
+            pct = int(round(max(scores.get(key, 0.0), 0.0)))
             marker = " 👈 (Just Scanned)" if i == 1 else ""
-            lines.append(f"{i}. {escape_html(symbol)}{marker}")
+            lines.append(f"{i}. {escape_html(key)} [{pct}%]{marker}")
         remaining = max(ingested - min(len(recent), 10), 0) + max(universe - ingested, 0)
         if remaining > 0:
             lines.append(f"+ {remaining} more queued")

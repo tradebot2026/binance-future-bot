@@ -136,15 +136,17 @@ def backtest_min_bars() -> int:
 
 
 def required_backtest_win_rate(trades: int) -> Optional[float]:
-    """Min win-rate for a closed-trade sample, or None if the sample is too thin."""
+    """Min win-rate for a closed-trade sample, or None if the sample is too thin.
+
+    Hot-tier REST gate: three closed trades at 2/3 WR is enough to promote.
+    Four or more trades use BACKTEST_MIN_WIN_RATE (default 60%).
+    """
     closed = int(trades)
-    if closed >= 5:
-        return float(Config.BACKTEST_MIN_WIN_RATE)
-    if closed == 4:
-        return 75.0
+    if closed < 3:
+        return None
     if closed == 3:
-        return 100.0
-    return None
+        return 66.0
+    return float(Config.BACKTEST_MIN_WIN_RATE)
 
 
 def run_15m_backtest(df: Optional[pd.DataFrame]) -> BacktestResult:

@@ -933,6 +933,8 @@ class TelegramManager:
                 currently_scanning=str(tiers.get("currently_scanning") or ""),
                 recently_scanned=list(tiers.get("recently_scanned") or []),
                 flush_minutes=int(tiers.get("flush_minutes") or 0),
+                flush_count=int(tiers.get("flush_count") or 0),
+                normal_scores=dict(tiers.get("normal_scores") or {}),
             )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"

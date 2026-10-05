@@ -162,8 +162,8 @@ class TestFifteenMinuteBacktest(unittest.TestCase):
     def test_required_win_rate_tiers(self) -> None:
         self.assertIsNone(required_backtest_win_rate(0))
         self.assertIsNone(required_backtest_win_rate(2))
-        self.assertEqual(required_backtest_win_rate(3), 100.0)
-        self.assertEqual(required_backtest_win_rate(4), 75.0)
+        self.assertEqual(required_backtest_win_rate(3), 66.0)
+        self.assertEqual(required_backtest_win_rate(4), 60.0)
         self.assertEqual(required_backtest_win_rate(5), 60.0)
         self.assertEqual(required_backtest_win_rate(12), 60.0)
 
@@ -179,8 +179,14 @@ class TestFifteenMinuteBacktest(unittest.TestCase):
         self.assertEqual(result.trades, 3)
         self.assertEqual(result.win_rate, 100.0)
 
-    def test_rejects_imperfect_three_trade_sample(self) -> None:
+    def test_passes_two_of_three(self) -> None:
         result = _run_with_outcomes([1.0, 1.0, -1.0])
+        self.assertTrue(result.passed)
+        self.assertEqual(result.trades, 3)
+        self.assertGreaterEqual(result.win_rate, 66.0)
+
+    def test_rejects_one_of_three(self) -> None:
+        result = _run_with_outcomes([1.0, -1.0, -1.0])
         self.assertFalse(result.passed)
         self.assertEqual(result.trades, 3)
         self.assertIn("win_rate", result.reason)
@@ -189,7 +195,7 @@ class TestFifteenMinuteBacktest(unittest.TestCase):
         result = _run_with_outcomes([1.0, 1.0, 1.0, -1.0])
         self.assertTrue(result.passed)
         self.assertEqual(result.trades, 4)
-        self.assertGreaterEqual(result.win_rate, 75.0)
+        self.assertGreaterEqual(result.win_rate, 60.0)
 
     def test_rejects_two_of_four(self) -> None:
         result = _run_with_outcomes([1.0, 1.0, -1.0, -1.0])

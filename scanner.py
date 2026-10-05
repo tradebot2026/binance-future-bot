@@ -49,6 +49,7 @@ class MarketScanner:
         self._pipeline = StrategyScannerPipeline(exchange, db)
         self._universe_builder = UniverseBuilder(exchange, db)
         self.orchestrator = EventScanOrchestrator(exchange, db)
+        self._total_flush_count: int = 0
 
     @property
     def _last_universe_symbols(self) -> list[str]:
@@ -209,6 +210,13 @@ class MarketScanner:
             drop(symbol)
         return len(symbols)
 
+    @property
+    def total_flush_count(self) -> int:
+        funnel = getattr(self.orchestrator, "funnel", None) if self.orchestrator else None
+        if funnel is not None:
+            self._total_flush_count = int(getattr(funnel, "flush_count", 0) or 0)
+        return int(self._total_flush_count)
+
     def get_watchlist_tiers(self) -> dict[str, Any]:
         """Return live Normal ingest progress plus Hot/Super snapshots."""
         empty = {
@@ -224,7 +232,9 @@ class MarketScanner:
             "ingested_count": 0,
             "currently_scanning": "",
             "recently_scanned": [],
+            "normal_scores": {},
             "flush_minutes": 180,
+            "flush_count": 0,
         }
         if self.orchestrator is None:
             return empty
@@ -233,6 +243,8 @@ class MarketScanner:
         snap = funnel.watchlist_snapshot() if funnel is not None else {}
         recently = list(snap.get("recently_scanned") or [])
         ingested = list(getattr(funnel, "normal_symbols", None) or [])
+        flush_count = int(snap.get("flush_count") or 0)
+        self._total_flush_count = flush_count
         return {
             "tier1_hot": list(getattr(funnel, "hot_symbols", None) or orchestrator.priority_queue.hot_symbols),
             "tier1_background": orchestrator.priority_queue.background_symbols,
@@ -253,5 +265,7 @@ class MarketScanner:
             "ingested_count": int(snap.get("ingested_count") or len(ingested)),
             "currently_scanning": str(snap.get("currently_scanning") or ""),
             "recently_scanned": recently,
+            "normal_scores": dict(snap.get("normal_scores") or {}),
             "flush_minutes": int(snap.get("flush_minutes") or 0),
+            "flush_count": flush_count,
         }
