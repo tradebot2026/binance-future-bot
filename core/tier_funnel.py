@@ -26,6 +26,8 @@ class HotRecord:
     score: float = 0.0
     action: str = "NEUTRAL"
     backtest_passed: bool = False
+    backtest_pending: bool = False
+    pending_reason: str = ""
     backup_index: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -78,6 +80,9 @@ class TierFunnel:
         self._hot_clock = MinuteWindow(Config.HOT_TIER_COINS_PER_MINUTE)
         self._super_clock = MinuteWindow(Config.SUPER_TIER_COINS_PER_MINUTE)
         self._pending_hot_rest: set[str] = set()
+        self._digest_lines: list[str] = []
+        self._digest_started: float = 0.0
+        self._super_skip_tg_at: dict[str, float] = {}
 
     @property
     def normal_symbols(self) -> list[str]:
@@ -392,6 +397,7 @@ class TierFunnel:
             "flush_minutes": self.flush_minutes_remaining(stamp),
             "flush_count": self._flush_count,
             "lock_cycle": self._lock_cycle,
+            "hot_backtest_pending": self.pending_backtest_symbols(),
         }
 
     def take_hot_for_rest(self, now: float | None = None) -> Optional[HotRecord]:
@@ -478,7 +484,9 @@ class TierFunnel:
             "🔥 <b>Hot Tier promotion</b>\n"
             f"🪙 {key}\n"
             f"🧠 {best.strategy} ({backup_label})\n"
-            f"📊 score={best_score:.1f}"
+            f"📊 score={best_score:.1f}",
+            instant=False,
+            digest=f"⬆️ Hot: {key} | {best.strategy} | {best_score:.0f}",
         )
         return rec
 
@@ -489,18 +497,41 @@ class TierFunnel:
         """Clear REST-in-flight so the coin can retry (e.g. -1003 deferred)."""
         self._pending_hot_rest.discard(str(symbol).upper())
 
+    def note_hot_backtest_pending(self, symbol: str, reason: str = "") -> None:
+        """Keep the coin in Hot while 15m history bootstraps — do not demote."""
+        key = str(symbol).upper()
+        self._pending_hot_rest.discard(key)
+        rec = self._hot.get(key)
+        if rec is None or rec.backtest_passed:
+            return
+        rec.backtest_pending = True
+        rec.pending_reason = str(reason or "Need 200+ closed 15m bars")
+        scanner_logger.info(
+            "[TIER_HOT] %s [Pending Backtest] — %s",
+            key,
+            rec.pending_reason,
+        )
+
+    def pending_backtest_symbols(self) -> list[str]:
+        return [
+            rec.symbol
+            for rec in (self._hot[s] for s in self._hot_order if s in self._hot)
+            if rec.backtest_pending and not rec.backtest_passed
+        ]
+
     def on_backtest_failed(self, symbol: str, reason: str = "") -> None:
         key = str(symbol).upper()
         self._pending_hot_rest.discard(key)
         rec = self._hot.get(key)
         if rec is None:
             return
+        label = str(reason or "Backtest rejected").strip() or "Backtest rejected"
         scanner_logger.info(
-            "[TIER_HOT] demote %s — backtest failed (%s)",
+            "[TIER_HOT] demote %s — %s",
             key,
-            reason or "rejected",
+            label,
         )
-        self._demote_hot(key, reason=reason or "backtest_failed")
+        self._demote_hot(key, reason=label)
 
     def on_backtest_passed(
         self,
@@ -513,6 +544,8 @@ class TierFunnel:
         if rec is None:
             return None
         rec.backtest_passed = True
+        rec.backtest_pending = False
+        rec.pending_reason = ""
         if payload:
             rec.metadata.update(payload)
         return rec
@@ -588,7 +621,7 @@ class TierFunnel:
                 rec.backup_index += 1
                 return "HOT"
 
-        self._demote_hot(key, reason="scores_below_hot")
+        self._demote_hot(key, reason="Score dropped below Hot band")
         return "NORMAL"
 
     def drop_super(self, symbol: str) -> None:
@@ -672,7 +705,9 @@ class TierFunnel:
             "⭐ <b>Super Tier promotion</b>\n"
             f"🪙 {key}\n"
             f"🧠 {score.strategy}\n"
-            f"📊 score={effective:.1f}"
+            f"📊 score={effective:.1f}",
+            instant=True,
+            digest=f"⭐ Super: {key} | {score.strategy} | {effective:.0f}",
         )
 
     def _demote_hot(self, symbol: str, *, reason: str) -> None:
@@ -688,12 +723,69 @@ class TierFunnel:
         self._emit(
             "⬇️ <b>Hot Tier demotion</b>\n"
             f"🪙 {key}\n"
-            f"<i>{reason}</i> — returned to Normal cycle"
+            f"<i>{reason}</i> — returned to Normal cycle",
+            instant=False,
+            digest=f"⬇️ Demote {key} — {reason}",
         )
 
-    def _emit(self, text: str) -> None:
-        if self._notify is None:
+    def note_super_skip(self, symbol: str, reason: str, *, instant: bool = False) -> None:
+        key = str(symbol or "").upper()
+        label = str(reason or "setup not ready").strip()
+        if not key:
             return
+        self._emit(
+            "⚠️ <b>Super setup skipped</b>\n"
+            f"🪙 {key}\n"
+            f"<i>{label}</i>",
+            instant=instant,
+            digest=f"⚠️ Super skip {key} — {label}",
+            instant_cooldown_key=key if instant else "",
+        )
+
+    def maybe_flush_digest(self, now: float | None = None) -> Optional[str]:
+        """Send the hourly Hot/pending summary. Super/live alerts stay instant."""
+        stamp = time.monotonic() if now is None else now
+        interval = max(float(getattr(Config, "FUNNEL_DIGEST_SECONDS", 3600.0)), 60.0)
+        if self._digest_started <= 0:
+            self._digest_started = stamp
+            return None
+        if (stamp - self._digest_started) < interval:
+            return None
+        pending_bt = self.pending_backtest_symbols()
+        if not self._digest_lines and not pending_bt:
+            self._digest_started = stamp
+            return None
+        lines = ["📊 <b>Hourly Funnel Digest</b>"]
+        if self._digest_lines:
+            lines.extend(self._digest_lines)
+        else:
+            lines.append("<i>No Hot promotions or demotions this hour.</i>")
+        if pending_bt:
+            lines.append("⏳ Pending Backtest: " + ", ".join(pending_bt[:20]))
+        self._digest_lines = []
+        self._digest_started = stamp
+        text = "\n".join(lines)
+        self._emit(text, instant=True)
+        return text
+
+    def _emit(
+        self,
+        text: str,
+        *,
+        instant: bool = False,
+        digest: Optional[str] = None,
+        instant_cooldown_key: str = "",
+    ) -> None:
+        if digest:
+            self._digest_lines.append(digest)
+        if not instant or not text or self._notify is None:
+            return
+        if instant_cooldown_key:
+            now = time.monotonic()
+            last = self._super_skip_tg_at.get(instant_cooldown_key, 0.0)
+            if (now - last) < 600.0:
+                return
+            self._super_skip_tg_at[instant_cooldown_key] = now
         try:
             self._notify(text)
         except Exception:

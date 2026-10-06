@@ -862,9 +862,11 @@ class EventScanOrchestrator:
                 if signal is not None:
                     candidates.append(signal)
                 else:
-                    scanner_logger.info(
-                        "[TIER_SUPER] %s setup not ready this minute — stay Super",
+                    self._report_super_skip(
                         super_rec.symbol,
+                        getattr(self, "_last_super_skip_reason", "")
+                        or "No valid Super setup this bar",
+                        instant=bool(getattr(self, "_last_super_skip_instant", False)),
                     )
 
         universe_total = len(self.funnel.scan_pool()) or len(self._tier1_symbols)
@@ -891,6 +893,7 @@ class EventScanOrchestrator:
                 hot=len(self.funnel.hot_symbols),
                 super_n=len(self.funnel.super_symbols),
             )
+        self._funnel_maybe_flush_digest(now)
         return dict_results
 
     def _log_empty_universe(self) -> None:
@@ -983,7 +986,7 @@ class EventScanOrchestrator:
             if scores is None:
                 continue
             if not scores:
-                self.funnel.on_backtest_failed(symbol, "hot_rescore_empty")
+                self.funnel.on_backtest_failed(symbol, "No live setup after backtest")
                 continue
             self.funnel.apply_hot_scores(symbol, scores, candidate=payload)
 
@@ -1074,6 +1077,19 @@ class EventScanOrchestrator:
             volume_rank=volume_rank,
         )
 
+    def _funnel_maybe_flush_digest(self, now: float) -> None:
+        flush = getattr(self.funnel, "maybe_flush_digest", None)
+        if callable(flush):
+            flush(now)
+
+    def _report_super_skip(self, symbol: str, reason: str, *, instant: bool) -> None:
+        label = str(reason or "No valid Super setup this bar")
+        scanner_logger.info("[TIER_SUPER] %s skip — %s", symbol, label)
+        log_scan_rejected(symbol, label)
+        note = getattr(self.funnel, "note_super_skip", None)
+        if callable(note):
+            note(symbol, label, instant=instant)
+
     def _evaluate_super_symbol(
         self,
         symbol: str,
@@ -1083,8 +1099,33 @@ class EventScanOrchestrator:
         ticker_map: dict[str, Any],
         book_map: dict[str, Any],
     ) -> Optional[SignalCandidate]:
+        from constants import SMC_STRATEGY_TAGS
+        from core.strategy_score_ranges import score_range_for
+
+        key = symbol.upper()
+        rec = self.funnel._super.get(key)
+        self._last_super_skip_reason = ""
+        self._last_super_skip_instant = False
+        snapshot = self._build_eval_snapshot(key, ticker_map, book_map)
+        max_spread = float(Config.MAX_SPREAD_PERCENT)
+        spread = float(getattr(snapshot, "spread_pct", 0.0) or 0.0) if snapshot is not None else 0.0
+        if snapshot is None:
+            self._last_super_skip_reason = "Insufficient kline history"
+            self._last_super_skip_instant = False
+            return None
+        if spread > max_spread:
+            self._last_super_skip_reason = (
+                f"Spread too wide ({spread:.3f}% > {max_spread:.3f}%)"
+            )
+            self._last_super_skip_instant = True
+            return None
+        if spread >= max_spread * 0.75:
+            self._last_super_skip_reason = f"Slippage Risk (spread {spread:.3f}%)"
+            self._last_super_skip_instant = True
+            return None
+
         signal = self._evaluate_symbol(
-            symbol,
+            key,
             bar_open_ms=0,
             timeframe=timeframe,
             open_symbols=open_symbols,
@@ -1092,33 +1133,37 @@ class EventScanOrchestrator:
             book_map=book_map,
         )
         if signal is None:
+            strat = str(getattr(rec, "strategy", "") or "")
+            if strat in SMC_STRATEGY_TAGS or strat.startswith("SMC"):
+                self._last_super_skip_reason = "Invalid SMC Orderblock"
+                self._last_super_skip_instant = True
+            else:
+                self._last_super_skip_reason = "No valid Super setup this bar"
+                self._last_super_skip_instant = False
             return None
-        from core.strategy_score_ranges import score_range_for
 
-        rec = self.funnel._super.get(symbol.upper())
         band = score_range_for(signal.strategy)
         live = float(signal.score or 0.0)
         remembered = float(rec.score or 0.0) if rec is not None else 0.0
         if not band.meets_super(max(live, remembered)):
-            log_scan_rejected(
-                symbol,
-                f"super score {live:.1f} below {band.super_score:.1f}",
-                strategy=signal.strategy,
+            self._last_super_skip_reason = (
+                f"Super score {live:.1f} below {band.super_score:.1f}"
             )
+            self._last_super_skip_instant = False
             return None
         if rec is not None:
             meta = dict(rec.candidate.get("structure_metadata") or {})
             meta.update(signal.structure_metadata or {})
             meta["funnel_tier"] = "SUPER"
             meta["backup_strategies"] = list(rec.backup_strategies)
-            for key in (
+            for meta_key in (
                 "backtest_validated",
                 "backtest_win_rate",
                 "backtest_wins",
                 "backtest_trades",
             ):
-                if key in rec.candidate:
-                    meta.setdefault(key, rec.candidate[key])
+                if meta_key in rec.candidate:
+                    meta.setdefault(meta_key, rec.candidate[meta_key])
             signal.structure_metadata = meta
         return signal
 

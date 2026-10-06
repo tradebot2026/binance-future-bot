@@ -116,11 +116,13 @@ class TestFifteenMinuteBacktest(unittest.TestCase):
     def test_rejects_thin_history(self) -> None:
         result = run_15m_backtest(_ohlcv(80))
         self.assertFalse(result.passed)
-        self.assertIn("insufficient_15m_bars", result.reason)
+        self.assertTrue(result.deferred)
+        self.assertIn("closed 15m bars", result.reason)
 
     def test_accepts_450_closed_15m_bars(self) -> None:
         result = run_15m_backtest(_ohlcv(451))
-        self.assertNotIn("insufficient_15m_bars", result.reason)
+        self.assertFalse(result.deferred)
+        self.assertNotIn("closed 15m bars", result.reason)
 
     def test_rejects_win_rate_below_60(self) -> None:
         df = _ohlcv(501)
@@ -136,7 +138,10 @@ class TestFifteenMinuteBacktest(unittest.TestCase):
         ):
             result = run_15m_backtest(df)
         self.assertFalse(result.passed)
+        self.assertFalse(result.deferred)
         self.assertLess(result.win_rate, 60.0)
+        self.assertIn("Win Rate", result.reason)
+        self.assertIn("<", result.reason)
 
     def test_passes_win_rate_above_60(self) -> None:
         df = _ohlcv(501)
@@ -171,7 +176,7 @@ class TestFifteenMinuteBacktest(unittest.TestCase):
         result = _run_with_outcomes([1.0, 1.0])
         self.assertFalse(result.passed)
         self.assertEqual(result.trades, 2)
-        self.assertEqual(result.reason, "Insufficient historical trade samples")
+        self.assertEqual(result.reason, "Fewer than 3 closed trades")
 
     def test_passes_perfect_three_of_three(self) -> None:
         result = _run_with_outcomes([1.0, 1.0, 1.0])
@@ -189,7 +194,7 @@ class TestFifteenMinuteBacktest(unittest.TestCase):
         result = _run_with_outcomes([1.0, -1.0, -1.0])
         self.assertFalse(result.passed)
         self.assertEqual(result.trades, 3)
-        self.assertIn("win_rate", result.reason)
+        self.assertEqual(result.reason, "Win Rate 33% < 66%")
 
     def test_passes_three_of_four(self) -> None:
         result = _run_with_outcomes([1.0, 1.0, 1.0, -1.0])
@@ -201,7 +206,7 @@ class TestFifteenMinuteBacktest(unittest.TestCase):
         result = _run_with_outcomes([1.0, 1.0, -1.0, -1.0])
         self.assertFalse(result.passed)
         self.assertEqual(result.trades, 4)
-        self.assertIn("win_rate", result.reason)
+        self.assertIn("Win Rate", result.reason)
 
 
 class TestValidationQueue(unittest.TestCase):
@@ -238,7 +243,7 @@ class TestValidationQueue(unittest.TestCase):
             passed=False,
             win_rate=0.0,
             trades=2,
-            reason="Insufficient historical trade samples",
+            reason="Fewer than 3 closed trades",
         )
         with patch("core.validation_queue.run_15m_backtest", return_value=failed), patch(
             "core.validation_queue.trade_logger"
@@ -248,7 +253,26 @@ class TestValidationQueue(unittest.TestCase):
             )
         self.assertIsNone(out)
         msg = str(log.warning.call_args)
-        self.assertIn("Insufficient historical trade samples", msg)
+        self.assertIn("Fewer than 3 closed trades", msg)
+
+    def test_decide_defers_insufficient_bars(self) -> None:
+        from core.candle_backtest import BacktestResult
+
+        exchange = MagicMock()
+        exchange.is_rest_blocked.return_value = (False, "")
+        exchange.fetch_historical_candles.return_value = _ohlcv(80)
+        validator = AsyncBacktestValidator(exchange)
+        deferred = BacktestResult(
+            passed=False,
+            deferred=True,
+            reason="Need 450+ closed 15m bars (have 80)",
+        )
+        with patch("core.validation_queue.run_15m_backtest", return_value=deferred):
+            decision = validator._decide(
+                {"symbol": "QNTUSDT", "action": "LONG", "atr": 1.0, "score": 80}
+            )
+        self.assertEqual(decision.status, "deferred")
+        self.assertIn("closed 15m bars", decision.reason)
 
     def test_validate_approves_and_tags_metadata(self) -> None:
         exchange = MagicMock()

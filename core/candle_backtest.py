@@ -16,6 +16,7 @@ from utils import safe_float
 @dataclass
 class BacktestResult:
     passed: bool = False
+    deferred: bool = False
     win_rate: float = 0.0
     trades: int = 0
     wins: int = 0
@@ -158,8 +159,10 @@ def run_15m_backtest(df: Optional[pd.DataFrame]) -> BacktestResult:
     tp_mult = max(float(Config.TP1_ATR_MULTIPLIER), sl_mult)
 
     closed = drop_forming_bar(df)
-    if closed is None or closed.empty or len(closed) < min_bars:
-        result.reason = f"insufficient_15m_bars need={min_bars} have={0 if closed is None else len(closed)}"
+    have = 0 if closed is None or closed.empty else len(closed)
+    if closed is None or closed.empty or have < min_bars:
+        result.deferred = True
+        result.reason = f"Need {min_bars}+ closed 15m bars (have {have})"
         return result
 
     enriched = apply_validation_indicators(closed)
@@ -192,13 +195,13 @@ def run_15m_backtest(df: Optional[pd.DataFrame]) -> BacktestResult:
 
     min_wr = required_backtest_win_rate(result.trades)
     if min_wr is None:
-        result.reason = "Insufficient historical trade samples"
+        result.reason = "Fewer than 3 closed trades"
         return result
     if result.win_rate < min_wr:
-        result.reason = f"win_rate {result.win_rate:.1f}% < {min_wr:.1f}%"
+        result.reason = f"Win Rate {result.win_rate:.0f}% < {min_wr:.0f}%"
         return result
-    if result.profit_r <= 0:
-        result.reason = f"unprofitable expectancy_r={result.expectancy_r:.3f}"
+    if result.expectancy_r <= 0 or result.profit_r <= 0:
+        result.reason = "Negative Expectancy"
         return result
 
     result.passed = True

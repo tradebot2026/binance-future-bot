@@ -294,6 +294,18 @@ class TestTierFunnel(unittest.TestCase):
         self.assertIn("1. ADAUSDT [Pending]", missing)
         self.assertNotIn("ADAUSDT [0%]", missing)
 
+        hot_pending = format_watchlist_message(
+            tier1_hot=["ETHUSDT"],
+            tier1_background=[],
+            tier1_full=[],
+            tier2_rows=[("ETHUSDT", "SMC_TREND", 72.0)],
+            hot_scan_interval=60.0,
+            hot_backtest_pending=["ETHUSDT"],
+        )
+        self.assertIn("ETHUSDT", hot_pending)
+        self.assertIn("[Pending Backtest]", hot_pending)
+        self.assertNotIn("| 72", hot_pending)
+
         funnel = TierFunnel()
         funnel.replace_normal_universe(["AAAUSDT"], now=1.0)
         funnel.take_normal(now=1.0)
@@ -447,6 +459,69 @@ class TestTierFunnel(unittest.TestCase):
         retry = funnel.take_hot_for_rest(now=65.0)
         self.assertIsNotNone(retry)
         self.assertEqual(retry.symbol, "AAAUSDT")
+
+    def test_insufficient_klines_stay_hot_pending_backtest(self) -> None:
+        notified: list[str] = []
+        funnel = TierFunnel(notify=notified.append)
+        funnel.replace_normal_universe(["AAAUSDT"], now=1.0)
+        funnel.promote_from_normal("AAAUSDT", [_score("AAAUSDT", "SMC_TREND", 72.0)])
+        self.assertEqual(notified, [])
+        funnel.note_hot_backtest_pending(
+            "AAAUSDT", "Need 450+ closed 15m bars (have 80)"
+        )
+        self.assertIn("AAAUSDT", funnel.hot_symbols)
+        self.assertIn("AAAUSDT", funnel.pending_backtest_symbols())
+        snap = funnel.watchlist_snapshot(now=1.0)
+        self.assertIn("AAAUSDT", snap["hot_backtest_pending"])
+        funnel.on_backtest_failed("AAAUSDT", "Win Rate 35% < 60%")
+        self.assertNotIn("AAAUSDT", funnel.hot_symbols)
+        self.assertTrue(any("Win Rate 35% < 60%" in line for line in funnel._digest_lines))
+        self.assertEqual(notified, [])
+
+    def test_hourly_digest_lists_pending_and_demotes(self) -> None:
+        notified: list[str] = []
+        funnel = TierFunnel(notify=notified.append)
+        funnel.replace_normal_universe(["AAAUSDT"], now=1.0)
+        funnel.promote_from_normal("AAAUSDT", [_score("AAAUSDT", "SMC_TREND", 72.0)])
+        funnel.note_hot_backtest_pending("AAAUSDT", "Need 450+ closed 15m bars (have 12)")
+        funnel._digest_started = 1.0
+        with patch.object(Config, "FUNNEL_DIGEST_SECONDS", 60.0):
+            text = funnel.maybe_flush_digest(now=70.0)
+        self.assertIsNotNone(text)
+        self.assertIn("Hourly Funnel Digest", text)
+        self.assertIn("Hot: AAAUSDT", text)
+        self.assertIn("Pending Backtest", text)
+        self.assertTrue(notified)
+
+    def test_super_promotion_still_instant(self) -> None:
+        notified: list[str] = []
+        funnel = TierFunnel(notify=notified.append)
+        funnel.replace_normal_universe(["AAAUSDT"], now=1.0)
+        funnel.promote_from_normal(
+            "AAAUSDT",
+            [
+                _score("AAAUSDT", "SMC_TREND", 72.0),
+                _score("AAAUSDT", "RANGE_REVERSION", 80.0),
+            ],
+        )
+        funnel.on_backtest_passed("AAAUSDT")
+        with patch.dict("os.environ", _FUNNEL_SCORE_ENV, clear=False), patch.object(
+            Config, "USE_TESTNET", False
+        ), patch.object(Config, "TESTNET_RELAX_STRATEGY_THRESHOLDS", False):
+            funnel.apply_hot_scores(
+                "AAAUSDT",
+                [_score("AAAUSDT", "RANGE_REVERSION", 80.0)],
+            )
+        self.assertTrue(any("Super Tier promotion" in msg for msg in notified))
+
+    def test_super_skip_spread_instant_once(self) -> None:
+        notified: list[str] = []
+        funnel = TierFunnel(notify=notified.append)
+        funnel.note_super_skip("AAAUSDT", "Spread too wide (0.12% > 0.08%)", instant=True)
+        funnel.note_super_skip("AAAUSDT", "Spread too wide (0.12% > 0.08%)", instant=True)
+        self.assertEqual(len(notified), 1)
+        self.assertIn("Spread too wide", notified[0])
+        self.assertTrue(any("Spread too wide" in line for line in funnel._digest_lines))
 
 
 class TestFunnelOrchestratorEmptyLog(unittest.TestCase):

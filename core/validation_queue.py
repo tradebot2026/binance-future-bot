@@ -20,6 +20,13 @@ class _QueuedCandidate:
     queued_at: float = field(default_factory=time.monotonic)
 
 
+@dataclass
+class _BacktestDecision:
+    status: str
+    payload: Optional[dict[str, Any]] = None
+    reason: str = ""
+
+
 class AsyncBacktestValidator:
     """
     Lightweight producer (main scan) / single-consumer validator.
@@ -129,12 +136,14 @@ class AsyncBacktestValidator:
             try:
                 if (time.monotonic() - item.queued_at) > ttl:
                     trade_logger.warning(
-                        "[BACKTEST_REJECTED] %s — queue TTL expired", symbol
+                        "[BACKTEST_REJECTED] %s — Backtest queue timed out", symbol
                     )
                     funnel = self._on_funnel
                     if funnel is not None:
                         try:
-                            funnel.on_backtest_failed(symbol, "queue_ttl")
+                            funnel.on_backtest_failed(
+                                symbol, "Backtest queue timed out"
+                            )
                         except Exception:
                             pass
                     continue
@@ -155,14 +164,32 @@ class AsyncBacktestValidator:
                         except Exception:
                             pass
                     continue
-                approved = self._validate(item.payload)
-                if approved is not None:
-                    self._approved.put(approved)
+                decision = self._decide(item.payload)
+                if decision.status == "deferred":
+                    trade_logger.info(
+                        "[BACKTEST_PENDING] %s — %s",
+                        symbol,
+                        decision.reason,
+                    )
+                    funnel = self._on_funnel
+                    if funnel is not None:
+                        try:
+                            note = getattr(funnel, "note_hot_backtest_pending", None)
+                            if callable(note):
+                                note(symbol, decision.reason)
+                            else:
+                                funnel.release_hot_rest(symbol)
+                        except Exception:
+                            pass
+                elif decision.status == "passed" and decision.payload is not None:
+                    self._approved.put(decision.payload)
                 else:
                     funnel = self._on_funnel
                     if funnel is not None:
                         try:
-                            funnel.on_backtest_failed(symbol, "backtest_rejected")
+                            funnel.on_backtest_failed(
+                                symbol, decision.reason or "Backtest rejected"
+                            )
                         except Exception:
                             pass
             except Exception as exc:
@@ -170,7 +197,7 @@ class AsyncBacktestValidator:
                 funnel = self._on_funnel
                 if funnel is not None:
                     try:
-                        funnel.on_backtest_failed(symbol, "validator_error")
+                        funnel.on_backtest_failed(symbol, "Backtest validator error")
                     except Exception:
                         pass
             finally:
@@ -187,15 +214,21 @@ class AsyncBacktestValidator:
             remaining = interval - (time.monotonic() - self._last_process_at)
 
     def _validate(self, candidate: dict[str, Any]) -> Optional[dict[str, Any]]:
+        decision = self._decide(candidate)
+        return decision.payload if decision.status == "passed" else None
+
+    def _decide(self, candidate: dict[str, Any]) -> _BacktestDecision:
         symbol = str(candidate.get("symbol", "")).upper()
         df = self._fetch_15m_history(symbol)
         result = run_15m_backtest(df)
+        if result.deferred is True:
+            return _BacktestDecision(status="deferred", reason=result.reason)
         if not result.passed:
-            if result.reason == "Insufficient historical trade samples":
+            if result.reason == "Fewer than 3 closed trades":
                 trade_logger.warning(
-                    "[BACKTEST_REJECTED] %s — Insufficient historical trade samples "
-                    "(closed=%s wr=%.1f%%)",
+                    "[BACKTEST_REJECTED] %s — %s (closed=%s wr=%.1f%%)",
                     symbol,
+                    result.reason,
                     result.trades,
                     result.win_rate,
                 )
@@ -207,7 +240,7 @@ class AsyncBacktestValidator:
                     result.trades,
                     result.reason,
                 )
-            return None
+            return _BacktestDecision(status="failed", reason=result.reason)
 
         approved = dict(candidate)
         meta = dict(approved.get("structure_metadata") or {})
@@ -237,7 +270,7 @@ class AsyncBacktestValidator:
             result.expectancy_r,
             approved.get("atr") or 0.0,
         )
-        return approved
+        return _BacktestDecision(status="passed", payload=approved)
 
     def _fetch_15m_history(self, symbol: str) -> Optional[Any]:
         timeframe = str(Config.BACKTEST_TIMEFRAME or "15m")

@@ -440,6 +440,7 @@ def format_watchlist_message(
     flush_count: int = 0,
     normal_scores: Optional[dict[str, float]] = None,
     kline_pending: Optional[list[str]] = None,
+    hot_backtest_pending: Optional[list[str]] = None,
 ) -> str:
     """Format /watchlist — paced Normal ingest plus Hot / Super."""
     universe = max(int(universe_size or Config.NORMAL_TIER_UNIVERSE_SIZE), 1)
@@ -455,6 +456,7 @@ def format_watchlist_message(
     flush_n = max(int(flush_count or lock_cycle or 0), 0)
     scores = {str(k).upper(): float(v or 0.0) for k, v in (normal_scores or {}).items()}
     pending = {str(k).upper() for k in (kline_pending or []) if k}
+    hot_pending = {str(k).upper() for k in (hot_backtest_pending or []) if k}
 
     lines = [
         "📡 <b>3-Tier Dynamic Scan Funnel</b>",
@@ -487,9 +489,14 @@ def format_watchlist_message(
     lines.append(f"🔥 <b>Hot Tier</b> ({len(tier2_rows)}) • 1 coin/min")
     if tier2_rows:
         for sym, strat, score in tier2_rows[:tier2_display_limit]:
+            key = str(sym).upper()
+            if key in hot_pending:
+                tail = "[Pending Backtest]"
+            else:
+                tail = f"{score:.0f}"
             lines.append(
-                f"• {escape_html(sym)} | {escape_html(strategy_display_label(strat))} "
-                f"| {score:.0f}"
+                f"• {escape_html(key)} | {escape_html(strategy_display_label(strat))} "
+                f"| {tail}"
             )
     else:
         lines.append("<i>No Hot promotions yet</i>")

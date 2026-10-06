@@ -239,6 +239,7 @@ class MarketScanner:
             "recently_scanned": [],
             "normal_scores": {},
             "kline_pending": [],
+            "hot_backtest_pending": [],
             "flush_minutes": 180,
             "flush_count": 0,
         }
@@ -279,6 +280,7 @@ class MarketScanner:
             "recently_scanned": recently,
             "normal_scores": scores,
             "kline_pending": [key for key in recently if key in pending],
+            "hot_backtest_pending": list(snap.get("hot_backtest_pending") or []),
             "flush_minutes": int(snap.get("flush_minutes") or 0),
             "flush_count": flush_count,
         }
