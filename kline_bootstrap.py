@@ -256,9 +256,13 @@ def run_batched_kline_bootstrap(
 
     by_symbol: dict[str, list[str]] = defaultdict(list)
     for sym, interval in pairs:
-        by_symbol[sym.upper()].append(interval)
+        key = str(sym or "").upper()
+        if not key:
+            continue
+        by_symbol[key].append(interval)
 
-    symbol_order = list(by_symbol.keys())
+    # One pass per symbol this call — never re-queue the same coin inside a batch.
+    symbol_order = list(dict.fromkeys(by_symbol.keys()))
     if max_pairs is not None:
         trimmed: dict[str, list[str]] = defaultdict(list)
         count = 0

@@ -290,6 +290,9 @@ class AsyncBacktestValidator:
         can_boot = getattr(self.exchange, "can_bootstrap_klines_rest", None)
         if callable(can_boot) and not can_boot():
             return cached
+        can_rest = getattr(self.exchange, "can_make_background_rest_call", None)
+        if callable(can_rest) and not can_rest(1):
+            return cached
         try:
             with self.exchange.bootstrap_context():
                 df = self.exchange.fetch_bootstrap_klines_df(

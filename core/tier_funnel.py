@@ -28,6 +28,8 @@ class HotRecord:
     backtest_passed: bool = False
     backtest_pending: bool = False
     pending_reason: str = ""
+    pending_passes: int = 0
+    rest_cooldown_until: float = 0.0
     backup_index: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
 
@@ -72,6 +74,7 @@ class TierFunnel:
         self._hot: dict[str, HotRecord] = {}
         self._hot_order: list[str] = []
         self._hot_index: int = 0
+        self._hot_rest_index: int = 0
         self._super: dict[str, SuperRecord] = {}
         self._super_order: list[str] = []
         self._super_index: int = 0
@@ -401,21 +404,42 @@ class TierFunnel:
         }
 
     def take_hot_for_rest(self, now: float | None = None) -> Optional[HotRecord]:
-        """One Hot coin per minute that still needs the REST backtest fetch."""
-        pending = [
-            self._hot[s]
-            for s in self._hot_order
-            if s in self._hot
-            and not self._hot[s].backtest_passed
-            and s not in self._pending_hot_rest
-        ]
-        if not pending:
+        """One Hot coin per minute, round-robin. Cooling/pending coins are skipped."""
+        stamp = time.monotonic() if now is None else now
+        order = [s for s in self._hot_order if s in self._hot]
+        if not order:
             return None
-        if self._hot_clock.take(1, now=now) < 1:
+        n = len(order)
+        start = self._hot_rest_index % n
+        picked: Optional[HotRecord] = None
+        cooling = 0
+        for offset in range(n):
+            key = order[(start + offset) % n]
+            rec = self._hot[key]
+            if rec.backtest_passed or key in self._pending_hot_rest:
+                continue
+            if rec.rest_cooldown_until > stamp:
+                cooling += 1
+                continue
+            picked = rec
+            self._hot_rest_index = (start + offset + 1) % n
+            break
+        if picked is None:
             return None
-        rec = pending[0]
-        self._pending_hot_rest.add(rec.symbol)
-        return rec
+        if self._hot_clock.take(1, now=stamp) < 1:
+            return None
+        self._pending_hot_rest.add(picked.symbol)
+        scanner_logger.info(
+            "[TIER_HOT] rotate REST %s | cooling=%s remaining=%s",
+            picked.symbol,
+            cooling,
+            sum(
+                1
+                for s in order
+                if not self._hot[s].backtest_passed and s not in self._pending_hot_rest
+            ),
+        )
+        return picked
 
     def take_hot_for_rescore(self, now: float | None = None) -> Optional[HotRecord]:
         """
@@ -497,20 +521,41 @@ class TierFunnel:
         """Clear REST-in-flight so the coin can retry (e.g. -1003 deferred)."""
         self._pending_hot_rest.discard(str(symbol).upper())
 
-    def note_hot_backtest_pending(self, symbol: str, reason: str = "") -> None:
-        """Keep the coin in Hot while 15m history bootstraps — do not demote."""
+    def note_hot_backtest_pending(
+        self,
+        symbol: str,
+        reason: str = "",
+        *,
+        now: float | None = None,
+    ) -> None:
+        """Park a thin-history Hot coin on cooldown and rotate; demote after max passes."""
         key = str(symbol).upper()
         self._pending_hot_rest.discard(key)
         rec = self._hot.get(key)
         if rec is None or rec.backtest_passed:
             return
+        stamp = time.monotonic() if now is None else now
         rec.backtest_pending = True
         rec.pending_reason = str(reason or "Need 200+ closed 15m bars")
+        rec.pending_passes += 1
+        rec.rest_cooldown_until = stamp + Config.hot_pending_cooldown_seconds()
+        max_passes = Config.hot_pending_max_passes()
         scanner_logger.info(
-            "[TIER_HOT] %s [Pending Backtest] — %s",
+            "[TIER_HOT] %s [Pending Backtest] — %s | pass=%s/%s cooldown=%.0fs",
             key,
             rec.pending_reason,
+            rec.pending_passes,
+            max_passes,
+            Config.hot_pending_cooldown_seconds(),
         )
+        if rec.pending_passes >= max_passes:
+            self._demote_hot(
+                key,
+                reason=(
+                    f"Pending Backtest exceeded {rec.pending_passes} passes "
+                    "— insufficient 15m history"
+                ),
+            )
 
     def pending_backtest_symbols(self) -> list[str]:
         return [
@@ -546,6 +591,8 @@ class TierFunnel:
         rec.backtest_passed = True
         rec.backtest_pending = False
         rec.pending_reason = ""
+        rec.pending_passes = 0
+        rec.rest_cooldown_until = 0.0
         if payload:
             rec.metadata.update(payload)
         return rec

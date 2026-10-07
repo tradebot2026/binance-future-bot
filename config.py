@@ -706,6 +706,10 @@ class Config:
     BACKTEST_QUEUE_TTL_SECONDS: float = _env_float("BACKTEST_QUEUE_TTL_SECONDS", 180.0)
     BACKTEST_QUEUE_MAX: int = _env_int("BACKTEST_QUEUE_MAX", 8)
     FUNNEL_DIGEST_SECONDS: float = _env_float("FUNNEL_DIGEST_SECONDS", 3600.0)
+    HOT_PENDING_COOLDOWN_SECONDS: float = _env_float(
+        "HOT_PENDING_COOLDOWN_SECONDS", 180.0
+    )
+    HOT_PENDING_MAX_PASSES: int = _env_int("HOT_PENDING_MAX_PASSES", 3)
     ATTACH_NATIVE_TP_SL_AFTER_VALIDATION: bool = _env_bool(
         "ATTACH_NATIVE_TP_SL_AFTER_VALIDATION", False
     )
@@ -898,6 +902,16 @@ class Config:
         if cls.ENABLE_THREE_TIER_FUNNEL:
             return 60.0 / max(int(cls.HOT_TIER_COINS_PER_MINUTE), 1)
         return max(float(cls.HOT_SCAN_INTERVAL_SECONDS), cls.scan_cycle_seconds())
+
+    @classmethod
+    def hot_pending_cooldown_seconds(cls) -> float:
+        """Skip REST re-fetch for a pending Hot coin (2–3 minutes)."""
+        return min(max(float(getattr(cls, "HOT_PENDING_COOLDOWN_SECONDS", 180.0)), 120.0), 180.0)
+
+    @classmethod
+    def hot_pending_max_passes(cls) -> int:
+        """Demote a Hot coin still missing 15m history after this many turns."""
+        return min(max(int(getattr(cls, "HOT_PENDING_MAX_PASSES", 3)), 2), 5)
 
     @classmethod
     def scan_cycle_symbol_count(cls) -> int:

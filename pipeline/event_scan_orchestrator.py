@@ -55,6 +55,7 @@ class EventScanOrchestrator:
         self._last_catchup_at: float = 0.0
         self._last_universe_refresh_at: float = 0.0
         self._kline_cache_misses: list[str] = []
+        self._kline_boot_cool_until: dict[str, float] = {}
         self._kline_pending_log_at: dict[str, float] = {}
         self._last_ticker_unavail_log_at: float = 0.0
         self._last_empty_universe_log_at: float = 0.0
@@ -163,19 +164,31 @@ class EventScanOrchestrator:
             if event is not None:
                 self.event_scheduler.requeue(event, delay_seconds=2.0)
 
+    def _mark_kline_bootstrap_cooldown(self, symbol: str, now: float | None = None) -> None:
+        key = str(symbol or "").upper()
+        if not key:
+            return
+        stamp = time.monotonic() if now is None else now
+        cool = getattr(self, "_kline_boot_cool_until", None)
+        if cool is None:
+            self._kline_boot_cool_until = {}
+            cool = self._kline_boot_cool_until
+        cool[key] = stamp + Config.hot_pending_cooldown_seconds()
+
     def _next_bootstrap_symbol(self, queued: list[str]) -> str:
-        """Prefer a hot miss; otherwise the first queued not-ready symbol."""
+        """Fair FIFO among not-cooling symbols — never pin the slot on one Hot miss."""
         if not queued:
             return ""
-        try:
-            hot = {str(s).upper() for s in (self.priority_queue.hot_symbols or [])}
-        except Exception:
-            hot = set()
+        stamp = time.monotonic()
+        cool = getattr(self, "_kline_boot_cool_until", {}) or {}
         for raw in queued:
             symbol = str(raw or "").upper()
-            if symbol and symbol in hot:
-                return symbol
-        return str(queued[0] or "").upper()
+            if not symbol:
+                continue
+            if float(cool.get(symbol, 0.0) or 0.0) > stamp:
+                continue
+            return symbol
+        return ""
 
     def _bootstrap_missing_scan_klines(self, symbols: list[str]) -> int:
         """Governor-gated REST backfill for one not-ready symbol. Never in scan_context."""
@@ -218,12 +231,14 @@ class EventScanOrchestrator:
                     warmup=False,
                 )
         except Exception as exc:
+            self._mark_kline_bootstrap_cooldown(target)
             scanner_logger.warning(
                 "[SCAN_KLINE_BOOTSTRAP] %s failed — %s",
                 target,
                 exc,
             )
             return 0
+        self._mark_kline_bootstrap_cooldown(target)
 
         scanner_logger.info(
             "[SCAN_KLINE_BOOTSTRAP] %s — seeded=%s series (missing TFs only)",
@@ -926,9 +941,10 @@ class EventScanOrchestrator:
             super_n,
         )
 
-    def _enqueue_hot_backtest(self, rec: HotRecord) -> None:
+    def _enqueue_hot_backtest(self, rec: HotRecord) -> bool:
         if self._validator is None:
-            return
+            self.funnel.release_hot_rest(rec.symbol)
+            return False
         payload = {
             "symbol": rec.symbol,
             "strategy": rec.strategy,
@@ -943,10 +959,15 @@ class EventScanOrchestrator:
         try:
             if self._validator.enqueue(payload):
                 self.funnel.note_hot_rest_started(rec.symbol)
+                return True
+            self.funnel.release_hot_rest(rec.symbol)
+            return False
         except Exception as exc:
+            self.funnel.release_hot_rest(rec.symbol)
             scanner_logger.warning(
                 "[TIER_HOT] queue failed for %s: %s", rec.symbol, exc
             )
+            return False
 
     def _enqueue_due_hot_rest(self, now: float) -> None:
         if self._validator is None:

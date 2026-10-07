@@ -460,6 +460,63 @@ class TestTierFunnel(unittest.TestCase):
         self.assertIsNotNone(retry)
         self.assertEqual(retry.symbol, "AAAUSDT")
 
+    def test_hot_rest_rotates_past_pending_cooldown(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["GRIFFAINUSDT", "IOTXUSDT", "DASHUSDT"], now=1.0)
+        funnel.promote_from_normal(
+            "GRIFFAINUSDT", [_score("GRIFFAINUSDT", "SMC_TREND", 72.0)]
+        )
+        funnel.promote_from_normal("IOTXUSDT", [_score("IOTXUSDT", "SMC_TREND", 73.0)])
+        funnel.promote_from_normal("DASHUSDT", [_score("DASHUSDT", "SMC_TREND", 74.0)])
+        first = funnel.take_hot_for_rest(now=5.0)
+        self.assertEqual(first.symbol, "GRIFFAINUSDT")
+        funnel.note_hot_backtest_pending(
+            "GRIFFAINUSDT",
+            "Need 450+ closed 15m bars (have 12)",
+            now=5.0,
+        )
+        self.assertIn("GRIFFAINUSDT", funnel.hot_symbols)
+        second = funnel.take_hot_for_rest(now=65.0)
+        self.assertIsNotNone(second)
+        self.assertEqual(second.symbol, "IOTXUSDT")
+        third = funnel.take_hot_for_rest(now=125.0)
+        self.assertIsNotNone(third)
+        self.assertEqual(third.symbol, "DASHUSDT")
+        self.assertIsNone(funnel.take_hot_for_rest(now=150.0))
+        again = funnel.take_hot_for_rest(now=186.0)
+        self.assertIsNotNone(again)
+        self.assertEqual(again.symbol, "GRIFFAINUSDT")
+
+    def test_pending_backtest_demotes_after_three_passes(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["GRIFFAINUSDT"], now=1.0)
+        funnel.promote_from_normal(
+            "GRIFFAINUSDT", [_score("GRIFFAINUSDT", "SMC_TREND", 72.0)]
+        )
+        with patch.object(Config, "HOT_PENDING_MAX_PASSES", 3), patch.object(
+            Config, "HOT_PENDING_COOLDOWN_SECONDS", 180.0
+        ):
+            funnel.note_hot_backtest_pending("GRIFFAINUSDT", "Need 450+", now=1.0)
+            funnel.note_hot_backtest_pending("GRIFFAINUSDT", "Need 450+", now=181.0)
+            self.assertIn("GRIFFAINUSDT", funnel.hot_symbols)
+            funnel.note_hot_backtest_pending("GRIFFAINUSDT", "Need 450+", now=361.0)
+        self.assertNotIn("GRIFFAINUSDT", funnel.hot_symbols)
+        self.assertTrue(
+            any("3 passes" in line for line in funnel._digest_lines)
+        )
+
+    def test_hot_rest_does_not_burn_slot_when_all_cooling(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["AAAUSDT"], now=1.0)
+        funnel.promote_from_normal("AAAUSDT", [_score("AAAUSDT", "SMC_TREND", 72.0)])
+        rec = funnel.take_hot_for_rest(now=5.0)
+        self.assertIsNotNone(rec)
+        funnel.note_hot_backtest_pending("AAAUSDT", "Need 450+", now=5.0)
+        self.assertIsNone(funnel.take_hot_for_rest(now=65.0))
+        retry = funnel.take_hot_for_rest(now=186.0)
+        self.assertIsNotNone(retry)
+        self.assertEqual(retry.symbol, "AAAUSDT")
+
     def test_insufficient_klines_stay_hot_pending_backtest(self) -> None:
         notified: list[str] = []
         funnel = TierFunnel(notify=notified.append)
@@ -553,6 +610,18 @@ class TestFunnelOrchestratorEmptyLog(unittest.TestCase):
         info_msgs = [c[0][0] for c in log.info.call_args_list]
         empty = [m for m in info_msgs if "empty universe" in m]
         self.assertEqual(len(empty), 1)
+
+    def test_kline_bootstrap_skips_cooling_hot_symbol(self) -> None:
+        orch = EventScanOrchestrator.__new__(EventScanOrchestrator)
+        orch._kline_boot_cool_until = {}
+        orch.priority_queue = MagicMock()
+        orch.priority_queue.hot_symbols = ["GRIFFAINUSDT"]
+        orch._mark_kline_bootstrap_cooldown("GRIFFAINUSDT", now=10.0)
+        with patch("pipeline.event_scan_orchestrator.time.monotonic", return_value=20.0):
+            nxt = orch._next_bootstrap_symbol(
+                ["GRIFFAINUSDT", "IOTXUSDT", "DASHUSDT"]
+            )
+        self.assertEqual(nxt, "IOTXUSDT")
 
 
 class TestFunnelKlineFlushGc(unittest.TestCase):
