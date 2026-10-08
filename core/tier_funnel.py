@@ -18,6 +18,14 @@ from logger import scanner_logger
 NotifyFn = Callable[[str], None]
 
 
+def is_history_demote_reason(reason: str) -> bool:
+    """True when Hot demotion is from thin 15m history / pending-pass exhaustion."""
+    text = str(reason or "").lower()
+    if "insufficient 15m history" in text:
+        return True
+    return "exceeded" in text and "pass" in text
+
+
 @dataclass
 class HotRecord:
     symbol: str
@@ -83,6 +91,7 @@ class TierFunnel:
         self._hot_clock = MinuteWindow(Config.HOT_TIER_COINS_PER_MINUTE)
         self._super_clock = MinuteWindow(Config.SUPER_TIER_COINS_PER_MINUTE)
         self._pending_hot_rest: set[str] = set()
+        self._demote_cooldown_until: dict[str, float] = {}
         self._digest_lines: list[str] = []
         self._digest_started: float = 0.0
         self._super_skip_tg_at: dict[str, float] = {}
@@ -214,6 +223,7 @@ class TierFunnel:
         keep_keys = {str(s).upper() for s in (keep or set()) if s}
         keep_keys.update(self._hot)
         keep_keys.update(self._super)
+        keep_keys.update(self._active_history_quarantine(time.monotonic()))
         outgoing: list[str] = []
         seen: set[str] = set()
         for raw in self._normal + self._demoted_hold + self._candidates:
@@ -474,10 +484,14 @@ class TierFunnel:
         scores: list[StrategyScore],
         *,
         extra: Optional[dict[str, Any]] = None,
+        now: float | None = None,
     ) -> Optional[HotRecord]:
         """Promote when primary score reaches Hot band. Remembers until Hot demotes."""
         key = str(symbol).upper()
+        stamp = time.monotonic() if now is None else now
         if not key or key in self._promoted or key in self._hot or key in self._super:
+            return None
+        if self.in_history_demote_cooldown(key, now=stamp):
             return None
         ranked = _ranked_scores(scores)
         if not ranked:
@@ -555,6 +569,7 @@ class TierFunnel:
                     f"Pending Backtest exceeded {rec.pending_passes} passes "
                     "— insufficient 15m history"
                 ),
+                now=stamp,
             )
 
     def pending_backtest_symbols(self) -> list[str]:
@@ -757,7 +772,29 @@ class TierFunnel:
             digest=f"⭐ Super: {key} | {score.strategy} | {effective:.0f}",
         )
 
-    def _demote_hot(self, symbol: str, *, reason: str) -> None:
+    def in_history_demote_cooldown(
+        self, symbol: str, *, now: float | None = None
+    ) -> bool:
+        """True while a thin-history demote still blocks Hot re-promotion."""
+        key = str(symbol).upper()
+        stamp = time.monotonic() if now is None else now
+        return key in self._active_history_quarantine(stamp)
+
+    def _active_history_quarantine(self, now: float) -> set[str]:
+        live: set[str] = set()
+        expired: list[str] = []
+        for key, until in self._demote_cooldown_until.items():
+            if now >= until:
+                expired.append(key)
+            else:
+                live.add(key)
+        for key in expired:
+            self._demote_cooldown_until.pop(key, None)
+        return live
+
+    def _demote_hot(
+        self, symbol: str, *, reason: str, now: float | None = None
+    ) -> None:
         key = symbol.upper()
         rec = self._hot.pop(key, None)
         self._hot_order = [s for s in self._hot_order if s != key]
@@ -767,6 +804,15 @@ class TierFunnel:
             return
         if key not in {s.upper() for s in self._demoted_hold}:
             self._demoted_hold.append(key)
+        if is_history_demote_reason(reason):
+            stamp = time.monotonic() if now is None else now
+            hold = Config.hot_history_demote_cooldown_seconds()
+            self._demote_cooldown_until[key] = stamp + hold
+            scanner_logger.info(
+                "[TIER_HOT] %s history-demote cooldown %.0fs — skip Hot re-promote",
+                key,
+                hold,
+            )
         self._emit(
             "⬇️ <b>Hot Tier demotion</b>\n"
             f"🪙 {key}\n"

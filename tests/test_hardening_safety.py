@@ -526,9 +526,7 @@ class TestWatchdogAndWs(unittest.TestCase):
             calls.append((symbol, interval))
             return pd.DataFrame()
 
-        with patch("kline_bootstrap.time.sleep"), patch.object(
-            Config, "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 600
-        ), patch.object(Config, "REST_OPERATIONAL_WEIGHT_CAP", 600):
+        with patch("kline_bootstrap.time.sleep"):
             result = run_batched_kline_bootstrap(
                 [("AAAUSDT", "5m"), ("AAAUSDT", "15m")],
                 fetcher,
@@ -576,6 +574,7 @@ class TestKlineBootstrapHaltResume(unittest.TestCase):
         exchange._rest_usage = MagicMock()
         exchange._rest_usage.in_safety_mode.return_value = False
         exchange._rest_usage.allows_background_rest.return_value = True
+        exchange._rest_usage.allows_hot_rest.return_value = True
         exchange._rest_usage.snapshot.return_value = {"state": "HEALTHY"}
         exchange._rest_usage.projected_used_weight.return_value = 0
         self.assertTrue(exchange.maybe_resume_kline_bootstrap())
@@ -592,6 +591,7 @@ class TestKlineBootstrapHaltResume(unittest.TestCase):
         exchange._rest_usage = MagicMock()
         exchange._rest_usage.in_safety_mode.return_value = False
         exchange._rest_usage.allows_background_rest.return_value = False
+        exchange._rest_usage.allows_hot_rest.return_value = False
         exchange._rest_usage.snapshot.return_value = {"state": "RATE_LIMIT_WARNING"}
         exchange._rest_usage.projected_used_weight.return_value = 2513
         self.assertFalse(exchange.maybe_resume_kline_bootstrap())

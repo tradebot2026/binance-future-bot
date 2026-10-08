@@ -325,13 +325,20 @@ class BinanceExchangeManager:
                 f"API SAFETY MODE — REST halted "
                 f"({remaining}s remaining, {self._rest_usage.snapshot().get('state')})"
             )
-        if not execution_priority and not self._rest_usage.allows_background_rest():
-            snap = self._rest_usage.snapshot()
-            remaining = int(snap.get("weight_throttle_remaining_seconds") or 0)
-            return False, (
-                f"REST weight governor — {snap.get('state')} "
-                f"(used_weight_1m={snap.get('used_weight_1m')}, pause {remaining}s)"
-            )
+        if not execution_priority:
+            usage = self._rest_usage
+            if self._is_bootstrap_priority():
+                allows_hot = getattr(usage, "allows_hot_rest", None)
+                allowed = allows_hot() if callable(allows_hot) else usage.allows_background_rest()
+            else:
+                allowed = usage.allows_background_rest()
+            if not allowed:
+                snap = usage.snapshot()
+                remaining = int(snap.get("weight_throttle_remaining_seconds") or 0)
+                return False, (
+                    f"REST weight governor — {snap.get('state')} "
+                    f"(used_weight_1m={snap.get('used_weight_1m')}, pause {remaining}s)"
+                )
         return True, ""
 
     @contextmanager
@@ -728,10 +735,15 @@ class BinanceExchangeManager:
             return False
         if self._rest_token_bucket.is_hard_stopped():
             return False
-        if self._rest_usage.in_safety_mode() or not self._rest_usage.allows_background_rest():
+        if self._rest_usage.in_safety_mode():
             return False
-        throttle = Config.rest_weight_throttle_threshold()
-        if self._rest_usage.projected_used_weight() + max(weight, 1) > throttle:
+        if self._is_bootstrap_priority():
+            allows_hot = getattr(self._rest_usage, "allows_hot_rest", None)
+            if callable(allows_hot) and not allows_hot():
+                return False
+            if not callable(allows_hot) and not self._rest_usage.allows_background_rest():
+                return False
+        elif not self._rest_usage.allows_background_rest():
             return False
         if not Config.ENABLE_STRICT_RATE_LIMIT:
             allowed = True
@@ -765,16 +777,6 @@ class BinanceExchangeManager:
                 return True, (
                     f"API SAFETY MODE — REST halted "
                     f"({remaining}s remaining, {state})"
-                )
-            if not bool(getattr(usage, "allows_background_rest", lambda: True)()):
-                snap = usage.snapshot() if callable(getattr(usage, "snapshot", None)) else {}
-                if not isinstance(snap, dict):
-                    snap = {}
-                remaining = int(snap.get("weight_throttle_remaining_seconds") or 0)
-                state = str(snap.get("state") or "RATE_LIMIT_WARNING")
-                return True, (
-                    f"REST weight governor — {state} "
-                    f"(used_weight_1m={snap.get('used_weight_1m', 0)}, pause {remaining}s)"
                 )
             if self._market_data:
                 blocked, reason = self._market_data.is_rest_blocked()
@@ -1063,9 +1065,14 @@ class BinanceExchangeManager:
             return False
         if getattr(usage, "in_safety_mode", lambda: False)():
             return False
-        allows = getattr(usage, "allows_background_rest", None)
-        if callable(allows) and not allows():
-            return False
+        allows_hot = getattr(usage, "allows_hot_rest", None)
+        if callable(allows_hot):
+            if not allows_hot():
+                return False
+        else:
+            allows = getattr(usage, "allows_background_rest", None)
+            if callable(allows) and not allows():
+                return False
         snap = usage.snapshot() if callable(getattr(usage, "snapshot", None)) else {}
         state = str((snap or {}).get("state") or "HEALTHY").upper()
         weight = 0
@@ -1075,6 +1082,8 @@ class BinanceExchangeManager:
                 weight = int(projected() or 0)
             except Exception:
                 weight = 0
+        if weight >= Config.rest_hard_weight_cap():
+            return False
         return self.resume_kline_bootstrap(
             f"API {state} used_weight_1m={weight}"
         )
@@ -1090,12 +1099,17 @@ class BinanceExchangeManager:
             return False
         if self._rest_token_bucket.is_hard_stopped():
             return False
-        if self._rest_usage.in_safety_mode() or not self._rest_usage.allows_background_rest():
+        if self._rest_usage.in_safety_mode():
+            return False
+        allows_hot = getattr(self._rest_usage, "allows_hot_rest", None)
+        if callable(allows_hot):
+            if not allows_hot():
+                return False
+        elif not self._rest_usage.allows_background_rest():
             return False
         if not Config.ENABLE_STRICT_RATE_LIMIT:
             return True
-        reserve = max(Config.REST_BUDGET_MIN_REMAINING_FRACTION, 0.0)
-        return self._rest_budget.remaining_fraction() >= reserve
+        return self._rest_budget.has_budget_for(5, RestLane.BOOTSTRAP)
 
     def _enforce_kline_rest_pace(self) -> None:
         """Gap between consecutive futures_klines REST calls (warmup 0.5–1.0s)."""
@@ -1230,7 +1244,11 @@ class BinanceExchangeManager:
         )
         if is_bootstrap_kline:
             if not self.can_bootstrap_klines_rest():
-                self.halt_kline_bootstrap("budget_or_ban_gate")
+                if self._rest_usage.in_safety_mode() or (
+                    self._rest_usage.projected_used_weight()
+                    >= Config.rest_hard_weight_cap()
+                ):
+                    self.halt_kline_bootstrap("budget_or_ban_gate")
                 return []
 
         blocked, reason = self._rest_block_applies(priority)
@@ -1294,25 +1312,29 @@ class BinanceExchangeManager:
                     if self._is_account_rest_call(func):
                         if bypass_account_cache and priority:
                             raise ExchangeRateLimitError(
-                                "REST budget below reserve threshold"
+                                "REST component budget exhausted"
                             )
                         return self._return_cached_account_call(func)
                     if is_bootstrap_kline:
-                        self.halt_kline_bootstrap("rest_budget_reserve")
                         return []
                     if self._rest_block_log.should_log("rest_budget_reserve"):
                         error_logger.warning(
-                            "REST call skipped — budget below %.0f%% reserve "
+                            "REST call skipped — %s lane budget exhausted "
                             "(used=%s/%s weight, endpoint=%s).",
-                            Config.REST_BUDGET_MIN_REMAINING_FRACTION * 100,
+                            lane.value,
                             self._rest_budget.current_window_weight(),
                             self._rest_budget.max_weight_per_minute,
                             getattr(func, "__name__", "unknown"),
                         )
                     raise ExchangeRateLimitError(
-                        "REST budget below reserve threshold"
+                        "REST component budget exhausted"
                     )
-                if not self._rest_usage.try_reserve_background(call_weight):
+                reserved = (
+                    self._rest_usage.try_reserve_hot(call_weight)
+                    if lane == RestLane.BOOTSTRAP
+                    else self._rest_usage.try_reserve_background(call_weight)
+                )
+                if not reserved:
                     if self._is_account_rest_call(func):
                         if bypass_account_cache and priority:
                             raise ExchangeRateLimitError(
@@ -1320,14 +1342,19 @@ class BinanceExchangeManager:
                             )
                         return self._return_cached_account_call(func)
                     if is_bootstrap_kline:
-                        self.halt_kline_bootstrap("operational_weight_cap")
+                        if (
+                            self._rest_usage.projected_used_weight()
+                            >= Config.rest_hard_weight_cap()
+                        ):
+                            self.halt_kline_bootstrap("hard_weight_cap")
                         return []
                     if self._rest_block_log.should_log("operational_weight_cap"):
                         error_logger.warning(
-                            "REST call skipped — approaching used-weight cap "
+                            "REST call skipped — %s weight budget "
                             "(projected=%s/%s, endpoint=%s).",
+                            lane.value,
                             self._rest_usage.projected_used_weight(),
-                            Config.rest_weight_throttle_threshold(),
+                            Config.rest_hard_weight_cap(),
                             getattr(func, "__name__", "unknown"),
                         )
                     raise ExchangeRateLimitError(
@@ -1337,11 +1364,15 @@ class BinanceExchangeManager:
                 self._rest_usage.note_outgoing_weight(call_weight)
             self._rest_token_bucket.acquire(call_weight)
         elif lane != RestLane.EXECUTION:
-            if not self._rest_usage.try_reserve_background(call_weight):
+            reserved = (
+                self._rest_usage.try_reserve_hot(call_weight)
+                if lane == RestLane.BOOTSTRAP
+                else self._rest_usage.try_reserve_background(call_weight)
+            )
+            if not reserved:
                 if self._is_account_rest_call(func):
                     return self._return_cached_account_call(func)
                 if is_bootstrap_kline:
-                    self.halt_kline_bootstrap("operational_weight_cap")
                     return []
                 raise ExchangeRateLimitError(
                     "REST weight cap — background call skipped"

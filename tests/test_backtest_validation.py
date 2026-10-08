@@ -7,9 +7,20 @@ from unittest.mock import MagicMock, patch
 
 import pandas as pd
 
+from collections import deque
+
 from config import Config
-from core.candle_backtest import required_backtest_win_rate, run_15m_backtest
+from core.candle_backtest import (
+    append_closed_ohlcv,
+    backtest_history_ready,
+    required_backtest_win_rate,
+    run_15m_backtest,
+)
 from core.validation_queue import AsyncBacktestValidator
+from kline_bootstrap import (
+    backtest_history_buffer_limit,
+    merge_closed_kline_bar,
+)
 from pipeline.event_scan_orchestrator import EventScanOrchestrator
 
 
@@ -378,6 +389,149 @@ class TestTelegramBacktestLine(unittest.TestCase):
             )
         msg = tg.send_message.call_args[0][0]
         self.assertIn("Backtest WR:</b> 68.5% (8/12 Wins)", msg)
+
+
+class TestBacktestWsAutofill(unittest.TestCase):
+    def test_merge_closed_kline_bar_grows_history(self) -> None:
+        bars = deque(maxlen=backtest_history_buffer_limit())
+        for i in range(12):
+            ts = pd.Timestamp("2026-01-01") + pd.Timedelta(minutes=15 * i)
+            self.assertTrue(
+                merge_closed_kline_bar(
+                    bars,
+                    {
+                        "timestamp": ts,
+                        "open": 1.0,
+                        "high": 2.0,
+                        "low": 0.5,
+                        "close": 1.1,
+                        "volume": 10.0,
+                        "open_ms": int(ts.timestamp() * 1000),
+                        "closed": True,
+                    },
+                )
+            )
+        self.assertEqual(len(bars), 12)
+        last = dict(bars[-1])
+        last["close"] = 1.25
+        merge_closed_kline_bar(bars, last)
+        self.assertEqual(len(bars), 12)
+        self.assertEqual(bars[-1]["close"], 1.25)
+
+    def test_append_closed_ohlcv_reaches_min_bars_without_changing_gates(self) -> None:
+        df = None
+        for i in range(451):
+            ts = pd.Timestamp("2026-01-01") + pd.Timedelta(minutes=15 * i)
+            df = append_closed_ohlcv(
+                df,
+                {
+                    "timestamp": ts,
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.2,
+                    "volume": 1_000.0,
+                },
+            )
+        self.assertTrue(backtest_history_ready(df))
+        result = run_15m_backtest(df)
+        self.assertFalse(result.deferred)
+        self.assertEqual(required_backtest_win_rate(3), 66.0)
+        self.assertEqual(required_backtest_win_rate(4), 60.0)
+
+    def test_fetch_skips_rest_when_ws_buffer_ready(self) -> None:
+        hub = MagicMock()
+        hub.get_backtest_candles.return_value = _ohlcv(500)
+        hub.should_skip_backtest_rest.return_value = False
+        exchange = MagicMock()
+        exchange._market_data = hub
+        validator = AsyncBacktestValidator(exchange)
+        df = validator._fetch_15m_history("CELRUSDT")
+        self.assertEqual(len(df), 500)
+        exchange.fetch_bootstrap_klines_df.assert_not_called()
+
+    def test_fetch_skips_rest_after_thin_history_exhausted(self) -> None:
+        hub = MagicMock()
+        hub.get_backtest_candles.return_value = _ohlcv(12)
+        hub.should_skip_backtest_rest.return_value = True
+        exchange = MagicMock()
+        exchange._market_data = hub
+        validator = AsyncBacktestValidator(exchange)
+        df = validator._fetch_15m_history("BIOUSDT")
+        self.assertEqual(len(df), 12)
+        exchange.fetch_bootstrap_klines_df.assert_not_called()
+
+    def test_fetch_rest_seeds_when_cache_empty(self) -> None:
+        hub = MagicMock()
+        hub.get_backtest_candles.return_value = pd.DataFrame()
+        hub.should_skip_backtest_rest.return_value = False
+        exchange = MagicMock()
+        exchange._market_data = hub
+        exchange.can_bootstrap_klines_rest.return_value = True
+        exchange.fetch_historical_candles.return_value = pd.DataFrame()
+        exchange.fetch_bootstrap_klines_df.return_value = _ohlcv(12)
+        validator = AsyncBacktestValidator(exchange)
+        df = validator._fetch_15m_history("CELRUSDT")
+        self.assertEqual(len(df), 12)
+        exchange.fetch_bootstrap_klines_df.assert_called_once()
+        hub.note_backtest_rest_result.assert_called_once()
+        hub.seed_klines_from_dataframe.assert_called_once()
+
+    def test_hub_closed_ws_bar_fills_backtest_buffer(self) -> None:
+        from market_data_hub import MarketDataHub
+
+        hub = MarketDataHub(MagicMock())
+        open_ms = 1_700_000_000_000
+        for i in range(3):
+            hub._on_kline_message(
+                {
+                    "s": "CELRUSDT",
+                    "k": {
+                        "s": "CELRUSDT",
+                        "i": "15m",
+                        "t": open_ms + i * 15 * 60 * 1000,
+                        "o": "1",
+                        "h": "2",
+                        "l": "0.5",
+                        "c": "1.1",
+                        "v": "10",
+                        "x": True,
+                    },
+                }
+            )
+        df = hub.get_backtest_candles("CELRUSDT", "15m", 500)
+        self.assertEqual(len(df), 3)
+
+    def test_seed_keeps_full_backtest_history_beyond_scan_buffer(self) -> None:
+        from market_data_hub import MarketDataHub
+
+        hub = MarketDataHub(MagicMock())
+        rows = []
+        for i in range(500):
+            rows.append(
+                {
+                    "timestamp": pd.Timestamp("2026-01-01")
+                    + pd.Timedelta(minutes=15 * i),
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.2,
+                    "volume": 1_000.0,
+                }
+            )
+        hub.seed_klines_from_dataframe("BIOUSDT", "15m", pd.DataFrame(rows))
+        self.assertEqual(len(hub.get_backtest_candles("BIOUSDT", "15m", 500)), 500)
+        self.assertEqual(
+            len(hub._kline_bars[("BIOUSDT", "15m")]), Config.WS_KLINE_BUFFER_LIMIT
+        )
+        self.assertGreater(backtest_history_buffer_limit(), Config.WS_KLINE_BUFFER_LIMIT)
+
+    def test_hot_capacity_and_scoring_untouched(self) -> None:
+        self.assertEqual(Config.HOT_TIER_COINS_PER_MINUTE, 1)
+        self.assertEqual(Config.hot_history_demote_cooldown_seconds(), 1800.0)
+        self.assertEqual(required_backtest_win_rate(3), 66.0)
+        self.assertEqual(required_backtest_win_rate(4), 60.0)
+        self.assertGreaterEqual(Config.BACKTEST_MIN_BARS, 450)
 
 
 if __name__ == "__main__":

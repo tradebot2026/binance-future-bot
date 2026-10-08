@@ -505,6 +505,44 @@ class TestTierFunnel(unittest.TestCase):
             any("3 passes" in line for line in funnel._digest_lines)
         )
 
+    def test_history_demote_blocks_repromote_for_30_minutes(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["CELRUSDT", "BIOUSDT"], now=1.0)
+        scores = [_score("CELRUSDT", "SMC_TREND", 72.0)]
+        funnel.promote_from_normal("CELRUSDT", scores, now=1.0)
+        with patch.object(Config, "HOT_PENDING_MAX_PASSES", 3), patch.object(
+            Config, "HOT_PENDING_COOLDOWN_SECONDS", 180.0
+        ):
+            funnel.note_hot_backtest_pending(
+                "CELRUSDT", "Need 450+ closed 15m bars (have 12)", now=1.0
+            )
+            funnel.note_hot_backtest_pending(
+                "CELRUSDT", "Need 450+ closed 15m bars (have 12)", now=181.0
+            )
+            funnel.note_hot_backtest_pending(
+                "CELRUSDT", "Need 450+ closed 15m bars (have 12)", now=361.0
+            )
+        self.assertNotIn("CELRUSDT", funnel.hot_symbols)
+        self.assertTrue(funnel.in_history_demote_cooldown("CELRUSDT", now=362.0))
+        self.assertIsNone(funnel.promote_from_normal("CELRUSDT", scores, now=362.0))
+        self.assertIsNone(
+            funnel.promote_from_normal("CELRUSDT", scores, now=361.0 + 1799.0)
+        )
+        again = funnel.promote_from_normal("CELRUSDT", scores, now=361.0 + 1800.0)
+        self.assertIsNotNone(again)
+        self.assertEqual(again.symbol, "CELRUSDT")
+        self.assertFalse(funnel.in_history_demote_cooldown("BIOUSDT", now=362.0))
+
+    def test_wr_demote_does_not_quarantine_repromote(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["BIOUSDT"], now=1.0)
+        scores = [_score("BIOUSDT", "SMC_TREND", 72.0)]
+        funnel.promote_from_normal("BIOUSDT", scores, now=1.0)
+        funnel.on_backtest_failed("BIOUSDT", "Win Rate 33% < 66%")
+        self.assertFalse(funnel.in_history_demote_cooldown("BIOUSDT", now=2.0))
+        again = funnel.promote_from_normal("BIOUSDT", scores, now=2.0)
+        self.assertIsNotNone(again)
+
     def test_hot_rest_does_not_burn_slot_when_all_cooling(self) -> None:
         funnel = TierFunnel()
         funnel.replace_normal_universe(["AAAUSDT"], now=1.0)

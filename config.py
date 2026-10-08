@@ -154,13 +154,18 @@ class Config:
     RATE_LIMIT_SOFT_HALT_SECONDS: int = _env_int("RATE_LIMIT_SOFT_HALT_SECONDS", 900)
     REST_IP_REQUEST_LIMIT_MAINNET: int = _env_int("REST_IP_REQUEST_LIMIT_MAINNET", 2400)
     REST_IP_REQUEST_LIMIT_TESTNET: int = _env_int("REST_IP_REQUEST_LIMIT_TESTNET", 6000)
-    REST_USED_WEIGHT_LIMIT: int = _env_int("REST_USED_WEIGHT_LIMIT", 6000)
-    REST_OPERATIONAL_WEIGHT_CAP: int = _env_int("REST_OPERATIONAL_WEIGHT_CAP", 600)
+    REST_USED_WEIGHT_LIMIT: int = _env_int("REST_USED_WEIGHT_LIMIT", 2400)
+    REST_HARD_WEIGHT_CAP: int = _env_int("REST_HARD_WEIGHT_CAP", 1500)
+    REST_PRIORITY_THROTTLE_TOTAL: int = _env_int("REST_PRIORITY_THROTTLE_TOTAL", 1200)
+    REST_BUDGET_ORDER_WEIGHT: int = _env_int("REST_BUDGET_ORDER_WEIGHT", 400)
+    REST_BUDGET_HOT_WEIGHT: int = _env_int("REST_BUDGET_HOT_WEIGHT", 600)
+    REST_BUDGET_NORMAL_WEIGHT: int = _env_int("REST_BUDGET_NORMAL_WEIGHT", 400)
+    REST_OPERATIONAL_WEIGHT_CAP: int = _env_int("REST_OPERATIONAL_WEIGHT_CAP", 1500)
     REST_USED_WEIGHT_THROTTLE_THRESHOLD: int = _env_int(
-        "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 600
+        "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1200
     )
     REST_USED_WEIGHT_HARD_THRESHOLD: int = _env_int(
-        "REST_USED_WEIGHT_HARD_THRESHOLD", 1200
+        "REST_USED_WEIGHT_HARD_THRESHOLD", 1500
     )
     WS_DEGRADED_REST_MIN_INTERVAL_SECONDS: float = _env_float(
         "WS_DEGRADED_REST_MIN_INTERVAL_SECONDS", 10.0
@@ -238,9 +243,9 @@ class Config:
     )
     POSITION_CACHE_TTL_SECONDS: int = _env_int("POSITION_CACHE_TTL_SECONDS", 300)
     POSITION_CACHE_BACKOFF_SECONDS: int = _env_int("POSITION_CACHE_BACKOFF_SECONDS", 600)
-    REST_TOKEN_BUCKET_CAPACITY: int = _env_int("REST_TOKEN_BUCKET_CAPACITY", 50)
+    REST_TOKEN_BUCKET_CAPACITY: int = _env_int("REST_TOKEN_BUCKET_CAPACITY", 1500)
     REST_TOKEN_REFILL_PER_SECOND: float = _env_float(
-        "REST_TOKEN_REFILL_PER_SECOND", 0.8
+        "REST_TOKEN_REFILL_PER_SECOND", 25.0
     )
     REST_BAN_MIN_SLEEP_SECONDS: int = _env_int("REST_BAN_MIN_SLEEP_SECONDS", 900)
     REST_BLOCK_LOG_INTERVAL_SECONDS: int = _env_int(
@@ -563,7 +568,7 @@ class Config:
     TIER1_REFRESH_INTERVAL_SECONDS: int = _env_int(
         "TIER1_REFRESH_INTERVAL_SECONDS", 10800
     )
-    REST_BUDGET_WEIGHT_PER_MINUTE: int = _env_int("REST_BUDGET_WEIGHT_PER_MINUTE", 200)
+    REST_BUDGET_WEIGHT_PER_MINUTE: int = _env_int("REST_BUDGET_WEIGHT_PER_MINUTE", 1500)
     REST_BUDGET_MIN_REMAINING_FRACTION: float = _env_float(
         "REST_BUDGET_MIN_REMAINING_FRACTION", 0.20
     )
@@ -710,6 +715,9 @@ class Config:
         "HOT_PENDING_COOLDOWN_SECONDS", 180.0
     )
     HOT_PENDING_MAX_PASSES: int = _env_int("HOT_PENDING_MAX_PASSES", 3)
+    HOT_DEMOTE_COOLDOWN_SECONDS: float = _env_float(
+        "HOT_DEMOTE_COOLDOWN_SECONDS", 1800.0
+    )
     ATTACH_NATIVE_TP_SL_AFTER_VALIDATION: bool = _env_bool(
         "ATTACH_NATIVE_TP_SL_AFTER_VALIDATION", False
     )
@@ -818,32 +826,45 @@ class Config:
         return max(int(cls.REST_USED_WEIGHT_LIMIT), 1)
 
     @classmethod
-    def rest_operational_weight_cap(cls) -> int:
-        """Background REST target: 50% of 1200 weight/min (hard cap 600)."""
+    def rest_hard_weight_cap(cls) -> int:
+        """Local hard stop (1500) — leaves ~900 buffer vs a 2400 Binance IP cap."""
         return min(
-            max(int(getattr(cls, "REST_OPERATIONAL_WEIGHT_CAP", 600)), 1),
-            600,
+            max(int(getattr(cls, "REST_HARD_WEIGHT_CAP", 1500)), 1),
+            1500,
             cls.rest_used_weight_limit(),
         )
 
     @classmethod
+    def rest_operational_weight_cap(cls) -> int:
+        """Total operational REST ceiling — same as the 1500 hard cap."""
+        return cls.rest_hard_weight_cap()
+
+    @classmethod
     def rest_weight_throttle_threshold(cls) -> int:
-        """Pause background REST when used weight reaches this value."""
-        limit = cls.rest_used_weight_limit()
-        cap = cls.rest_operational_weight_cap()
+        """Freeze Normal-scanner REST first when total used-weight hits this."""
+        hard = cls.rest_hard_weight_cap()
         return min(
-            max(int(cls.REST_USED_WEIGHT_THROTTLE_THRESHOLD), 1),
-            cap,
-            1800,
-            limit,
+            max(int(getattr(cls, "REST_PRIORITY_THROTTLE_TOTAL", 1200)), 1),
+            hard,
+            cls.rest_used_weight_limit(),
         )
 
     @classmethod
     def rest_weight_hard_threshold(cls) -> int:
-        """Longer REST pause when used weight is near the Binance cap."""
-        limit = cls.rest_used_weight_limit()
-        throttle = cls.rest_weight_throttle_threshold()
-        return min(max(int(cls.REST_USED_WEIGHT_HARD_THRESHOLD), throttle), limit)
+        """Hard-stop all REST (including Hot/orders) at this used-weight."""
+        return cls.rest_hard_weight_cap()
+
+    @classmethod
+    def rest_budget_order_weight(cls) -> int:
+        return min(max(int(getattr(cls, "REST_BUDGET_ORDER_WEIGHT", 400)), 1), 400)
+
+    @classmethod
+    def rest_budget_hot_weight(cls) -> int:
+        return min(max(int(getattr(cls, "REST_BUDGET_HOT_WEIGHT", 600)), 1), 600)
+
+    @classmethod
+    def rest_budget_normal_weight(cls) -> int:
+        return min(max(int(getattr(cls, "REST_BUDGET_NORMAL_WEIGHT", 400)), 1), 400)
 
     @classmethod
     def testnet_strategy_relax(cls) -> bool:
@@ -912,6 +933,14 @@ class Config:
     def hot_pending_max_passes(cls) -> int:
         """Demote a Hot coin still missing 15m history after this many turns."""
         return min(max(int(getattr(cls, "HOT_PENDING_MAX_PASSES", 3)), 2), 5)
+
+    @classmethod
+    def hot_history_demote_cooldown_seconds(cls) -> float:
+        """Block Hot re-promotion after a thin-history demote (30 minutes)."""
+        return min(
+            max(float(getattr(cls, "HOT_DEMOTE_COOLDOWN_SECONDS", 1800.0)), 1800.0),
+            3600.0,
+        )
 
     @classmethod
     def scan_cycle_symbol_count(cls) -> int:
@@ -1057,10 +1086,15 @@ class Config:
                 if part.strip()
             ]
         if cls.ENABLE_EVENT_DRIVEN_SCAN:
-            return cls.get_scan_trigger_timeframes()
-        if cls.WS_KLINE_LIVE_TIMEFRAMES_ONLY:
-            return [cls.ENTRY_TIMEFRAME]
-        return cls.get_scan_kline_intervals()
+            intervals = cls.get_scan_trigger_timeframes()
+        elif cls.WS_KLINE_LIVE_TIMEFRAMES_ONLY:
+            intervals = [cls.ENTRY_TIMEFRAME]
+        else:
+            intervals = cls.get_scan_kline_intervals()
+        backtest_tf = str(getattr(cls, "BACKTEST_TIMEFRAME", "15m") or "15m").strip()
+        if backtest_tf and backtest_tf not in intervals:
+            intervals = list(intervals) + [backtest_tf]
+        return intervals
 
     @classmethod
     def setup_directories(cls) -> None:

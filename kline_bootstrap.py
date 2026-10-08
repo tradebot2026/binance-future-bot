@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -18,6 +18,107 @@ from rest_rate_guard import kline_rest_delay_seconds, maybe_pause_warmup_rest
 
 class KlineBootstrapAborted(Exception):
     """Raised internally when REST kline bootstrap must stop (ban / budget)."""
+
+
+_OHLCV_COLS = ("timestamp", "open", "high", "low", "close", "volume")
+
+
+def backtest_history_buffer_limit() -> int:
+    """Dedicated WS history size — at least backtest min_bars, not the scan buffer."""
+    try:
+        limit_fn = getattr(Config, "backtest_candle_limit", None)
+        limit = int(limit_fn()) if callable(limit_fn) else int(
+            getattr(Config, "BACKTEST_CANDLE_LIMIT", 500)
+        )
+    except Exception:
+        limit = 500
+    floor = int(getattr(Config, "BACKTEST_MIN_BARS", 450))
+    return max(limit, floor, 200)
+
+
+def _normalize_closed_bar(row: dict) -> Optional[dict]:
+    if not row:
+        return None
+    if row.get("closed") is False:
+        return None
+    open_ms = int(row.get("open_ms") or 0)
+    ts = row.get("timestamp")
+    if open_ms <= 0 and ts is not None:
+        open_ms = int(pd.Timestamp(ts).timestamp() * 1000)
+    if open_ms <= 0:
+        return None
+    return {
+        "timestamp": ts if ts is not None else pd.to_datetime(open_ms, unit="ms"),
+        "open": row.get("open"),
+        "high": row.get("high"),
+        "low": row.get("low"),
+        "close": row.get("close"),
+        "volume": row.get("volume"),
+        "open_ms": open_ms,
+        "closed": True,
+    }
+
+
+def merge_closed_kline_bars(
+    bars: Optional[deque],
+    rows: list[dict],
+    *,
+    maxlen: int | None = None,
+) -> deque:
+    """Rebuild a time-ordered closed-bar deque, newest-capped at maxlen."""
+    limit = maxlen if maxlen and maxlen > 0 else None
+    if limit is None and bars is not None and getattr(bars, "maxlen", None):
+        limit = int(bars.maxlen)
+    by_ms: dict[int, dict] = {}
+    for existing in list(bars or []):
+        item = _normalize_closed_bar(existing)
+        if item is not None:
+            by_ms[item["open_ms"]] = item
+    for row in rows:
+        item = _normalize_closed_bar(row)
+        if item is not None:
+            by_ms[item["open_ms"]] = item
+    return deque((by_ms[key] for key in sorted(by_ms)), maxlen=limit)
+
+
+def merge_closed_kline_bar(bars: deque, row: dict) -> bool:
+    """Upsert one closed WS/REST bar. Returns True when history was written."""
+    item = _normalize_closed_bar(row)
+    if item is None:
+        return False
+    open_ms = item["open_ms"]
+    if not bars:
+        bars.append(item)
+        return True
+    last_ms = int(bars[-1].get("open_ms") or 0)
+    if last_ms == open_ms:
+        bars[-1] = item
+        return True
+    if last_ms < open_ms:
+        bars.append(item)
+        return True
+    merged = merge_closed_kline_bars(bars, [item], maxlen=bars.maxlen)
+    bars.clear()
+    bars.extend(merged)
+    return True
+
+
+def bars_to_ohlcv_dataframe(
+    bars: Optional[deque], limit: int | None = None
+) -> pd.DataFrame:
+    """Convert a closed-bar deque to the OHLCV frame used by 15m backtests."""
+    if not bars:
+        return pd.DataFrame()
+    rows = list(bars)
+    if limit is not None and int(limit) > 0:
+        rows = rows[-int(limit) :]
+    if not rows:
+        return pd.DataFrame()
+    frame = pd.DataFrame(rows)
+    cols = [col for col in _OHLCV_COLS if col in frame.columns]
+    if not cols:
+        return pd.DataFrame()
+    return frame[cols].copy()
 
 
 @dataclass
@@ -314,12 +415,12 @@ def run_batched_kline_bootstrap(
                     maybe_pause_warmup_rest(used_weight_fn())
                 elif used_weight_fn is not None:
                     weight = int(used_weight_fn() or 0)
-                    throttle = Config.rest_weight_throttle_threshold()
-                    if weight >= throttle:
+                    hard = Config.rest_hard_weight_cap()
+                    if weight >= hard:
                         system_logger.warning(
-                            "Kline bootstrap paused — used_weight=%s over throttle %s.",
+                            "Kline bootstrap paused — used_weight=%s over hard cap %s.",
                             weight,
-                            throttle,
+                            hard,
                         )
                         aborted = True
                         break

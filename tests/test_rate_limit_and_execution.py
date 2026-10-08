@@ -83,22 +83,23 @@ class TestRestUsageTracker(unittest.TestCase):
         self.assertGreater(tracker.weight_throttle_remaining(), 0)
         self.assertEqual(snap["used_weight_1m"], 4500)
 
-    def test_used_weight_1000_freezes_background_rest(self) -> None:
+    def test_used_weight_1250_throttles_normal_keeps_hot(self) -> None:
         tracker = RestUsageTracker()
         tracker.note_http_response(
             SimpleNamespace(
                 status_code=200,
-                headers={"X-MBX-USED-WEIGHT-1M": "1000"},
+                headers={"X-MBX-USED-WEIGHT-1M": "1250"},
             )
         )
         snap = tracker.snapshot()
-        self.assertEqual(snap["state"], "RATE_LIMIT_WARNING")
+        self.assertEqual(snap["state"], "HIGH_USAGE")
         self.assertFalse(tracker.allows_background_rest())
+        self.assertTrue(tracker.allows_hot_rest())
         self.assertTrue(tracker.allows_new_entries())
         self.assertFalse(tracker.in_safety_mode())
-        self.assertEqual(snap["used_weight_1m"], 1000)
+        self.assertEqual(snap["used_weight_1m"], 1250)
 
-    def test_used_weight_600_freezes_background_rest(self) -> None:
+    def test_used_weight_600_does_not_freeze_hot_or_normal(self) -> None:
         tracker = RestUsageTracker()
         tracker.note_http_response(
             SimpleNamespace(
@@ -107,28 +108,42 @@ class TestRestUsageTracker(unittest.TestCase):
             )
         )
         snap = tracker.snapshot()
-        self.assertEqual(snap["state"], "RATE_LIMIT_WARNING")
-        self.assertFalse(tracker.allows_background_rest())
+        self.assertEqual(snap["state"], "HEALTHY")
+        self.assertTrue(tracker.allows_background_rest())
+        self.assertTrue(tracker.allows_hot_rest())
         self.assertTrue(tracker.allows_new_entries())
         self.assertEqual(snap["used_weight_1m"], 600)
 
-    def test_operational_cap_keeps_1800_env_at_600(self) -> None:
-        with patch.object(Config, "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1800), patch.object(
-            Config, "REST_OPERATIONAL_WEIGHT_CAP", 600
-        ):
-            self.assertEqual(Config.rest_weight_throttle_threshold(), 600)
+    def test_hard_cap_is_1500(self) -> None:
+        self.assertEqual(Config.rest_hard_weight_cap(), 1500)
+        self.assertEqual(Config.rest_weight_throttle_threshold(), 1200)
+        self.assertEqual(Config.rest_budget_order_weight(), 400)
+        self.assertEqual(Config.rest_budget_hot_weight(), 600)
+        self.assertEqual(Config.rest_budget_normal_weight(), 400)
 
-    def test_local_weight_reserve_blocks_before_binance_header(self) -> None:
+    def test_local_weight_reserve_blocks_normal_at_400(self) -> None:
         tracker = RestUsageTracker()
         reserved = 0
         while tracker.try_reserve_background(5):
             reserved += 5
             if reserved > 2000:
-                self.fail("local reserve did not stop at the operational cap")
-        self.assertGreaterEqual(reserved, 595)
-        self.assertLessEqual(reserved, 600)
+                self.fail("local reserve did not stop at the Normal 400 cap")
+        self.assertGreaterEqual(reserved, 395)
+        self.assertLessEqual(reserved, 400)
         self.assertFalse(tracker.try_reserve_background(5))
         self.assertFalse(tracker.allows_background_rest())
+        self.assertTrue(tracker.try_reserve_hot(5))
+
+    def test_hot_reserve_caps_at_600(self) -> None:
+        tracker = RestUsageTracker()
+        reserved = 0
+        while tracker.try_reserve_hot(5):
+            reserved += 5
+            if reserved > 2000:
+                self.fail("hot reserve did not stop at 600")
+        self.assertGreaterEqual(reserved, 595)
+        self.assertLessEqual(reserved, 600)
+        self.assertFalse(tracker.try_reserve_hot(5))
 
     def test_kline_rest_delay_is_one_second(self) -> None:
         self.assertGreaterEqual(kline_rest_delay_seconds(0), 1.0)
@@ -156,41 +171,36 @@ class TestRestUsageTracker(unittest.TestCase):
         self.assertEqual(weight_for_call(futures_klines, limit=500), 5)
 
     def test_used_weight_1800_freezes_background_rest(self) -> None:
-        with patch.object(Config, "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1800), patch.object(
-            Config, "REST_USED_WEIGHT_HARD_THRESHOLD", 2400
-        ):
-            tracker = RestUsageTracker()
-            tracker.note_http_response(
-                SimpleNamespace(
-                    status_code=200,
-                    headers={"X-MBX-USED-WEIGHT-1M": "1800"},
-                )
+        tracker = RestUsageTracker()
+        tracker.note_http_response(
+            SimpleNamespace(
+                status_code=200,
+                headers={"X-MBX-USED-WEIGHT-1M": "1800"},
             )
-            snap = tracker.snapshot()
-            self.assertEqual(snap["state"], "RATE_LIMIT_WARNING")
-            self.assertFalse(tracker.allows_background_rest())
-            self.assertTrue(tracker.allows_new_entries())
-            self.assertFalse(tracker.in_safety_mode())
-            self.assertEqual(snap["used_weight_1m"], 1800)
+        )
+        snap = tracker.snapshot()
+        self.assertEqual(snap["state"], "RATE_LIMIT_WARNING")
+        self.assertFalse(tracker.allows_background_rest())
+        self.assertFalse(tracker.allows_hot_rest())
+        self.assertFalse(tracker.allows_new_entries())
+        self.assertFalse(tracker.in_safety_mode())
+        self.assertEqual(snap["used_weight_1m"], 1800)
 
     def test_used_weight_stays_frozen_after_short_throttle(self) -> None:
-        with patch.object(Config, "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1800), patch.object(
-            Config, "REST_USED_WEIGHT_HARD_THRESHOLD", 2400
-        ):
-            tracker = RestUsageTracker()
-            tracker.note_http_response(
-                SimpleNamespace(
-                    status_code=200,
-                    headers={"X-MBX-USED-WEIGHT-1M": "1900"},
-                )
+        tracker = RestUsageTracker()
+        tracker.note_http_response(
+            SimpleNamespace(
+                status_code=200,
+                headers={"X-MBX-USED-WEIGHT-1M": "1600"},
             )
-            with tracker._lock:
-                tracker._weight_throttle_until = time.monotonic() - 0.1
-            snap = tracker.snapshot()
-            self.assertEqual(snap["state"], "RATE_LIMIT_WARNING")
-            self.assertFalse(tracker.allows_background_rest())
-            self.assertTrue(tracker.allows_new_entries())
-            self.assertFalse(tracker.in_safety_mode())
+        )
+        with tracker._lock:
+            tracker._weight_throttle_until = time.monotonic() - 0.1
+        snap = tracker.snapshot()
+        self.assertEqual(snap["state"], "RATE_LIMIT_WARNING")
+        self.assertFalse(tracker.allows_background_rest())
+        self.assertFalse(tracker.allows_hot_rest())
+        self.assertFalse(tracker.in_safety_mode())
 
     def test_used_weight_decays_after_rolling_minute(self) -> None:
         tracker = RestUsageTracker()
@@ -252,8 +262,9 @@ class TestRestBlockedUsesSnapshotState(unittest.TestCase):
             )
         )
         blocked, reason = exchange.is_rest_blocked()
-        self.assertTrue(blocked)
-        self.assertIn("weight", reason.lower())
+        self.assertFalse(blocked)
+        self.assertFalse(exchange._rest_usage.allows_background_rest())
+        self.assertFalse(exchange._rest_usage.allows_hot_rest())
 
     def test_hub_recovery_clears_ip_banned_to_healthy(self) -> None:
         from exchange import BinanceExchangeManager
@@ -446,18 +457,16 @@ class TestExecutorSafetyGate(unittest.TestCase):
         exchange._rest_usage = RestUsageTracker()
         exchange._market_data = None
         exchange._entry_ready_logged = False
-        with patch.object(Config, "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1800), patch.object(
-            Config, "REST_USED_WEIGHT_HARD_THRESHOLD", 2400
-        ):
-            exchange._rest_usage.note_http_response(
-                SimpleNamespace(
-                    status_code=200,
-                    headers={"X-MBX-USED-WEIGHT-1M": "1800"},
-                )
+        exchange._rest_usage.note_http_response(
+            SimpleNamespace(
+                status_code=200,
+                headers={"X-MBX-USED-WEIGHT-1M": "1250"},
             )
-            state, _ = BinanceExchangeManager.get_execution_safety(exchange)
-            self.assertEqual(state, "EXECUTION_SAFE")
-            self.assertFalse(exchange._rest_usage.allows_background_rest())
+        )
+        state, _ = BinanceExchangeManager.get_execution_safety(exchange)
+        self.assertEqual(state, "EXECUTION_SAFE")
+        self.assertFalse(exchange._rest_usage.allows_background_rest())
+        self.assertTrue(exchange._rest_usage.allows_hot_rest())
 
 
 if __name__ == "__main__":

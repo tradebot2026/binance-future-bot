@@ -1,4 +1,4 @@
-"""Central REST budget manager — caps background REST below Binance limits."""
+"""Per-component REST budget — Order 400 / Hot 600 / Normal 400 under a 1500 cap."""
 
 from __future__ import annotations
 
@@ -19,39 +19,42 @@ class RestLane(enum.Enum):
 
 class RestBudgetManager:
     """
-    Sliding-window weight budget for non-execution REST.
-    Execution lane bypasses the per-minute cap (still uses token bucket).
-    Background/bootstrap calls fail fast when remaining budget < reserve floor.
+    Sliding-window weight budget per lane.
+    Execution is never fail-closed here (hard cap lives in RestUsageTracker).
+    Normal/background freeze first when the shared IP total hits 1200.
     """
 
     def __init__(self, max_weight_per_minute: Optional[int] = None) -> None:
-        cap = 600
-        try:
-            cap = Config.rest_operational_weight_cap()
-        except Exception:
-            cap = 600
-        self._max_per_minute = min(
-            max(
-                max_weight_per_minute or Config.REST_BUDGET_WEIGHT_PER_MINUTE, 1
-            ),
-            cap,
+        self._max_per_minute = max(
+            int(max_weight_per_minute or Config.rest_hard_weight_cap()), 1
         )
-        self._window: deque[tuple[float, int]] = deque()
+        self._windows: dict[RestLane, deque[tuple[float, int]]] = {
+            RestLane.EXECUTION: deque(),
+            RestLane.BACKGROUND: deque(),
+            RestLane.BOOTSTRAP: deque(),
+        }
         self._lock = threading.Lock()
 
     @property
     def max_weight_per_minute(self) -> int:
         return self._max_per_minute
 
+    def _cap_for(self, lane: RestLane) -> int:
+        if lane == RestLane.EXECUTION:
+            return Config.rest_budget_order_weight()
+        if lane == RestLane.BOOTSTRAP:
+            return Config.rest_budget_hot_weight()
+        return Config.rest_budget_normal_weight()
+
     def current_window_weight(self) -> int:
         self._purge_old()
-        return sum(weight for _, weight in self._window)
+        return sum(weight for window in self._windows.values() for _, weight in window)
 
     def remaining_fraction(self) -> float:
-        """Fraction of the per-minute budget still available (0.0–1.0)."""
         self._purge_old()
-        used = sum(weight for _, weight in self._window)
-        return max(0.0, (self._max_per_minute - used) / self._max_per_minute)
+        used = self.current_window_weight()
+        cap = max(self._max_per_minute, 1)
+        return max(0.0, (cap - used) / cap)
 
     def has_budget_for(
         self,
@@ -60,25 +63,15 @@ class RestBudgetManager:
         *,
         min_remaining_fraction: Optional[float] = None,
     ) -> bool:
-        """Check whether a call may proceed without breaching the reserve floor."""
         if lane == RestLane.EXECUTION:
             return True
-
-        reserve = (
-            Config.REST_BUDGET_MIN_REMAINING_FRACTION
-            if min_remaining_fraction is None
-            else min_remaining_fraction
-        )
-        reserve = max(min(reserve, 1.0), 0.0)
-        weight = max(weight, 1)
-
+        _ = min_remaining_fraction
+        weight = max(int(weight), 1)
+        cap = self._cap_for(lane)
         with self._lock:
             self._purge_old()
-            used = sum(w for _, w in self._window)
-            if used + weight > self._max_per_minute:
-                return False
-            remaining_after = (self._max_per_minute - used - weight) / self._max_per_minute
-            return remaining_after >= reserve
+            used = sum(w for _, w in self._windows[lane])
+            return used + weight <= cap
 
     def try_acquire(
         self,
@@ -87,24 +80,22 @@ class RestBudgetManager:
         *,
         min_remaining_fraction: Optional[float] = None,
     ) -> bool:
-        """Reserve budget if available; never blocks."""
         if lane == RestLane.EXECUTION:
             return True
-        if not self.has_budget_for(weight, lane, min_remaining_fraction=min_remaining_fraction):
+        if not self.has_budget_for(
+            weight, lane, min_remaining_fraction=min_remaining_fraction
+        ):
             return False
-        weight = max(weight, 1)
+        weight = max(int(weight), 1)
         with self._lock:
-            self._window.append((time.monotonic(), weight))
+            self._windows[lane].append((time.monotonic(), weight))
             return True
 
     def acquire(self, weight: int, lane: RestLane) -> bool:
-        """
-        Reserve budget for a non-execution REST call.
-        Returns False when reserve floor would be breached (fail fast, no sleep).
-        """
         return self.try_acquire(weight, lane)
 
     def _purge_old(self) -> None:
         cutoff = time.monotonic() - 60.0
-        while self._window and self._window[0][0] < cutoff:
-            self._window.popleft()
+        for window in self._windows.values():
+            while window and window[0][0] < cutoff:
+                window.popleft()

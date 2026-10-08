@@ -68,34 +68,48 @@ class ApiHealthState(str, enum.Enum):
     IP_BANNED = "IP_BANNED"
 
 
+class RestComponent(str, enum.Enum):
+    """Per-IP request-weight lanes (sums ≤ 1500 hard cap)."""
+
+    ORDER = "order"
+    HOT = "hot"
+    NORMAL = "normal"
+
+
 def _weight_thresholds() -> tuple[int, int, int]:
-    """Return (throttle_at, hard_at, limit) for X-MBX-USED-WEIGHT-1M."""
+    """Return (normal_throttle_at, hard_at, exchange_limit) for used-weight."""
     limit = Config.rest_used_weight_limit()
     throttle = Config.rest_weight_throttle_threshold()
-    hard = Config.rest_weight_hard_threshold()
+    hard = Config.rest_hard_weight_cap()
     return throttle, hard, limit
 
 
+def _component_budget(component: RestComponent) -> int:
+    if component == RestComponent.ORDER:
+        return Config.rest_budget_order_weight()
+    if component == RestComponent.HOT:
+        return Config.rest_budget_hot_weight()
+    return Config.rest_budget_normal_weight()
+
+
 def _weight_pause_seconds(used_weight: int) -> float:
-    """How long to pause background REST after a used-weight header."""
+    """Pause Normal-scanner REST after a used-weight header; Hot/orders stay up until hard cap."""
     throttle, hard, limit = _weight_thresholds()
-    if used_weight >= limit:
+    if used_weight >= limit or used_weight >= hard:
         return max(float(Config.REST_WEIGHT_OVER_LIMIT_PAUSE_SECONDS), 45.0)
-    if used_weight >= hard:
-        return max(float(Config.REST_WEIGHT_HARD_THROTTLE_SECONDS), 8.0)
     if used_weight >= throttle:
         return max(float(Config.REST_WEIGHT_THROTTLE_SECONDS), 5.0)
     return 0.0
 
 
 def kline_rest_delay_seconds(used_weight: int = 0) -> float:
-    """Gap between kline REST calls; stretch slightly as used-weight climbs."""
+    """Gap between kline REST calls; stretch only near the 1500 hard cap."""
     base = max(float(getattr(Config, "KLINE_REST_MIN_INTERVAL_SECONDS", 1.0)), 1.0)
     weight = int(used_weight or 0)
-    throttle = Config.rest_weight_throttle_threshold()
-    if weight >= throttle:
+    hard = Config.rest_hard_weight_cap()
+    if weight >= hard:
         return min(base + 1.0, 2.5)
-    if weight >= max(throttle // 2, 300):
+    if weight >= Config.rest_weight_throttle_threshold():
         return min(base + 0.5, 2.0)
     return base
 
@@ -135,7 +149,7 @@ class RestUsageTracker:
         self._reason: str = ""
         self._retry_after_seconds: float = 0.0
         self._logged_state: ApiHealthState = ApiHealthState.HEALTHY
-        self._local_weight_window: deque[tuple[float, int]] = deque()
+        self._local_weight_window: deque[tuple[float, int, str]] = deque()
 
     def requests_last_minute(self) -> int:
         self._purge()
@@ -160,7 +174,12 @@ class RestUsageTracker:
                 "header_used_weight_1m": int(self._used_weight_1m),
                 "ip_limit": Config.rest_ip_request_limit(),
                 "weight_limit": Config.rest_used_weight_limit(),
-                "operational_weight_cap": Config.rest_operational_weight_cap(),
+                "operational_weight_cap": Config.rest_hard_weight_cap(),
+                "hard_weight_cap": Config.rest_hard_weight_cap(),
+                "priority_throttle_total": Config.rest_weight_throttle_threshold(),
+                "weight_order_1m": self._component_sum_locked(RestComponent.ORDER),
+                "weight_hot_1m": self._component_sum_locked(RestComponent.HOT),
+                "weight_normal_1m": self._component_sum_locked(RestComponent.NORMAL),
                 "weight_throttle_remaining_seconds": throttle_remaining,
                 "safety_remaining_seconds": remaining,
                 "last_http_status": self._last_http_status,
@@ -169,14 +188,39 @@ class RestUsageTracker:
             }
 
     def allows_background_rest(self) -> bool:
+        """Normal-scanner REST — frozen first at the 1200 priority line."""
+        return self.allows_component_rest(RestComponent.NORMAL)
+
+    def allows_hot_rest(self) -> bool:
+        """Hot-tier / kline bootstrap REST — stays up until the 1500 hard cap."""
+        return self.allows_component_rest(RestComponent.HOT)
+
+    def allows_component_rest(self, component: RestComponent, weight: int = 1) -> bool:
         snap = self.snapshot()
-        throttle = Config.rest_weight_throttle_threshold()
-        if int(snap.get("used_weight_1m") or 0) >= throttle:
+        state = str(snap.get("state") or "")
+        if state in {
+            ApiHealthState.API_RATE_LIMITED.value,
+            ApiHealthState.IP_BANNED.value,
+        }:
             return False
-        return snap["state"] in {
-            ApiHealthState.HEALTHY.value,
-            ApiHealthState.HIGH_USAGE.value,
-        }
+        used = int(snap.get("used_weight_1m") or 0)
+        hard = Config.rest_hard_weight_cap()
+        if used >= hard or used + max(int(weight), 1) > hard:
+            return False
+        if component == RestComponent.NORMAL:
+            if used >= Config.rest_weight_throttle_threshold():
+                return False
+            if state == ApiHealthState.RATE_LIMIT_WARNING.value:
+                return False
+        budget = _component_budget(component)
+        key = {
+            RestComponent.ORDER: "weight_order_1m",
+            RestComponent.HOT: "weight_hot_1m",
+            RestComponent.NORMAL: "weight_normal_1m",
+        }[component]
+        if int(snap.get(key) or 0) + max(int(weight), 1) > budget:
+            return False
+        return True
 
     def projected_used_weight(self) -> int:
         """Max of Binance header and locally reserved weight in the last 60s."""
@@ -187,32 +231,55 @@ class RestUsageTracker:
             return max(int(self._used_weight_1m), self._local_weight_sum_locked())
 
     def try_reserve_background(self, weight: int) -> bool:
-        """Atomically reserve weight for a background REST call, or skip it."""
+        """Reserve Normal-scanner weight, or skip the call."""
+        return self.try_reserve(RestComponent.NORMAL, weight)
+
+    def try_reserve_hot(self, weight: int) -> bool:
+        """Reserve Hot/kline weight, or skip the call."""
+        return self.try_reserve(RestComponent.HOT, weight)
+
+    def try_reserve(self, component: RestComponent, weight: int) -> bool:
+        """Atomically reserve component weight under the 1500 hard cap."""
         weight = max(int(weight), 1)
+        hard = Config.rest_hard_weight_cap()
         throttle = Config.rest_weight_throttle_threshold()
+        budget = _component_budget(component)
         with self._lock:
             self._decay_used_weight_locked()
             self._purge_local_weight_locked()
             projected = max(int(self._used_weight_1m), self._local_weight_sum_locked())
-            if projected >= throttle or projected + weight > throttle:
+            if projected >= hard or projected + weight > hard:
                 return False
-            self._local_weight_window.append((time.monotonic(), weight))
+            if component == RestComponent.NORMAL and (
+                projected >= throttle or projected + weight > throttle
+            ):
+                return False
+            used = self._component_sum_locked(component)
+            if used + weight > budget:
+                return False
+            self._local_weight_window.append(
+                (time.monotonic(), weight, component.value)
+            )
             return True
 
     def note_outgoing_weight(self, weight: int) -> None:
-        """Record sent REST weight (execution lane — never blocks)."""
+        """Record sent REST weight on the order lane (does not block)."""
         weight = max(int(weight), 1)
         with self._lock:
             self._purge_local_weight_locked()
-            self._local_weight_window.append((time.monotonic(), weight))
+            self._local_weight_window.append(
+                (time.monotonic(), weight, RestComponent.ORDER.value)
+            )
 
     def allows_new_entries(self) -> bool:
-        """Orders may proceed unless Binance has halted the IP (429/418/-1003)."""
+        """Orders proceed unless the IP is halted or the 1500 hard cap is hit."""
         snap = self.snapshot()
-        return snap["state"] not in {
+        if snap["state"] in {
             ApiHealthState.API_RATE_LIMITED.value,
             ApiHealthState.IP_BANNED.value,
-        }
+        }:
+            return False
+        return int(snap.get("used_weight_1m") or 0) < Config.rest_hard_weight_cap()
 
     def in_safety_mode(self) -> bool:
         snap = self.snapshot()
@@ -360,7 +427,15 @@ class RestUsageTracker:
             self._local_weight_window.popleft()
 
     def _local_weight_sum_locked(self) -> int:
-        return int(sum(weight for _, weight in self._local_weight_window))
+        return int(sum(item[1] for item in self._local_weight_window))
+
+    def _component_sum_locked(self, component: RestComponent) -> int:
+        name = component.value
+        total = 0
+        for item in self._local_weight_window:
+            if len(item) >= 3 and item[2] == name:
+                total += int(item[1])
+        return total
 
     def _effective_state_locked(self, remaining: float) -> ApiHealthState:
         self._decay_used_weight_locked()
@@ -372,28 +447,30 @@ class RestUsageTracker:
             return self._state
         ip_limit = max(Config.rest_ip_request_limit(), 1)
         count = len(self._window)
-        throttle_at, _hard_at, weight_limit = _weight_thresholds()
+        throttle_at, hard_at, weight_limit = _weight_thresholds()
         self._purge_local_weight_locked()
         used_weight = max(int(self._used_weight_1m), self._local_weight_sum_locked())
         throttle_remaining = max(self._weight_throttle_until - time.monotonic(), 0.0)
 
-        if used_weight >= throttle_at:
+        if used_weight >= hard_at or used_weight >= weight_limit:
             self._state = ApiHealthState.RATE_LIMIT_WARNING
             pause_note = (
                 f" (pause {int(throttle_remaining)}s)"
                 if throttle_remaining > 0
-                else " — background REST frozen until weight decays"
+                else " — REST frozen until weight decays"
             )
-            if used_weight >= weight_limit:
-                self._reason = (
-                    f"used_weight_1m={used_weight} at/over limit {weight_limit}"
-                    f"{pause_note}"
-                )
-            else:
-                self._reason = (
-                    f"used_weight_1m={used_weight} over throttle {throttle_at}"
-                    f"{pause_note}"
-                )
+            self._reason = (
+                f"used_weight_1m={used_weight} at/over hard cap {hard_at}"
+                f"{pause_note}"
+            )
+            self._log_state_locked(count, ip_limit)
+            return self._state
+        if used_weight >= throttle_at:
+            self._state = ApiHealthState.HIGH_USAGE
+            self._reason = (
+                f"used_weight_1m={used_weight} — Normal scanner throttled "
+                f"(>{throttle_at}); Hot/orders stay up until {hard_at}"
+            )
             self._log_state_locked(count, ip_limit)
             return self._state
         if count >= int(ip_limit * 0.85):
@@ -546,10 +623,8 @@ class RestBlockLogSuppressor:
 
 
 def build_default_token_bucket() -> RestTokenBucket:
-    per_minute = max(Config.REST_BUDGET_WEIGHT_PER_MINUTE, 1)
+    per_minute = max(Config.rest_hard_weight_cap(), 1)
     return RestTokenBucket(
-        capacity=float(min(Config.REST_TOKEN_BUCKET_CAPACITY, per_minute)),
-        refill_per_second=min(
-            Config.REST_TOKEN_REFILL_PER_SECOND, per_minute / 60.0
-        ),
+        capacity=float(per_minute),
+        refill_per_second=per_minute / 60.0,
     )

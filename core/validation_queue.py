@@ -272,26 +272,48 @@ class AsyncBacktestValidator:
         )
         return _BacktestDecision(status="passed", payload=approved)
 
+    def _cached_15m_history(
+        self, symbol: str, timeframe: str, fetch_limit: int, hub: Any
+    ) -> Optional[Any]:
+        if hub is not None:
+            getter = getattr(hub, "get_backtest_candles", None)
+            if callable(getter):
+                try:
+                    cached = getter(symbol, timeframe, fetch_limit)
+                    if cached is not None and not getattr(cached, "empty", True):
+                        return cached
+                except Exception:
+                    pass
+        try:
+            return self.exchange.fetch_historical_candles(
+                symbol, timeframe, limit=fetch_limit, allow_rest=False
+            )
+        except Exception:
+            return None
+
     def _fetch_15m_history(self, symbol: str) -> Optional[Any]:
         timeframe = str(Config.BACKTEST_TIMEFRAME or "15m")
         fetch_limit = Config.backtest_candle_limit()
         min_bars = backtest_min_bars()
         hub = getattr(self.exchange, "_market_data", None)
-        cached = None
-        try:
-            cached = self.exchange.fetch_historical_candles(
-                symbol, timeframe, limit=fetch_limit, allow_rest=False
-            )
-        except Exception:
-            cached = None
-        if cached is not None and not cached.empty and len(cached) >= min_bars:
+        cached = self._cached_15m_history(symbol, timeframe, fetch_limit, hub)
+        have = 0 if cached is None or getattr(cached, "empty", True) else len(cached)
+        if have >= min_bars:
+            return cached
+
+        skip_rest = False
+        if hub is not None:
+            skip_fn = getattr(hub, "should_skip_backtest_rest", None)
+            if callable(skip_fn):
+                try:
+                    skip_rest = skip_fn(symbol, timeframe) is True
+                except Exception:
+                    skip_rest = False
+        if skip_rest:
             return cached
 
         can_boot = getattr(self.exchange, "can_bootstrap_klines_rest", None)
         if callable(can_boot) and not can_boot():
-            return cached
-        can_rest = getattr(self.exchange, "can_make_background_rest_call", None)
-        if callable(can_rest) and not can_rest(1):
             return cached
         try:
             with self.exchange.bootstrap_context():
@@ -310,4 +332,12 @@ class AsyncBacktestValidator:
                     seeder(symbol, timeframe, df)
                 except Exception:
                     pass
-        return df
+            mark = getattr(hub, "note_backtest_rest_result", None)
+            if callable(mark):
+                try:
+                    mark(symbol, timeframe, len(df), fetch_limit)
+                except Exception:
+                    pass
+        if df is not None and not df.empty:
+            return df
+        return cached

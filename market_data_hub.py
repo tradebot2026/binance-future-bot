@@ -22,7 +22,13 @@ from binance.client import Client
 from binance.exceptions import BinanceAPIException
 
 from config import Config
-from kline_bootstrap import run_batched_kline_bootstrap
+from kline_bootstrap import (
+    backtest_history_buffer_limit,
+    bars_to_ohlcv_dataframe,
+    merge_closed_kline_bar,
+    merge_closed_kline_bars,
+    run_batched_kline_bootstrap,
+)
 from logger import error_logger, system_logger
 from rest_rate_guard import kline_rest_delay_seconds, maybe_pause_warmup_rest
 from utils import safe_float
@@ -153,6 +159,8 @@ class MarketDataHub:
         self._book_fetched_at: float = 0.0
         self._candles: dict[tuple[str, str, int], _CandleCacheEntry] = {}
         self._kline_bars: dict[tuple[str, str], deque[dict[str, Any]]] = {}
+        self._backtest_bars: dict[tuple[str, str], deque[dict[str, Any]]] = {}
+        self._rest_history_exhausted: set[tuple[str, str]] = set()
         self._scan_halted_until: float = 0.0
         self._scan_halt_reason: str = ""
         self._rest_blocked_until: float = 0.0
@@ -2141,6 +2149,11 @@ class MarketDataHub:
                 else:
                     bars.append(row)
                 if row["closed"]:
+                    bt_limit = backtest_history_buffer_limit()
+                    bt = self._backtest_bars.setdefault(
+                        key, deque(maxlen=bt_limit)
+                    )
+                    merge_closed_kline_bar(bt, row)
                     self._sync_candles_from_klines(symbol, interval)
                 else:
                     self._patch_candle_cache_last_row(symbol, interval, row)
@@ -2639,11 +2652,11 @@ class MarketDataHub:
         symbol = symbol.upper()
         key = (symbol, interval)
         with self._lock:
-            bars: deque[dict[str, Any]] = deque(maxlen=Config.WS_KLINE_BUFFER_LIMIT)
+            built: list[dict[str, Any]] = []
             for _, row in df.iterrows():
                 ts = row["timestamp"]
                 open_ms = int(pd.Timestamp(ts).timestamp() * 1000)
-                bars.append(
+                built.append(
                     {
                         "timestamp": ts,
                         "open": safe_float(row.get("open")),
@@ -2655,7 +2668,14 @@ class MarketDataHub:
                         "closed": True,
                     }
                 )
-            self._kline_bars[key] = bars
+            self._kline_bars[key] = deque(
+                built, maxlen=Config.WS_KLINE_BUFFER_LIMIT
+            )
+            bt_limit = backtest_history_buffer_limit()
+            existing = self._backtest_bars.get(key, deque(maxlen=bt_limit))
+            self._backtest_bars[key] = merge_closed_kline_bars(
+                existing, built, maxlen=bt_limit
+            )
             self._sync_candles_from_klines(symbol, interval)
 
     # ---------------- Ticker / book ----------------
@@ -2894,20 +2914,54 @@ class MarketDataHub:
         symbol = symbol.upper()
         key = (symbol, timeframe, int(limit))
         with self._lock:
+            candidates: list[pd.DataFrame] = []
             cached = self._candles.get(key)
             if cached and not cached.dataframe.empty:
-                return cached.dataframe.copy()
-
+                candidates.append(cached.dataframe)
             kline_key = (symbol, timeframe)
+            backtest = getattr(self, "_backtest_bars", {}).get(kline_key)
+            if backtest and len(backtest) >= 10:
+                frame = bars_to_ohlcv_dataframe(backtest, limit)
+                if not frame.empty:
+                    candidates.append(frame)
             bars = self._kline_bars.get(kline_key)
             if bars and len(bars) >= 10:
                 rows = list(bars)[-limit:]
                 df = pd.DataFrame(rows)[
                     ["timestamp", "open", "high", "low", "close", "volume"]
                 ]
-                return df.copy()
+                candidates.append(df)
+            if candidates:
+                return max(candidates, key=len).copy()
 
         return pd.DataFrame()
+
+    def get_backtest_candles(
+        self, symbol: str, timeframe: str, limit: int
+    ) -> pd.DataFrame:
+        """Closed-bar history for walk-forward backtests (WS buffer, then cache)."""
+        symbol = symbol.upper()
+        key = (symbol, timeframe)
+        with self._lock:
+            bars = getattr(self, "_backtest_bars", {}).get(key)
+            if bars:
+                frame = bars_to_ohlcv_dataframe(bars, limit)
+                if not frame.empty:
+                    return frame
+        return self.get_candles_cached_only(symbol, timeframe, limit)
+
+    def note_backtest_rest_result(
+        self, symbol: str, interval: str, got: int, want: int
+    ) -> None:
+        """Remember when REST already returned every available 15m bar."""
+        if int(got) < int(want):
+            self._rest_history_exhausted.add((symbol.upper(), interval))
+
+    def should_skip_backtest_rest(self, symbol: str, interval: str) -> bool:
+        """True after REST proved the venue has fewer bars than the backtest floor."""
+        return (symbol.upper(), interval) in getattr(
+            self, "_rest_history_exhausted", set()
+        )
 
     def get_candles(
         self,

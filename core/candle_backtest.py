@@ -136,6 +136,40 @@ def backtest_min_bars() -> int:
     return max(min(floor, limit), 200)
 
 
+def backtest_history_ready(
+    df: Optional[pd.DataFrame], min_bars: Optional[int] = None
+) -> bool:
+    """True when closed 15m history already meets the walk-forward bar floor."""
+    need = int(min_bars) if min_bars is not None else backtest_min_bars()
+    closed = drop_forming_bar(df)
+    have = 0 if closed is None or closed.empty else len(closed)
+    return have >= need
+
+
+def append_closed_ohlcv(
+    df: Optional[pd.DataFrame], row: dict
+) -> pd.DataFrame:
+    """Append or replace a closed OHLCV bar by timestamp. Scoring rules unchanged."""
+    new_row = {
+        "timestamp": row.get("timestamp"),
+        "open": row.get("open"),
+        "high": row.get("high"),
+        "low": row.get("low"),
+        "close": row.get("close"),
+        "volume": row.get("volume"),
+    }
+    incoming = pd.DataFrame([new_row])
+    if df is None or df.empty:
+        return incoming
+    out = df.copy()
+    if "timestamp" not in out.columns or new_row["timestamp"] is None:
+        return pd.concat([out, incoming], ignore_index=True)
+    ts = pd.Timestamp(new_row["timestamp"])
+    stamps = pd.to_datetime(out["timestamp"])
+    out = out.loc[stamps != ts].reset_index(drop=True)
+    return pd.concat([out, incoming], ignore_index=True)
+
+
 def required_backtest_win_rate(trades: int) -> Optional[float]:
     """Min win-rate for a closed-trade sample, or None if the sample is too thin.
 
