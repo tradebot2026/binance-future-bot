@@ -103,6 +103,8 @@ class TierFunnel:
         self._history_bars_fn: Optional[HistoryBarsFn] = None
         self._demote_cooldown_until: dict[str, float] = {}
         self._digest_lines: list[str] = []
+        self._digest_promoted: list[tuple[str, str, float]] = []
+        self._digest_demoted: list[tuple[str, str]] = []
         self._digest_started: float = 0.0
         self._super_skip_tg_at: dict[str, float] = {}
 
@@ -536,6 +538,7 @@ class TierFunnel:
             f"📊 score={best_score:.1f}",
             instant=False,
             digest=f"⬆️ Hot: {key} | {best.strategy} | {best_score:.0f}",
+            digest_promote=(key, best.strategy, best_score),
         )
         return rec
 
@@ -857,6 +860,7 @@ class TierFunnel:
             f"📊 score={effective:.1f}",
             instant=True,
             digest=f"⭐ Super: {key} | {score.strategy} | {effective:.0f}",
+            digest_promote=(key, score.strategy, effective),
         )
 
     def in_history_demote_cooldown(
@@ -906,6 +910,7 @@ class TierFunnel:
             f"<i>{reason}</i> — returned to Normal cycle",
             instant=False,
             digest=f"⬇️ Demote {key} — {reason}",
+            digest_demote=(key, reason),
         )
 
     def note_super_skip(self, symbol: str, reason: str, *, instant: bool = False) -> None:
@@ -932,24 +937,31 @@ class TierFunnel:
         if (stamp - self._digest_started) < interval:
             return None
         pending_bt = self.pending_backtest_symbols()
-        if not self._digest_lines and not pending_bt:
+        if (
+            not self._digest_lines
+            and not pending_bt
+            and not self._digest_promoted
+            and not self._digest_demoted
+        ):
             self._digest_started = stamp
             return None
-        lines = ["📊 <b>Hourly Funnel Digest</b>"]
-        if self._digest_lines:
-            lines.extend(self._digest_lines)
-        else:
-            lines.append("<i>No Hot promotions or demotions this hour.</i>")
-        if pending_bt:
-            progress = self.pending_backtest_progress()
-            labels = [
-                f"{sym} {int(progress.get(sym, 0))}%"
-                for sym in pending_bt[:20]
-            ]
-            lines.append("⏳ Pending Backtest: " + ", ".join(labels))
+        from telegram_alerts import format_hourly_funnel_digest
+
+        progress = self.pending_backtest_progress()
+        pending_rows = [
+            (sym, int(progress.get(sym, 0))) for sym in pending_bt[:12]
+        ]
+        text = format_hourly_funnel_digest(
+            promoted=list(self._digest_promoted),
+            demoted=list(self._digest_demoted),
+            hot_count=len(self.hot_symbols),
+            super_count=len(self.super_symbols),
+            pending=pending_rows,
+        )
         self._digest_lines = []
+        self._digest_promoted = []
+        self._digest_demoted = []
         self._digest_started = stamp
-        text = "\n".join(lines)
         self._emit(text, instant=True)
         return text
 
@@ -959,10 +971,16 @@ class TierFunnel:
         *,
         instant: bool = False,
         digest: Optional[str] = None,
+        digest_promote: Optional[tuple[str, str, float]] = None,
+        digest_demote: Optional[tuple[str, str]] = None,
         instant_cooldown_key: str = "",
     ) -> None:
         if digest:
             self._digest_lines.append(digest)
+        if digest_promote:
+            self._digest_promoted.append(digest_promote)
+        if digest_demote:
+            self._digest_demoted.append(digest_demote)
         if not instant or not text or self._notify is None:
             return
         if instant_cooldown_key:

@@ -971,6 +971,26 @@ class MarketDataHub:
         for sock in self._kline_sockets:
             sock.last_event_at = now
 
+    def _catchup_kline_buffers_after_reconnect(self) -> None:
+        """Keep in-memory closed bars across reconnect — no extra REST."""
+        with self._lock:
+            bt_pairs = len(getattr(self, "_backtest_bars", {}) or {})
+            bt_bars = sum(
+                len(buf) for buf in (getattr(self, "_backtest_bars", {}) or {}).values()
+            )
+            scan_pairs = len(self._kline_bars)
+            scan_bars = sum(len(buf) for buf in self._kline_bars.values())
+            kline_streams = len(self._subscribed_kline_streams)
+        system_logger.info(
+            "[WS_CATCHUP] buffers kept — 15m/backtest pairs=%s bars=%s "
+            "scan pairs=%s bars=%s streams=%s (WS-first, no REST fill).",
+            bt_pairs,
+            bt_bars,
+            scan_pairs,
+            scan_bars,
+            kline_streams,
+        )
+
     def _note_ws_frame(self, stream: str = "") -> None:
         """Any inbound frame (data, heartbeat, empty payload) counts as connection life."""
         now = time.monotonic()
@@ -1181,6 +1201,9 @@ class MarketDataHub:
             self._note_ws_frame("ticker")
             if Config.ENABLE_WS_BOOK_STREAM:
                 self._note_ws_frame("book")
+            now_stamp = time.monotonic()
+            for sock in self._kline_sockets:
+                sock.last_event_at = now_stamp
             if self._ws_log.should_log("ws_protocol_ping"):
                 system_logger.debug(
                     "WS ping/pong keepalive sent on %s socket(s) (interval=%.0fs).",
@@ -1449,12 +1472,13 @@ class MarketDataHub:
             )
             self._start_ws_internal(preserve_cache=preserve_cache)
             self._mark_stream_freshness()
+            self._catchup_kline_buffers_after_reconnect()
             self._last_stale_reconnect_success_at = time.monotonic()
             self._degraded_since = 0.0
             self._reconnect_policy.reset()
             self._ws_log.reset()
             system_logger.info(
-                "[WS_RECONNECTED] streams re-subscribed (miniTicker + bookTicker + userData) after: %s",
+                "[WS_RECONNECTED] streams re-subscribed (miniTicker + bookTicker + userData + klines) after: %s",
                 reason,
             )
             system_logger.info("[WS_SUBSCRIPTION_READY] post-reconnect subscriptions active.")
@@ -1526,14 +1550,14 @@ class MarketDataHub:
         try:
             if sock is None or not sock.streams:
                 return
-            time.sleep(max(Config.WS_RECONNECT_MIN_SECONDS, 0.5))
+            time.sleep(min(max(Config.WS_RECONNECT_MIN_SECONDS, 0.25), 1.0))
             if not self._ws_manager or not self._ws_running or self._reconnect_in_progress:
                 return
             self._close_kline_multiplex(sock)
             sock.conn_key = self._start_kline_socket(sock, socket_idx)
             sock.last_event_at = time.monotonic()
             system_logger.info(
-                "Kline WS socket %s reconnected (%s streams).",
+                "Kline WS socket %s reconnected (%s streams) — closed-bar buffers kept.",
                 socket_idx,
                 len(sock.streams),
             )

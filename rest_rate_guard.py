@@ -76,6 +76,55 @@ class RestComponent(str, enum.Enum):
     NORMAL = "normal"
 
 
+class ComponentRestPacer:
+    """Strict inter-request gaps per REST lane (shared across exchange + bootstrap)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._last: dict[str, float] = {}
+
+    def reset(self) -> None:
+        with self._lock:
+            self._last.clear()
+
+    def last_at(self, component: RestComponent) -> float:
+        with self._lock:
+            return float(self._last.get(component.value, 0.0) or 0.0)
+
+    def wait(self, component: RestComponent) -> float:
+        gap = rest_pace_seconds(component)
+        with self._lock:
+            now = time.monotonic()
+            last = float(self._last.get(component.value, 0.0) or 0.0)
+            earliest = (last + gap) if last > 0 else now
+            start = max(now, earliest)
+            pause = max(0.0, start - now)
+            self._last[component.value] = start
+        if pause > 0:
+            time.sleep(pause)
+        return pause
+
+
+_LANE_PACER = ComponentRestPacer()
+
+
+def rest_pace_seconds(component: RestComponent) -> float:
+    if component == RestComponent.ORDER:
+        return Config.rest_pace_order_seconds()
+    if component == RestComponent.HOT:
+        return Config.rest_pace_hot_seconds()
+    return Config.rest_pace_normal_seconds()
+
+
+def wait_rest_lane(component: RestComponent) -> float:
+    """Block until this lane's interval has elapsed. Returns seconds slept."""
+    return _LANE_PACER.wait(component)
+
+
+def reset_rest_lane_pacer() -> None:
+    _LANE_PACER.reset()
+
+
 def _weight_thresholds() -> tuple[int, int, int]:
     """Return (normal_throttle_at, hard_at, exchange_limit) for used-weight."""
     limit = Config.rest_used_weight_limit()
@@ -103,14 +152,15 @@ def _weight_pause_seconds(used_weight: int) -> float:
 
 
 def kline_rest_delay_seconds(used_weight: int = 0) -> float:
-    """Gap between kline REST calls; stretch only near the 1500 hard cap."""
-    base = max(float(getattr(Config, "KLINE_REST_MIN_INTERVAL_SECONDS", 1.0)), 1.0)
+    """Hot-lane gap between kline REST calls (~20/min); stretch only near 1500."""
+    configured = float(getattr(Config, "KLINE_REST_MIN_INTERVAL_SECONDS", 3.0))
+    base = max(configured, Config.rest_pace_hot_seconds())
     weight = int(used_weight or 0)
     hard = Config.rest_hard_weight_cap()
     if weight >= hard:
-        return min(base + 1.0, 2.5)
+        return min(base + 1.0, 5.0)
     if weight >= Config.rest_weight_throttle_threshold():
-        return min(base + 0.5, 2.0)
+        return min(base + 0.5, 4.0)
     return base
 
 

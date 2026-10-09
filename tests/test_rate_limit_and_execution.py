@@ -10,7 +10,15 @@ from unittest.mock import MagicMock, patch
 
 from config import Config, _env_use_testnet
 from core.execution_ledger import ExecutionLedger, ExecutionPhase
-from rest_rate_guard import RestUsageTracker, kline_rest_delay_seconds, weight_for_call
+from rest_rate_guard import (
+    RestComponent,
+    RestUsageTracker,
+    kline_rest_delay_seconds,
+    reset_rest_lane_pacer,
+    rest_pace_seconds,
+    wait_rest_lane,
+    weight_for_call,
+)
 
 
 class TestEnvFailClosed(unittest.TestCase):
@@ -145,9 +153,23 @@ class TestRestUsageTracker(unittest.TestCase):
         self.assertLessEqual(reserved, 600)
         self.assertFalse(tracker.try_reserve_hot(5))
 
-    def test_kline_rest_delay_is_one_second(self) -> None:
-        self.assertGreaterEqual(kline_rest_delay_seconds(0), 1.0)
-        self.assertGreaterEqual(kline_rest_delay_seconds(1000), 1.0)
+    def test_kline_rest_delay_is_hot_lane_three_seconds(self) -> None:
+        self.assertGreaterEqual(kline_rest_delay_seconds(0), 3.0)
+        self.assertGreaterEqual(kline_rest_delay_seconds(1000), 3.0)
+        self.assertEqual(rest_pace_seconds(RestComponent.NORMAL), 2.0)
+        self.assertEqual(rest_pace_seconds(RestComponent.HOT), 3.0)
+        self.assertEqual(rest_pace_seconds(RestComponent.ORDER), 1.0)
+
+    def test_lane_pacer_gaps_second_call(self) -> None:
+        reset_rest_lane_pacer()
+        sleeps: list[float] = []
+        with patch("rest_rate_guard.time.sleep", side_effect=lambda s: sleeps.append(s)):
+            wait_rest_lane(RestComponent.HOT)
+            wait_rest_lane(RestComponent.HOT)
+            wait_rest_lane(RestComponent.NORMAL)
+        self.assertEqual(len(sleeps), 1)
+        self.assertGreaterEqual(sleeps[0], 2.9)
+        reset_rest_lane_pacer()
 
     def test_warmup_weight_guard_pauses_when_over_500(self) -> None:
         from rest_rate_guard import maybe_pause_warmup_rest

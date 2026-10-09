@@ -13,7 +13,12 @@ import pandas as pd
 from config import Config
 from exceptions import ExchangeRateLimitError
 from logger import error_logger, system_logger
-from rest_rate_guard import kline_rest_delay_seconds, maybe_pause_warmup_rest
+from rest_rate_guard import (
+    RestComponent,
+    kline_rest_delay_seconds,
+    maybe_pause_warmup_rest,
+    wait_rest_lane,
+)
 
 
 class KlineBootstrapAborted(Exception):
@@ -429,18 +434,17 @@ def run_batched_kline_bootstrap(
         batch_pause = max(float(Config.KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS), 0.0)
     else:
         batch_pause = max(float(batch_cooldown_seconds), 0.0)
+    use_hot_pacer = (not warmup_mode) and request_delay_seconds is None
     if warmup_mode:
         delay = (
             Config.warmup_kline_delay_seconds()
             if request_delay_seconds is None
             else min(max(float(request_delay_seconds), 0.5), 1.0)
         )
+    elif use_hot_pacer:
+        delay = 0.0
     else:
-        delay = (
-            kline_rest_delay_seconds(0)
-            if request_delay_seconds is None
-            else max(float(request_delay_seconds), 1.0)
-        )
+        delay = max(float(request_delay_seconds or 0.0), 1.0)
     done_bars = max(
         int(complete_min_bars or min_bars),
         min_bars,
@@ -480,7 +484,7 @@ def run_batched_kline_bootstrap(
         len(symbol_order),
         sum(len(v) for v in by_symbol.values()),
         batch_size,
-        delay,
+        Config.rest_pace_hot_seconds() if use_hot_pacer else delay,
         batch_pause,
         warmup_mode,
     )
@@ -516,6 +520,8 @@ def run_batched_kline_bootstrap(
                         aborted = True
                         break
                 try:
+                    if use_hot_pacer:
+                        wait_rest_lane(RestComponent.HOT)
                     df = rest_fetcher(sym, interval, limit)
                 except ExchangeRateLimitError as exc:
                     system_logger.warning(

@@ -20,9 +20,11 @@ from binance.exceptions import BinanceAPIException, BinanceOrderException
 
 from rest_rate_guard import (
     RestBlockLogSuppressor,
+    RestComponent,
     RestUsageTracker,
     build_default_token_bucket,
     kline_rest_delay_seconds,
+    wait_rest_lane,
     weight_for_call,
 )
 from config import Config
@@ -667,6 +669,14 @@ class BinanceExchangeManager:
             return RestLane.BOOTSTRAP
         return RestLane.BACKGROUND
 
+    @staticmethod
+    def _lane_component(lane: RestLane) -> RestComponent:
+        if lane == RestLane.EXECUTION:
+            return RestComponent.ORDER
+        if lane == RestLane.BOOTSTRAP:
+            return RestComponent.HOT
+        return RestComponent.NORMAL
+
     def background_account_rest_allowed(self) -> bool:
         """True when a non-execution account/status REST read may proceed."""
         if self.is_rest_blocked()[0]:
@@ -1118,16 +1128,9 @@ class BinanceExchangeManager:
         return self._rest_budget.has_budget_for(5, RestLane.BOOTSTRAP)
 
     def _enforce_kline_rest_pace(self) -> None:
-        """Gap between consecutive futures_klines REST calls (warmup 0.5–1.0s)."""
-        if self._in_scan_warmup():
-            min_gap = Config.warmup_kline_delay_seconds()
-        else:
-            min_gap = kline_rest_delay_seconds(self._rest_usage.projected_used_weight())
-        with self._kline_rest_lock:
-            elapsed = time.monotonic() - self._last_kline_rest_at
-            if elapsed < min_gap:
-                time.sleep(min_gap - elapsed)
-            self._last_kline_rest_at = time.monotonic()
+        """Hot-lane 3s gap between futures_klines REST calls (shared pacer)."""
+        wait_rest_lane(RestComponent.HOT)
+        self._last_kline_rest_at = time.monotonic()
 
     def _in_scan_warmup(self) -> bool:
         hub = self._market_data
@@ -1392,9 +1395,10 @@ class BinanceExchangeManager:
         network_retries = 1 if is_order_submit else max(Config.REST_NETWORK_MAX_RETRIES, 1)
         for attempt in range(1, network_retries + 1):
             if Config.ENABLE_STRICT_RATE_LIMIT:
+                wait_rest_lane(self._lane_component(lane))
                 limiter.wait()
             if is_bootstrap_kline:
-                self._enforce_kline_rest_pace()
+                self._last_kline_rest_at = time.monotonic()
             try:
                 result = func(*args, **kwargs)
                 if getattr(func, "__name__", "") == "futures_account":

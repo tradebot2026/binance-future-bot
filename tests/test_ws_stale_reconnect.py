@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import time
 import unittest
+from collections import deque
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -458,6 +459,36 @@ class TestWsStaleReconnect(unittest.TestCase):
             self.assertFalse(hub._book_stream_is_stale())
             self.assertFalse(hub._should_reconnect_for_stale_ticker())
             self.assertLess(hub.ticker_cache_age_seconds(), 2.0)
+
+    def test_protocol_ping_stamps_kline_sockets(self) -> None:
+        hub = _hub_with_running_ws()
+        old = time.monotonic() - 200.0
+        kline_sock = SimpleNamespace(last_event_at=old, streams={"ethusdt@kline_15m"})
+        hub._kline_sockets = [kline_sock]
+        hub._last_protocol_ping_at = 0.0
+        loop = MagicMock()
+        loop.is_running.return_value = True
+        hub._ws_loop = loop
+        ping = MagicMock()
+        sock = SimpleNamespace(ws=SimpleNamespace(ping=ping))
+        hub._ws_manager = SimpleNamespace(
+            _bsm=SimpleNamespace(_conns={"kline": sock})
+        )
+        with patch("market_data_hub.asyncio.run_coroutine_threadsafe"):
+            hub._maybe_protocol_ping()
+        self.assertGreater(kline_sock.last_event_at, old)
+
+    def test_reconnect_catchup_keeps_buffers_without_rest(self) -> None:
+        hub = _hub_with_running_ws()
+        hub._backtest_bars = {("ETHUSDT", "15m"): deque([{"open_ms": 1}], maxlen=500)}
+        hub._kline_bars = {("ETHUSDT", "15m"): deque([{"open_ms": 1}], maxlen=320)}
+        hub._subscribed_kline_streams = {"ethusdt@kline_15m"}
+        hub._ticker_rest_fetcher = MagicMock(
+            side_effect=AssertionError("REST catch-up must not run")
+        )
+        hub._catchup_kline_buffers_after_reconnect()
+        self.assertEqual(len(hub._backtest_bars[("ETHUSDT", "15m")]), 1)
+        hub._ticker_rest_fetcher.assert_not_called()
 
     def test_expired_ban_timestamp_clears_halt_and_hard_resubscribes(self) -> None:
         hub = _hub_with_running_ws()

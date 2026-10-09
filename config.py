@@ -160,6 +160,9 @@ class Config:
     REST_BUDGET_ORDER_WEIGHT: int = _env_int("REST_BUDGET_ORDER_WEIGHT", 400)
     REST_BUDGET_HOT_WEIGHT: int = _env_int("REST_BUDGET_HOT_WEIGHT", 600)
     REST_BUDGET_NORMAL_WEIGHT: int = _env_int("REST_BUDGET_NORMAL_WEIGHT", 400)
+    REST_PACE_ORDER_SECONDS: float = _env_float("REST_PACE_ORDER_SECONDS", 1.0)
+    REST_PACE_HOT_SECONDS: float = _env_float("REST_PACE_HOT_SECONDS", 3.0)
+    REST_PACE_NORMAL_SECONDS: float = _env_float("REST_PACE_NORMAL_SECONDS", 2.0)
     REST_OPERATIONAL_WEIGHT_CAP: int = _env_int("REST_OPERATIONAL_WEIGHT_CAP", 1500)
     REST_USED_WEIGHT_THROTTLE_THRESHOLD: int = _env_int(
         "REST_USED_WEIGHT_THROTTLE_THRESHOLD", 1200
@@ -267,17 +270,17 @@ class Config:
         "WS_KLINE_BOOTSTRAP_OVERALL_TIMEOUT_SECONDS", 90.0
     )
     WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS: float = _env_float(
-        "WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS", 1.0
+        "WS_KLINE_BOOTSTRAP_REST_DELAY_SECONDS", 3.0
     )
     KLINE_REST_MIN_INTERVAL_SECONDS: float = _env_float(
-        "KLINE_REST_MIN_INTERVAL_SECONDS", 1.0
+        "KLINE_REST_MIN_INTERVAL_SECONDS", 3.0
     )
     KLINE_BOOTSTRAP_BATCH_SYMBOLS: int = _env_int("KLINE_BOOTSTRAP_BATCH_SYMBOLS", 1)
     KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS: float = _env_float(
         "KLINE_BOOTSTRAP_BATCH_COOLDOWN_SECONDS", 10.0
     )
     KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS: float = _env_float(
-        "KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS", 1.0
+        "KLINE_BOOTSTRAP_INTER_REQUEST_DELAY_SECONDS", 3.0
     )
     WARMUP_KLINE_FETCH_LIMIT: int = _env_int("WARMUP_KLINE_FETCH_LIMIT", 100)
     WARMUP_KLINE_DELAY_SECONDS: float = _env_float("WARMUP_KLINE_DELAY_SECONDS", 1.0)
@@ -865,6 +868,21 @@ class Config:
     @classmethod
     def rest_budget_normal_weight(cls) -> int:
         return min(max(int(getattr(cls, "REST_BUDGET_NORMAL_WEIGHT", 400)), 1), 400)
+
+    @classmethod
+    def rest_pace_order_seconds(cls) -> float:
+        """Super/order REST gap — ~60 calls/min, leaves headroom for reconcile."""
+        return min(max(float(getattr(cls, "REST_PACE_ORDER_SECONDS", 1.0)), 0.5), 2.0)
+
+    @classmethod
+    def rest_pace_hot_seconds(cls) -> float:
+        """Hot/kline REST gap — ~20 calls/min so 15m history can fill safely."""
+        return min(max(float(getattr(cls, "REST_PACE_HOT_SECONDS", 3.0)), 2.0), 5.0)
+
+    @classmethod
+    def rest_pace_normal_seconds(cls) -> float:
+        """Normal-tier REST gap — ~30 calls/min."""
+        return min(max(float(getattr(cls, "REST_PACE_NORMAL_SECONDS", 2.0)), 1.0), 5.0)
 
     @classmethod
     def testnet_strategy_relax(cls) -> bool:

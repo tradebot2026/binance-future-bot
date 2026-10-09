@@ -683,10 +683,34 @@ class TestTierFunnel(unittest.TestCase):
             text = funnel.maybe_flush_digest(now=70.0)
         self.assertIsNotNone(text)
         self.assertIn("Hourly Funnel Digest", text)
-        self.assertIn("Hot: AAAUSDT", text)
-        self.assertIn("Pending Backtest", text)
+        self.assertIn("Promoted", text)
+        self.assertIn("AAAUSDT", text)
+        self.assertIn("Demoted", text)
+        self.assertIn("Hot Tier", text)
+        self.assertIn("Pending backtest", text)
         self.assertIn("AAAUSDT 3%", text)
         self.assertTrue(notified)
+
+    def test_hourly_digest_layout_categorizes_promote_and_demote(self) -> None:
+        from telegram_alerts import format_hourly_funnel_digest
+
+        text = format_hourly_funnel_digest(
+            promoted=[("ETHUSDT", "SMC_TREND", 72.0)],
+            demoted=[("CELRUSDT", "Pending Backtest exceeded 3 passes")],
+            hot_count=2,
+            super_count=1,
+            pending=[("ETHUSDT", 65)],
+        )
+        self.assertIn("✅", text)
+        self.assertIn("Promoted", text)
+        self.assertIn("ETHUSDT", text)
+        self.assertIn("72", text)
+        self.assertIn("Demoted", text)
+        self.assertIn("CELRUSDT", text)
+        self.assertIn("Pending Backtest exceeded 3 passes", text)
+        self.assertIn("Hot Tier", text)
+        self.assertIn("Active: 2", text)
+        self.assertIn("ETHUSDT 65%", text)
 
     def test_super_promotion_still_instant(self) -> None:
         notified: list[str] = []
