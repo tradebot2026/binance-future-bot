@@ -21,6 +21,97 @@ class KlineBootstrapAborted(Exception):
 
 
 _OHLCV_COLS = ("timestamp", "open", "high", "low", "close", "volume")
+FUTURES_KLINE_MAX_LIMIT = 1500
+
+
+def timestamp_to_open_ms(ts: object) -> int:
+    """UTC open time in ms. Naive pandas timestamps from unit='ms' are epoch-UTC."""
+    stamp = pd.Timestamp(ts)
+    if pd.isna(stamp):
+        return 0
+    return int(stamp.value // 1_000_000)
+
+
+def futures_klines_to_ohlcv(klines: object) -> pd.DataFrame:
+    """Convert a Binance futures_klines payload to the shared OHLCV frame."""
+    if not klines:
+        return pd.DataFrame()
+    frame = pd.DataFrame(klines)
+    if frame.empty:
+        return pd.DataFrame()
+    if frame.shape[1] >= 6:
+        frame = frame.iloc[:, :6]
+        frame.columns = list(_OHLCV_COLS)
+    else:
+        return pd.DataFrame()
+    frame["timestamp"] = pd.to_datetime(frame["timestamp"], unit="ms", utc=True).dt.tz_localize(None)
+    for col in ("open", "high", "low", "close", "volume"):
+        frame[col] = pd.to_numeric(frame[col], errors="coerce")
+    return frame[list(_OHLCV_COLS)]
+
+
+def merge_ohlcv_frames(*frames: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Union OHLCV rows by timestamp so WS cache + older REST pages stack."""
+    parts = [
+        frame[list(_OHLCV_COLS)].copy()
+        for frame in frames
+        if frame is not None
+        and not getattr(frame, "empty", True)
+        and all(col in frame.columns for col in _OHLCV_COLS)
+    ]
+    if not parts:
+        return pd.DataFrame()
+    out = pd.concat(parts, ignore_index=True)
+    out["timestamp"] = pd.to_datetime(out["timestamp"], utc=True, errors="coerce").dt.tz_localize(None)
+    out = out.dropna(subset=["timestamp"])
+    out = out.drop_duplicates(subset=["timestamp"], keep="last")
+    return out.sort_values("timestamp").reset_index(drop=True)
+
+
+def kline_cache_covers(cached: Optional[pd.DataFrame], limit: int) -> bool:
+    """True when memory already has the depth this caller asked for.
+
+    Scan fetches (limit < backtest floor) may reuse WS_KLINE_BOOTSTRAP_MIN_BARS.
+    Backtest fetches must not treat a 250–320 bar scan window as 500-bar history.
+    """
+    if cached is None or getattr(cached, "empty", True):
+        return False
+    have = len(cached)
+    want = max(int(limit), 1)
+    backtest_floor = int(getattr(Config, "BACKTEST_MIN_BARS", 450))
+    try:
+        backtest_limit = int(Config.backtest_candle_limit())
+        backtest_floor = max(min(backtest_floor, backtest_limit), 200)
+    except Exception:
+        backtest_floor = max(backtest_floor, 200)
+    if want >= backtest_floor:
+        return have >= want
+    scan_min = max(int(getattr(Config, "WS_KLINE_BOOTSTRAP_MIN_BARS", 250)), 10)
+    return have >= min(want, scan_min)
+
+
+def next_kline_page(
+    have: Optional[pd.DataFrame], want: int
+) -> tuple[int, Optional[int]]:
+    """Return (limit, endTime_ms) for the next futures_klines page.
+
+    endTime None means most-recent bars (no startTime — never skip the live edge).
+    When the WS cache already holds recent bars, page backward from the oldest open.
+    """
+    want_n = min(max(int(want), 1), FUTURES_KLINE_MAX_LIMIT)
+    if have is None or getattr(have, "empty", True):
+        return want_n, None
+    have_n = len(have)
+    if have_n >= want_n:
+        return 0, None
+    missing = want_n - have_n
+    oldest = pd.to_datetime(have["timestamp"], utc=True, errors="coerce").min()
+    if pd.isna(oldest):
+        return min(max(missing, 1), FUTURES_KLINE_MAX_LIMIT), None
+    end_ms = timestamp_to_open_ms(oldest) - 1
+    if end_ms <= 0:
+        return min(max(missing, 1), FUTURES_KLINE_MAX_LIMIT), None
+    return min(max(missing, 1), FUTURES_KLINE_MAX_LIMIT), end_ms
 
 
 def backtest_history_buffer_limit() -> int:
@@ -44,7 +135,7 @@ def _normalize_closed_bar(row: dict) -> Optional[dict]:
     open_ms = int(row.get("open_ms") or 0)
     ts = row.get("timestamp")
     if open_ms <= 0 and ts is not None:
-        open_ms = int(pd.Timestamp(ts).timestamp() * 1000)
+        open_ms = timestamp_to_open_ms(ts)
     if open_ms <= 0:
         return None
     return {

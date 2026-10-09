@@ -9,7 +9,13 @@ from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from config import Config
-from core.candle_backtest import backtest_min_bars, run_15m_backtest
+from core.candle_backtest import (
+    closed_history_bars,
+    kline_load_percent,
+    run_15m_backtest,
+    ws_cache_ready_for_backtest,
+)
+from kline_bootstrap import kline_cache_covers
 from logger import error_logger, scanner_logger, trade_logger
 from utils import safe_float
 
@@ -25,6 +31,7 @@ class _BacktestDecision:
     status: str
     payload: Optional[dict[str, Any]] = None
     reason: str = ""
+    history_bars: int = 0
 
 
 class AsyncBacktestValidator:
@@ -167,8 +174,9 @@ class AsyncBacktestValidator:
                 decision = self._decide(item.payload)
                 if decision.status == "deferred":
                     trade_logger.info(
-                        "[BACKTEST_PENDING] %s — %s",
+                        "[BACKTEST_PENDING] %s [Pending Backtest %s%%] — %s",
                         symbol,
+                        kline_load_percent(int(decision.history_bars or 0)),
                         decision.reason,
                     )
                     funnel = self._on_funnel
@@ -176,7 +184,11 @@ class AsyncBacktestValidator:
                         try:
                             note = getattr(funnel, "note_hot_backtest_pending", None)
                             if callable(note):
-                                note(symbol, decision.reason)
+                                note(
+                                    symbol,
+                                    decision.reason,
+                                    history_bars=int(decision.history_bars or 0),
+                                )
                             else:
                                 funnel.release_hot_rest(symbol)
                         except Exception:
@@ -222,7 +234,11 @@ class AsyncBacktestValidator:
         df = self._fetch_15m_history(symbol)
         result = run_15m_backtest(df)
         if result.deferred is True:
-            return _BacktestDecision(status="deferred", reason=result.reason)
+            return _BacktestDecision(
+                status="deferred",
+                reason=result.reason,
+                history_bars=closed_history_bars(df),
+            )
         if not result.passed:
             if result.reason == "Fewer than 3 closed trades":
                 trade_logger.warning(
@@ -294,11 +310,9 @@ class AsyncBacktestValidator:
     def _fetch_15m_history(self, symbol: str) -> Optional[Any]:
         timeframe = str(Config.BACKTEST_TIMEFRAME or "15m")
         fetch_limit = Config.backtest_candle_limit()
-        min_bars = backtest_min_bars()
         hub = getattr(self.exchange, "_market_data", None)
         cached = self._cached_15m_history(symbol, timeframe, fetch_limit, hub)
-        have = 0 if cached is None or getattr(cached, "empty", True) else len(cached)
-        if have >= min_bars:
+        if kline_cache_covers(cached, fetch_limit) or ws_cache_ready_for_backtest(cached):
             return cached
 
         skip_rest = False

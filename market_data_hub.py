@@ -25,9 +25,11 @@ from config import Config
 from kline_bootstrap import (
     backtest_history_buffer_limit,
     bars_to_ohlcv_dataframe,
+    kline_cache_covers,
     merge_closed_kline_bar,
     merge_closed_kline_bars,
     run_batched_kline_bootstrap,
+    timestamp_to_open_ms,
 )
 from logger import error_logger, system_logger
 from rest_rate_guard import kline_rest_delay_seconds, maybe_pause_warmup_rest
@@ -2655,7 +2657,7 @@ class MarketDataHub:
             built: list[dict[str, Any]] = []
             for _, row in df.iterrows():
                 ts = row["timestamp"]
-                open_ms = int(pd.Timestamp(ts).timestamp() * 1000)
+                open_ms = timestamp_to_open_ms(ts)
                 built.append(
                     {
                         "timestamp": ts,
@@ -2953,9 +2955,17 @@ class MarketDataHub:
     def note_backtest_rest_result(
         self, symbol: str, interval: str, got: int, want: int
     ) -> None:
-        """Remember when REST already returned every available 15m bar."""
-        if int(got) < int(want):
-            self._rest_history_exhausted.add((symbol.upper(), interval))
+        """Remember when a full-depth REST fetch proved the venue is thin."""
+        key = (symbol.upper(), interval)
+        want_n = max(int(want), 1)
+        got_n = int(got)
+        if got_n >= want_n:
+            self._rest_history_exhausted.discard(key)
+            return
+        backtest_floor = int(getattr(Config, "BACKTEST_MIN_BARS", 450))
+        scan_cap = int(Config.scan_kline_fetch_limit())
+        if want_n >= backtest_floor and got_n < backtest_floor and got_n < scan_cap:
+            self._rest_history_exhausted.add(key)
 
     def should_skip_backtest_rest(self, symbol: str, interval: str) -> bool:
         """True after REST proved the venue has fewer bars than the backtest floor."""
@@ -2974,13 +2984,8 @@ class MarketDataHub:
     ) -> pd.DataFrame:
         """Return cached candles; REST only when the WS kline buffer is too thin."""
         cached = self.get_candles_cached_only(symbol, timeframe, limit)
-        min_bars = max(int(getattr(Config, "WS_KLINE_BOOTSTRAP_MIN_BARS", 250)), 10)
-        if not cached.empty:
-            if int(limit) < min_bars:
-                if len(cached) >= min_bars:
-                    return cached
-            elif len(cached) >= min(int(limit), min_bars):
-                return cached
+        if kline_cache_covers(cached, limit):
+            return cached
         bar_open_ms = self._current_bar_open_ms(timeframe)
         key = (symbol.upper(), timeframe, int(limit))
 

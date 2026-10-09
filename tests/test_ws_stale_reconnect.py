@@ -304,6 +304,42 @@ class TestWsStaleReconnect(unittest.TestCase):
         self.assertGreaterEqual(len(df), 250)
         rest_fetcher.assert_not_called()
 
+    def test_scan_depth_does_not_skip_backtest_rest(self) -> None:
+        hub = _hub_with_running_ws()
+        rows = []
+        for i in range(280):
+            rows.append(
+                {
+                    "timestamp": pd.Timestamp("2026-01-01")
+                    + pd.Timedelta(minutes=15 * i),
+                    "open": 100.0,
+                    "high": 101.0,
+                    "low": 99.0,
+                    "close": 100.2,
+                    "volume": 1_000.0,
+                }
+            )
+        hub.seed_klines_from_dataframe("ETHUSDT", "15m", pd.DataFrame(rows))
+        filled = rows + [
+            {
+                "timestamp": pd.Timestamp("2026-01-01")
+                + pd.Timedelta(minutes=15 * (280 + i)),
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.2,
+                "volume": 1_000.0,
+            }
+            for i in range(220)
+        ]
+        rest_fetcher = MagicMock(return_value=pd.DataFrame(filled))
+        with patch.object(Config, "SCAN_WS_ONLY", False), patch.object(
+            Config, "ENABLE_WEBSOCKET_STREAMS", False
+        ):
+            df = hub.get_candles("ETHUSDT", "15m", 500, rest_fetcher, allow_rest=True)
+        rest_fetcher.assert_called_once()
+        self.assertGreaterEqual(len(df), 450)
+
     def test_cache_miss_does_not_rest_during_reconnect(self) -> None:
         hub = _hub_with_running_ws()
         hub._reconnect_in_progress = True

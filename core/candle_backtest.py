@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 import ta
 
 from config import Config
 from core.candle_prep import drop_forming_bar
+from kline_bootstrap import kline_cache_covers
 from utils import safe_float
 
 
@@ -136,6 +137,42 @@ def backtest_min_bars() -> int:
     return max(min(floor, limit), 200)
 
 
+def closed_history_bars(df: Optional[pd.DataFrame]) -> int:
+    """Closed 15m bars in a local frame — never fetches REST."""
+    closed = drop_forming_bar(df)
+    if closed is None or getattr(closed, "empty", True):
+        return 0
+    return int(len(closed))
+
+
+def kline_load_percent(have: int, need: Optional[int] = None) -> int:
+    """Integer 0–100 completion vs the walk-forward bar floor (default 450)."""
+    want = int(need) if need is not None else backtest_min_bars()
+    if want <= 0:
+        return 0
+    return min(100, int(round(max(int(have), 0) * 100 / want)))
+
+
+def memory_closed_backtest_bars(hub: Any, symbol: str) -> int:
+    """Read closed 15m history from the in-memory WS/backtest buffer only."""
+    if hub is None:
+        return 0
+    getter = getattr(hub, "get_backtest_candles", None)
+    if not callable(getter):
+        getter = getattr(hub, "get_candles_cached_only", None)
+    if not callable(getter):
+        return 0
+    try:
+        df = getter(
+            str(symbol).upper(),
+            str(Config.BACKTEST_TIMEFRAME or "15m"),
+            int(Config.backtest_candle_limit()),
+        )
+    except Exception:
+        return 0
+    return closed_history_bars(df)
+
+
 def backtest_history_ready(
     df: Optional[pd.DataFrame], min_bars: Optional[int] = None
 ) -> bool:
@@ -144,6 +181,14 @@ def backtest_history_ready(
     closed = drop_forming_bar(df)
     have = 0 if closed is None or closed.empty else len(closed)
     return have >= need
+
+
+def ws_cache_ready_for_backtest(df: Optional[pd.DataFrame]) -> bool:
+    """True when the live WS/memory buffer already satisfies a 15m backtest fetch."""
+    want = Config.backtest_candle_limit()
+    if not kline_cache_covers(df, want):
+        return False
+    return backtest_history_ready(df)
 
 
 def append_closed_ohlcv(

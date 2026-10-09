@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import math
+import re
 import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional
 
 from config import Config
+from core.candle_backtest import kline_load_percent
 from core.pace_clock import MinuteWindow
 from core.strategy_score_ranges import score_range_for
 from core.types import StrategyScore
@@ -16,6 +18,9 @@ from logger import scanner_logger
 
 
 NotifyFn = Callable[[str], None]
+HistoryBarsFn = Callable[[str], int]
+
+_HAVE_BARS_RE = re.compile(r"have\s+(\d+)", re.IGNORECASE)
 
 
 def is_history_demote_reason(reason: str) -> bool:
@@ -37,6 +42,10 @@ class HotRecord:
     backtest_pending: bool = False
     pending_reason: str = ""
     pending_passes: int = 0
+    pending_pass_limit: int = 0
+    history_bars: int = 0
+    history_pct: int = 0
+    last_history_pct: int = 0
     rest_cooldown_until: float = 0.0
     backup_index: int = 0
     metadata: dict[str, Any] = field(default_factory=dict)
@@ -91,6 +100,7 @@ class TierFunnel:
         self._hot_clock = MinuteWindow(Config.HOT_TIER_COINS_PER_MINUTE)
         self._super_clock = MinuteWindow(Config.SUPER_TIER_COINS_PER_MINUTE)
         self._pending_hot_rest: set[str] = set()
+        self._history_bars_fn: Optional[HistoryBarsFn] = None
         self._demote_cooldown_until: dict[str, float] = {}
         self._digest_lines: list[str] = []
         self._digest_started: float = 0.0
@@ -411,6 +421,7 @@ class TierFunnel:
             "flush_count": self._flush_count,
             "lock_cycle": self._lock_cycle,
             "hot_backtest_pending": self.pending_backtest_symbols(),
+            "hot_backtest_progress": self.pending_backtest_progress(),
         }
 
     def take_hot_for_rest(self, now: float | None = None) -> Optional[HotRecord]:
@@ -528,6 +539,47 @@ class TierFunnel:
         )
         return rec
 
+    def attach_kline_progress_fn(self, fn: Optional[HistoryBarsFn]) -> None:
+        """Optional memory-only bar counter (WS/backtest buffer — no REST)."""
+        self._history_bars_fn = fn
+
+    def _memory_history_bars(self, symbol: str) -> int:
+        fn = self._history_bars_fn
+        if not callable(fn):
+            return 0
+        try:
+            return max(int(fn(str(symbol).upper()) or 0), 0)
+        except Exception:
+            return 0
+
+    def _resolve_history_bars(
+        self, symbol: str, reason: str = "", history_bars: int | None = None
+    ) -> int:
+        bars = 0
+        if history_bars is not None:
+            bars = max(int(history_bars), 0)
+        match = _HAVE_BARS_RE.search(str(reason or ""))
+        if match:
+            bars = max(bars, int(match.group(1)))
+        bars = max(bars, self._memory_history_bars(symbol))
+        rec = self._hot.get(str(symbol).upper())
+        if rec is not None:
+            bars = max(bars, int(rec.history_bars or 0))
+        return bars
+
+    def pending_backtest_progress(self) -> dict[str, int]:
+        """Live 0–100 load % for Hot coins still waiting on 15m history."""
+        out: dict[str, int] = {}
+        for rec in (self._hot[s] for s in self._hot_order if s in self._hot):
+            if not rec.backtest_pending or rec.backtest_passed:
+                continue
+            bars = self._resolve_history_bars(rec.symbol)
+            if bars > rec.history_bars:
+                rec.history_bars = bars
+                rec.history_pct = kline_load_percent(bars)
+            out[rec.symbol] = int(rec.history_pct)
+        return out
+
     def note_hot_rest_started(self, symbol: str) -> None:
         self._pending_hot_rest.add(str(symbol).upper())
 
@@ -541,8 +593,9 @@ class TierFunnel:
         reason: str = "",
         *,
         now: float | None = None,
+        history_bars: int | None = None,
     ) -> None:
-        """Park a thin-history Hot coin on cooldown and rotate; demote after max passes."""
+        """Park a thin-history Hot coin on cooldown and rotate; demote if progress is stuck."""
         key = str(symbol).upper()
         self._pending_hot_rest.discard(key)
         rec = self._hot.get(key)
@@ -553,24 +606,54 @@ class TierFunnel:
         rec.pending_reason = str(reason or "Need 200+ closed 15m bars")
         rec.pending_passes += 1
         rec.rest_cooldown_until = stamp + Config.hot_pending_cooldown_seconds()
-        max_passes = Config.hot_pending_max_passes()
+        bars = self._resolve_history_bars(key, rec.pending_reason, history_bars)
+        prev_pct = int(rec.history_pct)
+        rec.last_history_pct = prev_pct
+        rec.history_bars = bars
+        rec.history_pct = kline_load_percent(bars)
+        base_max = Config.hot_pending_max_passes()
+        effective_max = rec.pending_pass_limit or base_max
         scanner_logger.info(
-            "[TIER_HOT] %s [Pending Backtest] — %s | pass=%s/%s cooldown=%.0fs",
+            "[TIER_HOT] %s [Pending Backtest %s%%] — %s | pass=%s/%s cooldown=%.0fs",
             key,
+            rec.history_pct,
             rec.pending_reason,
             rec.pending_passes,
-            max_passes,
+            effective_max,
             Config.hot_pending_cooldown_seconds(),
         )
-        if rec.pending_passes >= max_passes:
-            self._demote_hot(
+        if rec.pending_passes < effective_max:
+            return
+        if rec.history_pct >= 100:
+            rec.pending_pass_limit = rec.pending_passes + 1
+            scanner_logger.info(
+                "[TIER_HOT] %s extra pass — history 100%%, waiting on strategy validation",
                 key,
-                reason=(
-                    f"Pending Backtest exceeded {rec.pending_passes} passes "
-                    "— insufficient 15m history"
-                ),
-                now=stamp,
             )
+            return
+        if rec.history_pct > prev_pct:
+            rec.pending_pass_limit = rec.pending_passes + 1
+            scanner_logger.info(
+                "[TIER_HOT] %s extra pass granted — progress %s%% → %s%%",
+                key,
+                prev_pct,
+                rec.history_pct,
+            )
+            return
+        scanner_logger.info(
+            "[TIER_HOT] %s progress stuck at %s%% — demote after %s passes",
+            key,
+            rec.history_pct,
+            rec.pending_passes,
+        )
+        self._demote_hot(
+            key,
+            reason=(
+                f"Pending Backtest exceeded {rec.pending_passes} passes "
+                "— insufficient 15m history"
+            ),
+            now=stamp,
+        )
 
     def pending_backtest_symbols(self) -> list[str]:
         return [
@@ -607,6 +690,10 @@ class TierFunnel:
         rec.backtest_pending = False
         rec.pending_reason = ""
         rec.pending_passes = 0
+        rec.pending_pass_limit = 0
+        rec.history_bars = 0
+        rec.history_pct = 0
+        rec.last_history_pct = 0
         rec.rest_cooldown_until = 0.0
         if payload:
             rec.metadata.update(payload)
@@ -854,7 +941,12 @@ class TierFunnel:
         else:
             lines.append("<i>No Hot promotions or demotions this hour.</i>")
         if pending_bt:
-            lines.append("⏳ Pending Backtest: " + ", ".join(pending_bt[:20]))
+            progress = self.pending_backtest_progress()
+            labels = [
+                f"{sym} {int(progress.get(sym, 0))}%"
+                for sym in pending_bt[:20]
+            ]
+            lines.append("⏳ Pending Backtest: " + ", ".join(labels))
         self._digest_lines = []
         self._digest_started = stamp
         text = "\n".join(lines)

@@ -937,6 +937,7 @@ class TelegramManager:
                 normal_scores=dict(tiers.get("normal_scores") or {}),
                 kline_pending=list(tiers.get("kline_pending") or []),
                 hot_backtest_pending=list(tiers.get("hot_backtest_pending") or []),
+                hot_backtest_progress=dict(tiers.get("hot_backtest_progress") or {}),
             )
             if len(text) > 4000:
                 text = text[:3990] + "\n…"

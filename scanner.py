@@ -7,6 +7,7 @@ lives in strategies/ + engines/.
 
 from __future__ import annotations
 
+import time
 from typing import Any, Dict, List, Optional
 
 from config import Config
@@ -81,6 +82,22 @@ class MarketScanner:
             )
         return result.symbols, result.price_map
 
+    def is_backtest_quarantined(
+        self, symbol: str, *, now: float | None = None
+    ) -> bool:
+        """True while a coin must not re-enter Hot REST backtests (30m demote / pending cool-off)."""
+        funnel = getattr(self.orchestrator, "funnel", None) if self.orchestrator else None
+        if funnel is None:
+            return False
+        stamp = time.monotonic() if now is None else now
+        check = getattr(funnel, "in_history_demote_cooldown", None)
+        if callable(check) and check(symbol, now=stamp):
+            return True
+        recs = getattr(funnel, "_hot", None) or {}
+        rec = recs.get(str(symbol).upper()) if isinstance(recs, dict) else None
+        until = float(getattr(rec, "rest_cooldown_until", 0.0) or 0.0)
+        return until > stamp
+
     def ensure_scan_klines_ready(self, symbols: Optional[list[str]] = None) -> int:
         """
         REST kline seed for at most 2 coins (Normal ingest pace). Remaining
@@ -97,14 +114,22 @@ class MarketScanner:
             return 0
         pace = Config.kline_bootstrap_coins_per_minute()
         batch = batch[:pace]
-        timeframes = Config.get_scan_kline_intervals()
-        self._hub.subscribe_kline_streams(batch)
+        timeframes = list(
+            dict.fromkeys(
+                list(Config.get_scan_kline_intervals())
+                + [str(Config.BACKTEST_TIMEFRAME or "15m")]
+            )
+        )
+        self._hub.subscribe_kline_streams(batch, intervals=timeframes)
+        rest_batch = [sym for sym in batch if not self.is_backtest_quarantined(sym)]
+        if not rest_batch:
+            return 0
         with self.exchange.bootstrap_context():
             return self._hub.bootstrap_klines_for_symbols(
-                batch,
+                rest_batch,
                 timeframes,
                 self.exchange.fetch_bootstrap_klines_df,
-                max_pairs=len(timeframes) * len(batch),
+                max_pairs=len(timeframes) * len(rest_batch),
             )
 
     def refresh_event_universe(self) -> list[str]:
@@ -240,6 +265,7 @@ class MarketScanner:
             "normal_scores": {},
             "kline_pending": [],
             "hot_backtest_pending": [],
+            "hot_backtest_progress": {},
             "flush_minutes": 180,
             "flush_count": 0,
         }
@@ -281,6 +307,7 @@ class MarketScanner:
             "normal_scores": scores,
             "kline_pending": [key for key in recently if key in pending],
             "hot_backtest_pending": list(snap.get("hot_backtest_pending") or []),
+            "hot_backtest_progress": dict(snap.get("hot_backtest_progress") or {}),
             "flush_minutes": int(snap.get("flush_minutes") or 0),
             "flush_count": flush_count,
         }

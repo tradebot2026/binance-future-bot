@@ -33,6 +33,12 @@ from exceptions import (
     OrderExecutionError,
     PositionAlreadyClosedError,
 )
+from kline_bootstrap import (
+    futures_klines_to_ohlcv,
+    kline_cache_covers,
+    merge_ohlcv_frames,
+    next_kline_page,
+)
 from logger import error_logger, system_logger, trade_logger
 from utils import amount_to_precision, round_step_size, safe_float
 
@@ -2610,61 +2616,95 @@ class BinanceExchangeManager:
                 "fetch_bootstrap_klines_df requires exchange.bootstrap_context()"
             )
         fetch_limit = limit or Config.CANDLE_FETCH_LIMIT
-        if self._in_scan_warmup():
+        backtest_floor = int(getattr(Config, "BACKTEST_MIN_BARS", 450))
+        # Warmup may shrink scan seeds, never a Hot 15m backtest fetch.
+        if self._in_scan_warmup() and int(fetch_limit) < backtest_floor:
             fetch_limit = min(int(fetch_limit), Config.warmup_kline_fetch_limit())
         return self._fetch_bootstrap_klines_direct(symbol, timeframe, fetch_limit)
+
+    def _cached_bootstrap_klines(
+        self, symbol: str, timeframe: str, limit: int
+    ) -> pd.DataFrame:
+        hub = self._market_data
+        if hub is None:
+            return pd.DataFrame()
+        backtest_floor = int(getattr(Config, "BACKTEST_MIN_BARS", 450))
+        getter = getattr(hub, "get_backtest_candles", None)
+        if int(limit) >= backtest_floor and callable(getter):
+            try:
+                cached = getter(symbol, timeframe, limit)
+                if cached is not None and not getattr(cached, "empty", True):
+                    return cached
+            except Exception:
+                pass
+        try:
+            return hub.get_candles_cached_only(symbol, timeframe, limit)
+        except Exception:
+            return pd.DataFrame()
+
+    def _futures_klines_ohlcv(
+        self,
+        symbol: str,
+        timeframe: str,
+        limit: int,
+        end_time_ms: int | None = None,
+    ) -> pd.DataFrame:
+        kwargs: dict[str, Any] = {
+            "symbol": symbol,
+            "interval": timeframe,
+            "limit": int(limit),
+        }
+        if end_time_ms is not None:
+            kwargs["endTime"] = int(end_time_ms)
+        klines = self._throttled_call(self.client.futures_klines, **kwargs)
+        return futures_klines_to_ohlcv(klines)
 
     def _fetch_bootstrap_klines_direct(
         self, symbol: str, timeframe: str, limit: int
     ) -> pd.DataFrame:
         """
         Rate-limited REST kline fetch for startup bootstrap only.
+        Uses WS/memory first; paginates older bars when the scan cache is too short.
         Returns empty DataFrame on ban/budget — never raises uncaught exceptions.
         """
         if not self._is_bootstrap_priority():
             raise ExchangeError(
                 "Bootstrap kline fetch requires exchange.bootstrap_context()"
             )
-        if not self.can_bootstrap_klines_rest():
-            return pd.DataFrame()
-
-        if self._in_scan_warmup():
+        backtest_floor = int(getattr(Config, "BACKTEST_MIN_BARS", 450))
+        if self._in_scan_warmup() and int(limit) < backtest_floor:
             limit = min(int(limit), Config.warmup_kline_fetch_limit())
 
-        if self._market_data:
-            cached = self._market_data.get_candles_cached_only(symbol, timeframe, limit)
-            min_bars = max(int(Config.WS_KLINE_BOOTSTRAP_MIN_BARS), 10)
-            if self._in_scan_warmup():
-                min_bars = min(min_bars, Config.warmup_kline_fetch_limit())
-            if cached is not None and not cached.empty:
-                if limit < min_bars:
-                    if len(cached) >= min_bars:
-                        return cached
-                elif len(cached) >= min(limit, min_bars):
-                    return cached
+        cached = self._cached_bootstrap_klines(symbol, timeframe, limit)
+        if kline_cache_covers(cached, limit):
+            return cached
+
+        if not self.can_bootstrap_klines_rest():
+            return cached if cached is not None else pd.DataFrame()
+
+        page_limit, end_ms = next_kline_page(cached, limit)
+        if page_limit <= 0:
+            return cached if cached is not None else pd.DataFrame()
 
         try:
-            klines = self._throttled_call(
-                self.client.futures_klines,
-                symbol=symbol,
-                interval=timeframe,
-                limit=limit,
+            page = self._futures_klines_ohlcv(
+                symbol, timeframe, page_limit, end_ms
             )
         except ExchangeRateLimitError as exc:
             self.halt_kline_bootstrap(str(exc))
-            return pd.DataFrame()
+            return cached if cached is not None else pd.DataFrame()
         except BinanceAPIException as exc:
             if self._is_rate_limit_error(exc):
                 self._apply_rate_limit_halt(exc)
                 self.halt_kline_bootstrap(str(exc.message))
-                return pd.DataFrame()
+                return cached if cached is not None else pd.DataFrame()
             error_logger.warning(
                 "Bootstrap kline fetch failed for %s %s: %s",
                 symbol,
                 timeframe,
                 exc.message,
             )
-            return pd.DataFrame()
+            return cached if cached is not None else pd.DataFrame()
         except ExchangeError as exc:
             error_logger.warning(
                 "Bootstrap kline fetch failed for %s %s: %s",
@@ -2672,7 +2712,7 @@ class BinanceExchangeManager:
                 timeframe,
                 exc,
             )
-            return pd.DataFrame()
+            return cached if cached is not None else pd.DataFrame()
         except (ConnectionError, TimeoutError, OSError) as exc:
             error_logger.warning(
                 "Bootstrap kline network error for %s %s: %s",
@@ -2680,32 +2720,26 @@ class BinanceExchangeManager:
                 timeframe,
                 exc,
             )
-            return pd.DataFrame()
+            return cached if cached is not None else pd.DataFrame()
 
-        if not klines:
-            return pd.DataFrame()
-
-        df = pd.DataFrame(
-            klines,
-            columns=[
-                "timestamp",
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "close_time",
-                "quote_asset_volume",
-                "number_of_trades",
-                "taker_buy_base_asset_volume",
-                "taker_buy_quote_asset_volume",
-                "ignore",
-            ],
-        )
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-        for col in ("open", "high", "low", "close", "volume"):
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-        return df[["timestamp", "open", "high", "low", "close", "volume"]]
+        merged = merge_ohlcv_frames(cached, page)
+        if kline_cache_covers(merged, limit):
+            return merged
+        # Pagination/offset miss: pull the latest `limit` bars (no startTime).
+        if end_ms is not None and self.can_bootstrap_klines_rest():
+            try:
+                latest = self._futures_klines_ohlcv(symbol, timeframe, int(limit), None)
+                merged = merge_ohlcv_frames(merged, latest)
+            except Exception as exc:
+                error_logger.debug(
+                    "Bootstrap kline latest-page fallback skipped for %s %s: %s",
+                    symbol,
+                    timeframe,
+                    exc,
+                )
+        if merged is not None and not merged.empty:
+            return merged
+        return page
 
     def bootstrap_scan_candles(self, symbols: list[str], timeframes: list[str]) -> int:
         """Seed WS kline buffers via REST before scan evaluation (not during scan)."""

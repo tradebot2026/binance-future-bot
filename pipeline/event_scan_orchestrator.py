@@ -7,6 +7,7 @@ from typing import Any, Optional
 
 from config import Config
 from core.bot_health import touch_scan_cycle
+from core.candle_backtest import memory_closed_backtest_bars
 from core.assignment_manager import AssignmentManager
 from core.event_scheduler import EventScheduler
 from core.portfolio_allocator import PortfolioAllocator
@@ -61,8 +62,13 @@ class EventScanOrchestrator:
         self._last_empty_universe_log_at: float = 0.0
         self._last_zero_candidate_log_at: float = 0.0
         self.funnel = TierFunnel(notify=self._notify_funnel)
+        self.funnel.attach_kline_progress_fn(self._local_backtest_bars)
         self._validator: Any = None
         self._telegram: Any = None
+
+    def _local_backtest_bars(self, symbol: str) -> int:
+        """Closed 15m bars from the WS/memory buffer — never REST."""
+        return memory_closed_backtest_bars(self._hub, symbol)
 
     def attach_validator(self, validator: Any) -> None:
         self._validator = validator

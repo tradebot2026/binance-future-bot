@@ -441,6 +441,7 @@ def format_watchlist_message(
     normal_scores: Optional[dict[str, float]] = None,
     kline_pending: Optional[list[str]] = None,
     hot_backtest_pending: Optional[list[str]] = None,
+    hot_backtest_progress: Optional[dict[str, int]] = None,
 ) -> str:
     """Format /watchlist — paced Normal ingest plus Hot / Super."""
     universe = max(int(universe_size or Config.NORMAL_TIER_UNIVERSE_SIZE), 1)
@@ -457,6 +458,11 @@ def format_watchlist_message(
     scores = {str(k).upper(): float(v or 0.0) for k, v in (normal_scores or {}).items()}
     pending = {str(k).upper() for k in (kline_pending or []) if k}
     hot_pending = {str(k).upper() for k in (hot_backtest_pending or []) if k}
+    hot_progress = {
+        str(k).upper(): min(max(int(v), 0), 100)
+        for k, v in (hot_backtest_progress or {}).items()
+        if k is not None
+    }
 
     lines = [
         "📡 <b>3-Tier Dynamic Scan Funnel</b>",
@@ -491,7 +497,8 @@ def format_watchlist_message(
         for sym, strat, score in tier2_rows[:tier2_display_limit]:
             key = str(sym).upper()
             if key in hot_pending:
-                tail = "[Pending Backtest]"
+                pct = int(hot_progress.get(key, 0))
+                tail = f"[Pending Backtest {pct}%]"
             else:
                 tail = f"{score:.0f}"
             lines.append(

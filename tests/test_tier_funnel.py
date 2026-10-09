@@ -303,8 +303,19 @@ class TestTierFunnel(unittest.TestCase):
             hot_backtest_pending=["ETHUSDT"],
         )
         self.assertIn("ETHUSDT", hot_pending)
-        self.assertIn("[Pending Backtest]", hot_pending)
+        self.assertIn("[Pending Backtest 0%]", hot_pending)
         self.assertNotIn("| 72", hot_pending)
+
+        hot_loading = format_watchlist_message(
+            tier1_hot=["ETHUSDT"],
+            tier1_background=[],
+            tier1_full=[],
+            tier2_rows=[("ETHUSDT", "SMC_TREND", 72.0)],
+            hot_scan_interval=60.0,
+            hot_backtest_pending=["ETHUSDT"],
+            hot_backtest_progress={"ETHUSDT": 65},
+        )
+        self.assertIn("[Pending Backtest 65%]", hot_loading)
 
         funnel = TierFunnel()
         funnel.replace_normal_universe(["AAAUSDT"], now=1.0)
@@ -505,6 +516,77 @@ class TestTierFunnel(unittest.TestCase):
             any("3 passes" in line for line in funnel._digest_lines)
         )
 
+    def test_pending_backtest_extends_when_progress_increases(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["ETHUSDT"], now=1.0)
+        funnel.promote_from_normal(
+            "ETHUSDT", [_score("ETHUSDT", "SMC_TREND", 72.0)]
+        )
+        with patch.object(Config, "HOT_PENDING_MAX_PASSES", 3), patch.object(
+            Config, "HOT_PENDING_COOLDOWN_SECONDS", 180.0
+        ):
+            funnel.note_hot_backtest_pending(
+                "ETHUSDT", "Need 450+", now=1.0, history_bars=180
+            )
+            funnel.note_hot_backtest_pending(
+                "ETHUSDT", "Need 450+", now=181.0, history_bars=180
+            )
+            funnel.note_hot_backtest_pending(
+                "ETHUSDT", "Need 450+", now=361.0, history_bars=338
+            )
+            self.assertIn("ETHUSDT", funnel.hot_symbols)
+            rec = funnel._hot["ETHUSDT"]
+            self.assertEqual(rec.history_pct, 75)
+            self.assertEqual(rec.pending_pass_limit, 4)
+            funnel.note_hot_backtest_pending(
+                "ETHUSDT", "Need 450+", now=541.0, history_bars=338
+            )
+        self.assertNotIn("ETHUSDT", funnel.hot_symbols)
+
+    def test_pending_backtest_keeps_extra_pass_at_full_history(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["ETHUSDT"], now=1.0)
+        funnel.promote_from_normal(
+            "ETHUSDT", [_score("ETHUSDT", "SMC_TREND", 72.0)]
+        )
+        with patch.object(Config, "HOT_PENDING_MAX_PASSES", 3), patch.object(
+            Config, "HOT_PENDING_COOLDOWN_SECONDS", 180.0
+        ):
+            funnel.note_hot_backtest_pending(
+                "ETHUSDT", "Need 450+", now=1.0, history_bars=200
+            )
+            funnel.note_hot_backtest_pending(
+                "ETHUSDT", "Need 450+", now=181.0, history_bars=320
+            )
+            funnel.note_hot_backtest_pending(
+                "ETHUSDT", "Need 450+", now=361.0, history_bars=450
+            )
+        self.assertIn("ETHUSDT", funnel.hot_symbols)
+        rec = funnel._hot["ETHUSDT"]
+        self.assertEqual(rec.history_pct, 100)
+        self.assertEqual(rec.pending_pass_limit, 4)
+
+    def test_pending_progress_reads_memory_buffer_not_rest(self) -> None:
+        funnel = TierFunnel()
+        seen: list[str] = []
+
+        def _bars(symbol: str) -> int:
+            seen.append(symbol)
+            return 292
+
+        funnel.attach_kline_progress_fn(_bars)
+        funnel.replace_normal_universe(["ETHUSDT"], now=1.0)
+        funnel.promote_from_normal(
+            "ETHUSDT", [_score("ETHUSDT", "SMC_TREND", 72.0)]
+        )
+        funnel.note_hot_backtest_pending("ETHUSDT", "Need 450+", now=1.0)
+        rec = funnel._hot["ETHUSDT"]
+        self.assertEqual(rec.history_pct, 65)
+        snap = funnel.watchlist_snapshot(now=1.0)
+        self.assertEqual(snap["hot_backtest_progress"].get("ETHUSDT"), 65)
+        self.assertTrue(seen)
+        self.assertTrue(all(sym == "ETHUSDT" for sym in seen))
+
     def test_history_demote_blocks_repromote_for_30_minutes(self) -> None:
         funnel = TierFunnel()
         funnel.replace_normal_universe(["CELRUSDT", "BIOUSDT"], now=1.0)
@@ -532,6 +614,22 @@ class TestTierFunnel(unittest.TestCase):
         self.assertIsNotNone(again)
         self.assertEqual(again.symbol, "CELRUSDT")
         self.assertFalse(funnel.in_history_demote_cooldown("BIOUSDT", now=362.0))
+
+    def test_scanner_quarantine_blocks_rest_bootstrap(self) -> None:
+        from scanner import MarketScanner
+
+        scanner = MarketScanner.__new__(MarketScanner)
+        scanner.orchestrator = MagicMock()
+        scanner.orchestrator.funnel = funnel = TierFunnel()
+        funnel.replace_normal_universe(["CELRUSDT"], now=1.0)
+        scores = [_score("CELRUSDT", "SMC_TREND", 72.0)]
+        funnel.promote_from_normal("CELRUSDT", scores, now=1.0)
+        with patch.object(Config, "HOT_PENDING_MAX_PASSES", 3):
+            funnel.note_hot_backtest_pending("CELRUSDT", "Need 450+", now=1.0)
+            funnel.note_hot_backtest_pending("CELRUSDT", "Need 450+", now=181.0)
+            funnel.note_hot_backtest_pending("CELRUSDT", "Need 450+", now=361.0)
+        self.assertTrue(scanner.is_backtest_quarantined("CELRUSDT", now=362.0))
+        self.assertFalse(scanner.is_backtest_quarantined("CELRUSDT", now=361.0 + 1800.0))
 
     def test_wr_demote_does_not_quarantine_repromote(self) -> None:
         funnel = TierFunnel()
@@ -568,6 +666,7 @@ class TestTierFunnel(unittest.TestCase):
         self.assertIn("AAAUSDT", funnel.pending_backtest_symbols())
         snap = funnel.watchlist_snapshot(now=1.0)
         self.assertIn("AAAUSDT", snap["hot_backtest_pending"])
+        self.assertEqual(snap["hot_backtest_progress"].get("AAAUSDT"), 18)
         funnel.on_backtest_failed("AAAUSDT", "Win Rate 35% < 60%")
         self.assertNotIn("AAAUSDT", funnel.hot_symbols)
         self.assertTrue(any("Win Rate 35% < 60%" in line for line in funnel._digest_lines))
@@ -586,6 +685,7 @@ class TestTierFunnel(unittest.TestCase):
         self.assertIn("Hourly Funnel Digest", text)
         self.assertIn("Hot: AAAUSDT", text)
         self.assertIn("Pending Backtest", text)
+        self.assertIn("AAAUSDT 3%", text)
         self.assertTrue(notified)
 
     def test_super_promotion_still_instant(self) -> None:

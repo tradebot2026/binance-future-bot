@@ -13,13 +13,19 @@ from config import Config
 from core.candle_backtest import (
     append_closed_ohlcv,
     backtest_history_ready,
+    closed_history_bars,
+    kline_load_percent,
+    memory_closed_backtest_bars,
     required_backtest_win_rate,
     run_15m_backtest,
 )
 from core.validation_queue import AsyncBacktestValidator
 from kline_bootstrap import (
     backtest_history_buffer_limit,
+    kline_cache_covers,
     merge_closed_kline_bar,
+    merge_ohlcv_frames,
+    next_kline_page,
 )
 from pipeline.event_scan_orchestrator import EventScanOrchestrator
 
@@ -391,7 +397,47 @@ class TestTelegramBacktestLine(unittest.TestCase):
         self.assertIn("Backtest WR:</b> 68.5% (8/12 Wins)", msg)
 
 
+def _ohlcv_ts(n: int, *, minutes: int = 15) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "timestamp": [
+                pd.Timestamp("2026-01-01") + pd.Timedelta(minutes=minutes * i)
+                for i in range(n)
+            ],
+            "open": [100.0] * n,
+            "high": [101.0] * n,
+            "low": [99.0] * n,
+            "close": [100.2] * n,
+            "volume": [1_000.0] * n,
+        }
+    )
+
+
 class TestBacktestWsAutofill(unittest.TestCase):
+    def test_scan_window_does_not_cover_backtest_depth(self) -> None:
+        self.assertFalse(kline_cache_covers(_ohlcv_ts(280), 500))
+        self.assertFalse(kline_cache_covers(_ohlcv_ts(320), 500))
+        self.assertTrue(kline_cache_covers(_ohlcv_ts(500), 500))
+        self.assertTrue(kline_cache_covers(_ohlcv_ts(260), 280))
+
+    def test_next_kline_page_paginates_older_than_cache(self) -> None:
+        cached = _ohlcv_ts(280)
+        limit, end_ms = next_kline_page(cached, 500)
+        self.assertEqual(limit, 220)
+        self.assertIsNotNone(end_ms)
+        oldest = int(pd.Timestamp(cached.iloc[0]["timestamp"]).value // 1_000_000)
+        self.assertEqual(end_ms, oldest - 1)
+        empty_limit, empty_end = next_kline_page(pd.DataFrame(), 500)
+        self.assertEqual(empty_limit, 500)
+        self.assertIsNone(empty_end)
+
+    def test_merge_ohlcv_stacks_older_page_with_ws_cache(self) -> None:
+        recent = _ohlcv_ts(280)
+        older = _ohlcv_ts(220)
+        older["timestamp"] = older["timestamp"] - pd.Timedelta(minutes=15 * 280)
+        merged = merge_ohlcv_frames(recent, older)
+        self.assertEqual(len(merged), 500)
+
     def test_merge_closed_kline_bar_grows_history(self) -> None:
         bars = deque(maxlen=backtest_history_buffer_limit())
         for i in range(12):
@@ -439,6 +485,25 @@ class TestBacktestWsAutofill(unittest.TestCase):
         self.assertEqual(required_backtest_win_rate(3), 66.0)
         self.assertEqual(required_backtest_win_rate(4), 60.0)
 
+    def test_kline_load_percent_is_local_and_capped(self) -> None:
+        self.assertEqual(kline_load_percent(0), 0)
+        self.assertEqual(kline_load_percent(180, 450), 40)
+        self.assertEqual(kline_load_percent(292, 450), 65)
+        self.assertEqual(kline_load_percent(338, 450), 75)
+        self.assertEqual(kline_load_percent(450, 450), 100)
+        self.assertEqual(kline_load_percent(600, 450), 100)
+        self.assertEqual(closed_history_bars(_ohlcv(12)), 11)
+
+    def test_memory_closed_backtest_bars_never_calls_rest(self) -> None:
+        hub = MagicMock()
+        hub.get_backtest_candles.return_value = _ohlcv(293)
+        hub.get_candles = MagicMock(side_effect=AssertionError("REST path used"))
+        bars = memory_closed_backtest_bars(hub, "ETHUSDT")
+        self.assertEqual(bars, 292)
+        hub.get_backtest_candles.assert_called_once()
+        hub.get_candles.assert_not_called()
+        self.assertEqual(memory_closed_backtest_bars(None, "ETHUSDT"), 0)
+
     def test_fetch_skips_rest_when_ws_buffer_ready(self) -> None:
         hub = MagicMock()
         hub.get_backtest_candles.return_value = _ohlcv(500)
@@ -460,6 +525,19 @@ class TestBacktestWsAutofill(unittest.TestCase):
         df = validator._fetch_15m_history("BIOUSDT")
         self.assertEqual(len(df), 12)
         exchange.fetch_bootstrap_klines_df.assert_not_called()
+
+    def test_fetch_rests_when_scan_cache_is_too_short_for_backtest(self) -> None:
+        hub = MagicMock()
+        hub.get_backtest_candles.return_value = _ohlcv_ts(280)
+        hub.should_skip_backtest_rest.return_value = False
+        exchange = MagicMock()
+        exchange._market_data = hub
+        exchange.can_bootstrap_klines_rest.return_value = True
+        exchange.fetch_bootstrap_klines_df.return_value = _ohlcv_ts(500)
+        validator = AsyncBacktestValidator(exchange)
+        df = validator._fetch_15m_history("ETHUSDT")
+        self.assertEqual(len(df), 500)
+        exchange.fetch_bootstrap_klines_df.assert_called_once()
 
     def test_fetch_rest_seeds_when_cache_empty(self) -> None:
         hub = MagicMock()
