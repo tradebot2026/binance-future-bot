@@ -63,6 +63,7 @@ class EventScanOrchestrator:
         self._last_zero_candidate_log_at: float = 0.0
         self.funnel = TierFunnel(notify=self._notify_funnel)
         self.funnel.attach_kline_progress_fn(self._local_backtest_bars)
+        self.funnel.attach_health_fn(self._funnel_health)
         self._validator: Any = None
         self._telegram: Any = None
 
@@ -1103,6 +1104,31 @@ class EventScanOrchestrator:
             volume_24h=volume_24h,
             volume_rank=volume_rank,
         )
+
+    def _funnel_health(self) -> tuple[str, str]:
+        scanner = "ACTIVE"
+        api = "HEALTHY"
+        hub = self._hub
+        if hub is not None:
+            try:
+                snap = hub.get_ws_health_snapshot() or {}
+                state = str(snap.get("state") or "").upper()
+                if state in {"", "HEALTHY", "OK", "CONNECTED", "WARM"}:
+                    scanner = "ACTIVE"
+                else:
+                    scanner = state
+            except Exception:
+                scanner = "UNKNOWN"
+        try:
+            usage_fn = getattr(self.exchange, "rest_usage_snapshot", None)
+            if not callable(usage_fn) and hub is not None:
+                usage_fn = getattr(hub, "rest_usage_snapshot", None)
+            if callable(usage_fn):
+                usage = usage_fn() or {}
+                api = str(usage.get("state") or "HEALTHY")
+        except Exception:
+            api = "UNKNOWN"
+        return scanner, api
 
     def _funnel_maybe_flush_digest(self, now: float) -> None:
         flush = getattr(self.funnel, "maybe_flush_digest", None)

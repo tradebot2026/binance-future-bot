@@ -513,7 +513,7 @@ def _write_bot_heartbeat(cycle: int) -> None:
 
 
 def _handle_loop_error(
-    exc: Exception,
+    exc: BaseException,
     consecutive_errors: int,
     tg: Optional[TelegramManager],
     critical_alerts: Optional[CriticalAlertService] = None,
@@ -563,6 +563,13 @@ def _handle_loop_error(
             sleep_for = min(float(Config.RESTART_DELAY_SECONDS), 5.0)
     elif isinstance(exc, (ExchangeError, DatabaseError)):
         sleep_for = min(Config.RESTART_DELAY_SECONDS * 2, 90)
+        if isinstance(exc, ExchangeError) and market_data is not None:
+            reconnect = getattr(market_data, "reconnect_stale_streams", None)
+            if callable(reconnect):
+                try:
+                    reconnect("main-loop ExchangeError auto-recovery")
+                except Exception:
+                    pass
     else:
         sleep_for = Config.RESTART_DELAY_SECONDS
 
@@ -670,6 +677,7 @@ def main(controller: Optional[BotController] = None) -> str:
             scheduler=scheduler,
             risk_manager=risk,
         )
+        manager.executor = executor
         tg.manager = manager
         tg.scanner = scanner
         tg.market_data = market_data
@@ -878,7 +886,9 @@ def main(controller: Optional[BotController] = None) -> str:
 
             except KeyboardInterrupt:
                 raise
-            except Exception as exc:
+            except SystemExit:
+                raise
+            except BaseException as exc:
                 consecutive_errors = _handle_loop_error(
                     exc, consecutive_errors, tg, critical_alerts, market_data
                 )
@@ -947,7 +957,9 @@ def run_with_auto_restart() -> None:
         except KeyboardInterrupt:
             system_logger.info("Bot stopped manually (KeyboardInterrupt).")
             break
-        except Exception as exc:
+        except SystemExit:
+            raise
+        except BaseException as exc:
             restart_count += 1
             error_logger.critical(
                 "Fatal crash (restart #%s): %s",

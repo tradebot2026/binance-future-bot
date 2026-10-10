@@ -44,10 +44,22 @@ from reconciliation import (
 )
 from utils import escape_html, round_step_size, safe_float, utc_now, utc_today_str
 
+from core.dca_plan import (
+    dca_enabled,
+    dca_plan_active,
+    entry_stage_of,
+    last_resort_sl_hit,
+    next_dca_step,
+    resolved_final_sl,
+    should_trigger_add,
+    sl_is_armed,
+)
+
 if TYPE_CHECKING:
     from telegram_bot import TelegramManager
     from scheduler import DailyScheduler
     from risk_manager import RiskManager
+    from executor import TradeExecutor
 
 
 @dataclass
@@ -81,6 +93,9 @@ class TradeManager:
         self.telegram = telegram
         self.scheduler = scheduler
         self.risk_manager = risk_manager
+        self.executor: Optional["TradeExecutor"] = None
+        self._dca_inflight: set[str] = set()
+        self._dca_stage: dict[str, int] = {}
         self._monitored_symbols: set[str] = set()
         self._monitored_lock = threading.Lock()
         self._latest_ticks: dict[str, float] = {}
@@ -411,10 +426,62 @@ class TradeManager:
             if self._check_range_hard_exits(trade, price):
                 return
 
+        self._maybe_execute_dca(trade, price)
+        fresh = self.db.get_trade(trade["trade_id"])
+        if fresh:
+            trade = fresh
+        if trade.get("status") == TRADE_STATUS_CLOSED:
+            return
+
         if position_side == "LONG":
             self._manage_long_trade(trade, price)
         elif position_side == "SHORT":
             self._manage_short_trade(trade, price)
+
+    def _maybe_execute_dca(self, trade: dict[str, Any], price: float) -> None:
+        if not dca_enabled() or self.executor is None or price <= 0:
+            return
+        trade_id = str(trade.get("trade_id") or "")
+        if not trade_id or trade_id in self._dca_inflight:
+            return
+        metadata = self.db.parse_trade_metadata(trade)
+        if not dca_plan_active(metadata):
+            return
+        stage = self._dca_stage.get(trade_id) or entry_stage_of(trade, metadata)
+        self._dca_stage[trade_id] = stage
+        step = next_dca_step(metadata, trade)
+        if step is None or stage >= step:
+            return
+        side = str(trade.get("side") or "LONG").upper()
+        if not should_trigger_add(side, price, metadata, step):
+            return
+        if self.risk_manager is not None:
+            allowed, reason = self.risk_manager.can_add_dca_entry(step)
+            if not allowed:
+                trade_logger.info(
+                    "[DCA] Entry %s skipped for %s — %s",
+                    step,
+                    trade.get("symbol"),
+                    reason,
+                )
+                return
+        # Persist the stage claim BEFORE the order so a restart cannot re-fire.
+        metadata["entry_stage"] = stage
+        if not self.db.claim_entry_stage(trade_id, stage, step, metadata):
+            self._dca_stage[trade_id] = max(stage, step)
+            return
+        self._dca_stage[trade_id] = step
+        trade["entry_stage"] = step
+        metadata["entry_stage"] = step
+        metadata["dca_entries"] = step
+        trade["metadata"] = metadata
+        self._dca_inflight.add(trade_id)
+        try:
+            self.executor.execute_dca_add(trade, step, price)
+        except Exception as exc:
+            error_logger.error("DCA add failed for %s: %s", trade.get("symbol"), exc)
+        finally:
+            self._dca_inflight.discard(trade_id)
 
     def _ensure_local_exit_memory(self, trade: dict[str, Any]) -> dict[str, Any]:
         """Rebuild local TP/SL in memory if they were never stored (no exchange orders)."""
@@ -705,14 +772,24 @@ class TradeManager:
 
             metadata = self.db.parse_trade_metadata(trade)
             entry = safe_float(trade.get("entry_price"))
+            dca_hold_sl = dca_plan_active(metadata) and not sl_is_armed(metadata, trade)
 
-            self._advance_profit_stop_ladder(trade, current_price, is_long=True)
+            if not dca_hold_sl:
+                self._advance_profit_stop_ladder(trade, current_price, is_long=True)
 
-            if Config.ENABLE_TRAILING_STOP and entry > 0:
-                if current_price > entry or metadata.get("runner_active"):
-                    self._apply_trailing_stop(trade, current_price, is_long=True)
+                if Config.ENABLE_TRAILING_STOP and entry > 0:
+                    if current_price > entry or metadata.get("runner_active"):
+                        self._apply_trailing_stop(trade, current_price, is_long=True)
 
             stop_loss = safe_float(trade.get("stop_loss"))
+            safety_sl = resolved_final_sl(metadata, "LONG")
+            if dca_hold_sl:
+                if last_resort_sl_hit("LONG", current_price, safety_sl):
+                    stop_loss = safety_sl
+                else:
+                    stop_loss = 0.0
+            elif safety_sl > 0 and sl_is_armed(metadata, trade):
+                stop_loss = safety_sl
             if stop_loss > 0 and current_price <= stop_loss:
                 if self._market_close_is_exhausted(str(trade.get("trade_id", "")), "STOP_LOSS"):
                     return
@@ -761,14 +838,24 @@ class TradeManager:
 
             metadata = self.db.parse_trade_metadata(trade)
             entry = safe_float(trade.get("entry_price"))
+            dca_hold_sl = dca_plan_active(metadata) and not sl_is_armed(metadata, trade)
 
-            self._advance_profit_stop_ladder(trade, current_price, is_long=False)
+            if not dca_hold_sl:
+                self._advance_profit_stop_ladder(trade, current_price, is_long=False)
 
-            if Config.ENABLE_TRAILING_STOP and entry > 0:
-                if current_price < entry or metadata.get("runner_active"):
-                    self._apply_trailing_stop(trade, current_price, is_long=False)
+                if Config.ENABLE_TRAILING_STOP and entry > 0:
+                    if current_price < entry or metadata.get("runner_active"):
+                        self._apply_trailing_stop(trade, current_price, is_long=False)
 
             stop_loss = safe_float(trade.get("stop_loss"))
+            safety_sl = resolved_final_sl(metadata, "SHORT")
+            if dca_hold_sl:
+                if last_resort_sl_hit("SHORT", current_price, safety_sl):
+                    stop_loss = safety_sl
+                else:
+                    stop_loss = 0.0
+            elif safety_sl > 0 and sl_is_armed(metadata, trade):
+                stop_loss = safety_sl
             if stop_loss > 0 and current_price >= stop_loss:
                 if self._market_close_is_exhausted(str(trade.get("trade_id", "")), "STOP_LOSS"):
                     return

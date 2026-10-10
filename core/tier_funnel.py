@@ -19,6 +19,7 @@ from logger import scanner_logger
 
 NotifyFn = Callable[[str], None]
 HistoryBarsFn = Callable[[str], int]
+HealthFn = Callable[[], tuple[str, str]]
 
 _HAVE_BARS_RE = re.compile(r"have\s+(\d+)", re.IGNORECASE)
 
@@ -101,6 +102,7 @@ class TierFunnel:
         self._super_clock = MinuteWindow(Config.SUPER_TIER_COINS_PER_MINUTE)
         self._pending_hot_rest: set[str] = set()
         self._history_bars_fn: Optional[HistoryBarsFn] = None
+        self._health_fn: Optional[HealthFn] = None
         self._demote_cooldown_until: dict[str, float] = {}
         self._digest_lines: list[str] = []
         self._digest_promoted: list[tuple[str, str, float]] = []
@@ -546,6 +548,10 @@ class TierFunnel:
         """Optional memory-only bar counter (WS/backtest buffer — no REST)."""
         self._history_bars_fn = fn
 
+    def attach_health_fn(self, fn: Optional[HealthFn]) -> None:
+        """Optional Scanner / API health snapshot for the hourly digest."""
+        self._health_fn = fn
+
     def _memory_history_bars(self, symbol: str) -> int:
         fn = self._history_bars_fn
         if not callable(fn):
@@ -936,27 +942,22 @@ class TierFunnel:
             return None
         if (stamp - self._digest_started) < interval:
             return None
-        pending_bt = self.pending_backtest_symbols()
-        if (
-            not self._digest_lines
-            and not pending_bt
-            and not self._digest_promoted
-            and not self._digest_demoted
-        ):
-            self._digest_started = stamp
-            return None
         from telegram_alerts import format_hourly_funnel_digest
 
-        progress = self.pending_backtest_progress()
-        pending_rows = [
-            (sym, int(progress.get(sym, 0))) for sym in pending_bt[:12]
-        ]
+        scanner_health, api_health = "ACTIVE", "HEALTHY"
+        if self._health_fn is not None:
+            try:
+                scanner_health, api_health = self._health_fn()
+            except Exception:
+                scanner_health, api_health = "UNKNOWN", "UNKNOWN"
         text = format_hourly_funnel_digest(
-            promoted=list(self._digest_promoted),
-            demoted=list(self._digest_demoted),
+            normal_count=len(self.normal_symbols),
             hot_count=len(self.hot_symbols),
             super_count=len(self.super_symbols),
-            pending=pending_rows,
+            promoted_count=len(self._digest_promoted),
+            demoted_count=len(self._digest_demoted),
+            scanner_health=str(scanner_health or "ACTIVE"),
+            api_health=str(api_health or "HEALTHY"),
         )
         self._digest_lines = []
         self._digest_promoted = []

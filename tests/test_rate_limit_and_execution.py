@@ -124,10 +124,23 @@ class TestRestUsageTracker(unittest.TestCase):
 
     def test_hard_cap_is_1500(self) -> None:
         self.assertEqual(Config.rest_hard_weight_cap(), 1500)
+        self.assertEqual(Config.rest_soft_weight_ceiling(), 1350)
         self.assertEqual(Config.rest_weight_throttle_threshold(), 1200)
         self.assertEqual(Config.rest_budget_order_weight(), 400)
         self.assertEqual(Config.rest_budget_hot_weight(), 600)
         self.assertEqual(Config.rest_budget_normal_weight(), 400)
+
+    def test_soft_ceiling_blocks_hot_before_1500_warning(self) -> None:
+        tracker = RestUsageTracker()
+        tracker.note_http_response(
+            SimpleNamespace(
+                status_code=200,
+                headers={"X-MBX-USED-WEIGHT-1M": "1348"},
+            )
+        )
+        self.assertFalse(tracker.try_reserve_hot(5))
+        self.assertTrue(tracker.allows_new_entries())
+        self.assertNotEqual(tracker.snapshot()["state"], "RATE_LIMIT_WARNING")
 
     def test_local_weight_reserve_blocks_normal_at_400(self) -> None:
         tracker = RestUsageTracker()

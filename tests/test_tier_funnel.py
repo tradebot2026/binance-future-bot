@@ -682,13 +682,12 @@ class TestTierFunnel(unittest.TestCase):
         with patch.object(Config, "FUNNEL_DIGEST_SECONDS", 60.0):
             text = funnel.maybe_flush_digest(now=70.0)
         self.assertIsNotNone(text)
-        self.assertIn("Hourly Funnel Digest", text)
-        self.assertIn("Promoted", text)
-        self.assertIn("AAAUSDT", text)
-        self.assertIn("Demoted", text)
-        self.assertIn("Hot Tier", text)
-        self.assertIn("Pending backtest", text)
-        self.assertIn("AAAUSDT 3%", text)
+        self.assertIn("Hourly Digest", text)
+        self.assertIn("Tier Status", text)
+        self.assertIn("Hourly Activity", text)
+        self.assertIn("System Health", text)
+        self.assertIn("Promoted 1", text)
+        self.assertNotIn("AAAUSDT", text)
         self.assertTrue(notified)
 
     def test_hourly_digest_layout_categorizes_promote_and_demote(self) -> None:
@@ -697,20 +696,20 @@ class TestTierFunnel(unittest.TestCase):
         text = format_hourly_funnel_digest(
             promoted=[("ETHUSDT", "SMC_TREND", 72.0)],
             demoted=[("CELRUSDT", "Pending Backtest exceeded 3 passes")],
+            normal_count=10,
             hot_count=2,
             super_count=1,
             pending=[("ETHUSDT", 65)],
         )
-        self.assertIn("✅", text)
-        self.assertIn("Promoted", text)
-        self.assertIn("ETHUSDT", text)
-        self.assertIn("72", text)
-        self.assertIn("Demoted", text)
-        self.assertIn("CELRUSDT", text)
-        self.assertIn("Pending Backtest exceeded 3 passes", text)
-        self.assertIn("Hot Tier", text)
-        self.assertIn("Active: 2", text)
-        self.assertIn("ETHUSDT 65%", text)
+        self.assertIn("Tier Status", text)
+        self.assertIn("Normal 10", text)
+        self.assertIn("Hot 2", text)
+        self.assertIn("Super 1", text)
+        self.assertIn("Promoted 1", text)
+        self.assertIn("Demoted 1", text)
+        self.assertIn("System Health", text)
+        self.assertNotIn("ETHUSDT", text)
+        self.assertNotIn("CELRUSDT", text)
 
     def test_super_promotion_still_instant(self) -> None:
         notified: list[str] = []

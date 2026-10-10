@@ -6,8 +6,11 @@ Optimized for 24/7 VPS deployment with WAL mode and minimal hot-path I/O.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import sys
 import threading
+import time
 from contextlib import contextmanager
 from datetime import timedelta
 from typing import Any, Generator, List, Optional
@@ -31,36 +34,125 @@ class DatabaseManager:
     """SQLite access layer with thread-safe writes and optimized read helpers."""
 
     def __init__(self) -> None:
-        self.db_path = Config.DB_PATH
+        self.db_path = os.path.abspath(Config.DB_PATH)
         self._write_lock = threading.RLock()
+        self._local = threading.local()
+        self._known_conns: list[sqlite3.Connection] = []
+        # Production reuses per-thread handles. Unittest must release the
+        # Windows file lock so TemporaryDirectory cleanup can delete the DB.
+        self._retain_connections = "unittest" not in sys.modules
+        parent = os.path.dirname(self.db_path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         self._initialize_tables()
+
+    def _is_retryable_sqlite(self, exc: BaseException) -> bool:
+        msg = str(exc).lower()
+        return any(
+            token in msg
+            for token in ("unable to open", "locked", "busy", "disk i/o")
+        )
+
+    def _close_thread_connection(self) -> None:
+        conn = getattr(self._local, "conn", None)
+        self._local.conn = None
+        if conn is None:
+            return
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    def close_thread_connections(self) -> None:
+        """Drop the calling thread's cached SQLite handle."""
+        self._close_thread_connection()
+
+    def close(self) -> None:
+        """Close every cached handle so the DB file can be deleted (tests)."""
+        self._close_thread_connection()
+        with self._write_lock:
+            for conn in self._known_conns:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._known_conns.clear()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+    def _thread_connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "conn", None)
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1")
+                return conn
+            except sqlite3.Error:
+                self._close_thread_connection()
+        conn = self._create_connection()
+        self._local.conn = conn
+        with self._write_lock:
+            self._known_conns.append(conn)
+        return conn
 
     @contextmanager
     def connection(self) -> Generator[sqlite3.Connection, None, None]:
         """
-        Public thread-safe connection context manager.
-        Safe for use from the main loop and Telegram daemon thread.
+        Thread-local SQLite connection. WAL + busy_timeout keep readers and
+        writers from fighting; the handle is reused so Windows does not churn
+        .db / -wal / -shm opens on every query.
         """
-        conn = self._create_connection()
+        last_exc: Optional[BaseException] = None
+        conn: Optional[sqlite3.Connection] = None
+        for attempt in range(4):
+            try:
+                conn = self._thread_connection()
+                break
+            except sqlite3.OperationalError as exc:
+                last_exc = exc
+                if not self._is_retryable_sqlite(exc):
+                    raise DatabaseError(str(exc)) from exc
+                error_logger.warning(
+                    "SQLite open retry %s/4: %s", attempt + 1, exc
+                )
+                self._close_thread_connection()
+                time.sleep(0.05 * (attempt + 1))
+        else:
+            raise DatabaseError(f"SQLite unavailable: {last_exc}") from last_exc
+        self._local.depth = getattr(self._local, "depth", 0) + 1
         try:
             yield conn
         finally:
-            conn.close()
+            self._local.depth = getattr(self._local, "depth", 1) - 1
+            if self._local.depth <= 0 and not self._retain_connections:
+                self._close_thread_connection()
 
     def _create_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(
-            self.db_path,
-            check_same_thread=False,
-            timeout=30.0,
-        )
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON")
-        conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA temp_store = MEMORY")
-        conn.execute("PRAGMA cache_size = -20000")
-        return conn
+        last_exc: Optional[BaseException] = None
+        for attempt in range(4):
+            try:
+                conn = sqlite3.connect(
+                    self.db_path,
+                    check_same_thread=False,
+                    timeout=30.0,
+                )
+                conn.row_factory = sqlite3.Row
+                conn.execute("PRAGMA foreign_keys = ON")
+                conn.execute("PRAGMA busy_timeout = 30000")
+                conn.execute("PRAGMA synchronous = NORMAL")
+                conn.execute("PRAGMA journal_mode = WAL")
+                conn.execute("PRAGMA temp_store = MEMORY")
+                conn.execute("PRAGMA cache_size = -20000")
+                return conn
+            except sqlite3.OperationalError as exc:
+                last_exc = exc
+                if not self._is_retryable_sqlite(exc) or attempt >= 3:
+                    raise
+                time.sleep(0.05 * (attempt + 1))
+        raise sqlite3.OperationalError(str(last_exc))
 
     def _initialize_tables(self) -> None:
         try:
@@ -155,6 +247,7 @@ class DatabaseManager:
                 self._ensure_column(cursor, "signals", "rejection_reason", "TEXT")
                 self._ensure_column(cursor, "trades", "exit_price", "REAL")
                 self._ensure_column(cursor, "trades", "realized_pnl", "REAL")
+                self._ensure_column(cursor, "trades", "entry_stage", "INTEGER DEFAULT 1")
 
                 cursor.execute(
                     """
@@ -1212,12 +1305,25 @@ class DatabaseManager:
                             trade_data.get("exchange_order_id"),
                         ),
                     )
+                    stage = trade_data.get("entry_stage")
+                    raw_meta = trade_data.get("metadata")
+                    if stage is None and isinstance(raw_meta, dict):
+                        stage = raw_meta.get("entry_stage", 1)
+                    try:
+                        stage_n = min(max(int(stage or 1), 1), 3)
+                    except (TypeError, ValueError):
+                        stage_n = 1
+                    conn.execute(
+                        "UPDATE trades SET entry_stage = ? WHERE trade_id = ?",
+                        (stage_n, trade_data.get("trade_id")),
+                    )
                     conn.commit()
                     system_logger.info(
-                        "Trade logged | %s | %s | %s",
+                        "Trade logged | %s | %s | %s | stage=%s",
                         trade_data.get("symbol"),
                         trade_data.get("side"),
                         trade_data.get("status", "OPEN"),
+                        stage_n,
                     )
             except sqlite3.IntegrityError:
                 error_logger.warning(
@@ -1257,6 +1363,65 @@ class DatabaseManager:
                     return True
             except sqlite3.Error as exc:
                 error_logger.error("Failed to update trade %s: %s", trade_id, exc)
+                return False
+
+    def claim_entry_stage(
+        self,
+        trade_id: str,
+        from_stage: int,
+        to_stage: int,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Atomically advance entry_stage once. False if already claimed (restart-safe)."""
+        if to_stage != from_stage + 1 or to_stage < 2 or to_stage > 3:
+            return False
+        meta = dict(metadata or {})
+        meta["entry_stage"] = to_stage
+        meta["dca_entries"] = to_stage
+        payload = json.dumps(meta)
+        with self._write_lock:
+            try:
+                with self.connection() as conn:
+                    row = conn.execute(
+                        "SELECT entry_stage, metadata FROM trades WHERE trade_id = ?",
+                        (trade_id,),
+                    ).fetchone()
+                    if row is None:
+                        return False
+                    stored_meta = self.parse_trade_metadata(
+                        {"metadata": row["metadata"]}
+                    )
+                    current = 1
+                    for raw in (
+                        row["entry_stage"],
+                        stored_meta.get("entry_stage"),
+                        stored_meta.get("dca_entries"),
+                    ):
+                        try:
+                            if raw is not None:
+                                current = max(current, int(raw))
+                        except (TypeError, ValueError):
+                            pass
+                    if current != from_stage:
+                        return False
+                    cursor = conn.execute(
+                        """
+                        UPDATE trades
+                        SET entry_stage = ?, metadata = ?
+                        WHERE trade_id = ? AND COALESCE(entry_stage, 1) = ?
+                        """,
+                        (to_stage, payload, trade_id, from_stage),
+                    )
+                    conn.commit()
+                    return cursor.rowcount == 1
+            except sqlite3.Error as exc:
+                error_logger.error(
+                    "Failed to claim entry_stage %s→%s for %s: %s",
+                    from_stage,
+                    to_stage,
+                    trade_id,
+                    exc,
+                )
                 return False
 
     @staticmethod

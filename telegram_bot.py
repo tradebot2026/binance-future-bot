@@ -211,10 +211,22 @@ class TelegramManager:
         except Exception as exc:
             error_logger.error("Failed to reply via Telegram: %s", exc)
 
+    def _rebuild_bot(self) -> None:
+        """Recreate the TeleBot after infinity_polling exits or the API drops."""
+        try:
+            if self.bot is not None:
+                self.bot.stop_polling()
+        except Exception:
+            pass
+        self.bot = telebot.TeleBot(self.token, parse_mode="HTML")
+        self._register_handlers()
+
     def _polling_loop(self) -> None:
-        assert self.bot is not None
+        backoff = 5.0
         while not self._stop_event.is_set():
             try:
+                if self.bot is None:
+                    self._rebuild_bot()
                 system_logger.info("Telegram listener started.")
                 self.bot.infinity_polling(
                     timeout=10,
@@ -222,13 +234,30 @@ class TelegramManager:
                     skip_pending=True,
                     none_stop=True,
                 )
-            except Exception as exc:
+                if self._stop_event.is_set():
+                    break
+                error_logger.warning(
+                    "Telegram infinity_polling returned — restarting listener."
+                )
+                self._rebuild_bot()
+                time.sleep(backoff)
+                backoff = min(backoff * 2.0, 60.0)
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            except BaseException as exc:
                 error_logger.error(
                     "Telegram polling error (listener stays alive): %s", exc
                 )
                 if self._stop_event.is_set():
                     break
-                time.sleep(5)
+                try:
+                    self._rebuild_bot()
+                except Exception:
+                    self.bot = None
+                time.sleep(backoff)
+                backoff = min(backoff * 2.0, 60.0)
+            else:
+                backoff = 5.0
 
     # ---------------- Messaging ----------------
 

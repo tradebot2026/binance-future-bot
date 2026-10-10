@@ -119,4 +119,5 @@ ALLOWED_TRADE_COLUMNS: Final[Set[str]] = {
     "duration",
     "metadata",
     "exchange_order_id",
+    "entry_stage",
 }

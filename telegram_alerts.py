@@ -535,63 +535,36 @@ def format_watchlist_message(
 
 def format_hourly_funnel_digest(
     *,
-    promoted: Optional[list[tuple[str, str, float]]] = None,
-    demoted: Optional[list[tuple[str, str]]] = None,
+    normal_count: int = 0,
     hot_count: int = 0,
     super_count: int = 0,
+    promoted_count: int = 0,
+    demoted_count: int = 0,
+    scanner_health: str = "ACTIVE",
+    api_health: str = "HEALTHY",
+    promoted: Optional[list[tuple[str, str, float]]] = None,
+    demoted: Optional[list[tuple[str, str]]] = None,
     pending: Optional[list[tuple[str, int]]] = None,
 ) -> str:
-    """Hourly Telegram digest — promoted / demoted / Hot status, HTML-safe."""
-    promo = list(promoted or [])
-    demo = list(demoted or [])
-    loading = list(pending or [])
-    lines = [
-        "📊 <b>Hourly Funnel Digest</b>",
-        "────────────────────────",
-        "",
-        f"✅ <b>Promoted</b> ({len(promo)})",
-    ]
-    if promo:
-        for symbol, strategy, score in promo[:20]:
-            lines.append(
-                f"• {escape_html(str(symbol).upper())} | "
-                f"{escape_html(strategy_display_label(strategy))} | "
-                f"{float(score):.0f}"
-            )
-        if len(promo) > 20:
-            lines.append(f"<i>…and {len(promo) - 20} more</i>")
-    else:
-        lines.append("<i>None this hour</i>")
-
-    lines.extend(["", f"⬇️ <b>Demoted</b> ({len(demo)})"])
-    if demo:
-        for symbol, reason in demo[:20]:
-            why = str(reason or "demoted").strip() or "demoted"
-            lines.append(
-                f"• {escape_html(str(symbol).upper())} — {escape_html(why)}"
-            )
-        if len(demo) > 20:
-            lines.append(f"<i>…and {len(demo) - 20} more</i>")
-    else:
-        lines.append("<i>None this hour</i>")
-
-    lines.extend(
+    """Compact hourly Telegram digest — counts and health only, no coin lists."""
+    promo_n = int(promoted_count) if promoted_count else len(promoted or [])
+    demo_n = int(demoted_count) if demoted_count else len(demoted or [])
+    _ = pending  # kept for callers; names are no longer listed
+    return "\n".join(
         [
-            "",
-            "🔥 <b>Hot Tier</b>",
+            "📊 <b>Hourly Digest</b>",
             (
-                f"• Active: {max(int(hot_count), 0)} | "
-                f"Pending backtest: {len(loading)} | "
-                f"Super: {max(int(super_count), 0)}"
+                f"📊 <b>Tier Status:</b> Normal {max(int(normal_count), 0)} · "
+                f"Hot {max(int(hot_count), 0)} · Super {max(int(super_count), 0)}"
+            ),
+            (
+                f"🔄 <b>Hourly Activity:</b> Promoted {max(promo_n, 0)} · "
+                f"Demoted {max(demo_n, 0)}"
+            ),
+            (
+                f"🛡️ <b>System Health:</b> Scanner "
+                f"{escape_html(str(scanner_health or 'ACTIVE'))} · API "
+                f"{escape_html(str(api_health or 'HEALTHY'))}"
             ),
         ]
     )
-    if loading:
-        labels = [
-            f"{escape_html(str(sym).upper())} {max(min(int(pct), 100), 0)}%"
-            for sym, pct in loading[:12]
-        ]
-        lines.append("• Loading: " + " · ".join(labels))
-    else:
-        lines.append("• Loading: none")
-    return "\n".join(lines)

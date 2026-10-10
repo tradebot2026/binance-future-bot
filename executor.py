@@ -27,6 +27,16 @@ from engines.smc_engine import (
     compute_structural_sl,
     size_multiplier_for_score,
 )
+from core.dca_plan import (
+    apply_initial_dca_plan,
+    build_dca_plan,
+    dca_add_wallet_fraction,
+    dca_enabled,
+    dca_entry_count,
+    entry_stage_of,
+    mark_dca_filled,
+    resolved_final_sl,
+)
 from core.entry_in_flight_mutex import entry_in_flight_mutex
 from core.execution_governor import ExecutionGovernor
 from reconciliation import symbol_blocked_for_new_entry
@@ -1340,6 +1350,8 @@ class TradeExecutor:
         metadata.setdefault("size_multiplier", size_multiplier_for_score(score))
         metadata["best_price"] = fill_price
         metadata["r_distance"] = abs(fill_price - sl)
+        if dca_enabled():
+            apply_initial_dca_plan(metadata, fill_price, sl)
 
         trade_id = str(uuid.uuid4())
         opened_at = utc_now().isoformat()
@@ -1368,6 +1380,7 @@ class TradeExecutor:
             "duration": None,
             "metadata": metadata,
             "exchange_order_id": exchange_order_id,
+            "entry_stage": 1,
         }
 
         db_logged = False
@@ -1393,11 +1406,12 @@ class TradeExecutor:
                 structure,
             )
             if place_native:
+                sl_for_native = 0.0 if dca_enabled() else sl
                 self._place_native_exit_orders(
                     trade_id=trade_id,
                     symbol=symbol,
                     position_side=position_side,
-                    sl=sl,
+                    sl=sl_for_native,
                     tp1=tp1,
                     tp2=tp2,
                     tp3=tp3,
@@ -1427,6 +1441,8 @@ class TradeExecutor:
                                 "take_profit_3": tp3,
                             }
                         )
+                        if dca_enabled() and dca_entry_count(metadata) <= 1:
+                            metadata.update(build_dca_plan(fill_price, sl))
                         self._apply_execution_levels(
                             trade_id=trade_id,
                             fill_price=fill_price,
@@ -1437,11 +1453,12 @@ class TradeExecutor:
                             metadata=metadata,
                         )
                         if place_native:
+                            sl_for_native = 0.0 if dca_enabled() else sl
                             self._place_native_exit_orders(
                                 trade_id=trade_id,
                                 symbol=symbol,
                                 position_side=position_side,
-                                sl=sl,
+                                sl=sl_for_native,
                                 tp1=tp1,
                                 tp2=tp2,
                                 tp3=tp3,
@@ -1507,3 +1524,127 @@ class TradeExecutor:
             "orphan_fill": not db_logged,
             "score": score,
         }
+
+    def execute_dca_add(
+        self,
+        trade: dict[str, Any],
+        step: int,
+        current_price: float,
+    ) -> bool:
+        """Add Entry 2 or 3 using 1% of wallet. Does not move TP or Base Entry Price."""
+        if not dca_enabled() or Config.DRY_RUN:
+            return False
+        if step not in (2, 3):
+            return False
+        symbol = str(trade.get("symbol") or "")
+        side = str(trade.get("side") or "LONG").upper()
+        if not symbol or current_price <= 0:
+            return False
+        metadata = self.db.parse_trade_metadata(trade)
+        stage = entry_stage_of(trade, metadata)
+        # Stage must already be claimed (from_stage+1) so restarts cannot re-fire.
+        if stage != step:
+            return False
+        base = safe_float(metadata.get("base_entry_price")) or safe_float(
+            trade.get("entry_price")
+        )
+        if base <= 0:
+            return False
+        if self.exchange.is_rest_blocked()[0]:
+            return False
+
+        balance = self.exchange.get_futures_balance(force_refresh=False)
+        if balance <= 0:
+            return False
+        rules = self.exchange.get_symbol_rules(symbol)
+        notional = balance * dca_add_wallet_fraction()
+        quantity = notional / current_price
+        quantity = self._format_quantity(self.exchange, quantity, rules, symbol)
+        min_qty = minimum_order_quantity(
+            current_price,
+            rules.min_qty,
+            rules.min_notional,
+            rules.step_size,
+            rules.quantity_precision,
+        )
+        if quantity < min_qty:
+            quantity = min_qty
+        quantity, _ = cap_quantity_to_notional(
+            quantity,
+            current_price,
+            balance * Config.MAX_POSITION_VALUE_MULTIPLIER,
+            rules.min_qty,
+            rules.min_notional,
+            rules.step_size,
+            rules.quantity_precision,
+        )
+        if quantity <= 0:
+            return False
+
+        order_side = "BUY" if side == "LONG" else "SELL"
+        try:
+            response = self.exchange.execute_futures_order(
+                symbol=symbol,
+                side=order_side,
+                position_side=side,
+                quantity=quantity,
+                price=None,
+                reduce_only=False,
+                new_client_order_id=f"dca{step}{str(trade.get('trade_id') or 'x').replace('-', '')[:16]}",
+            )
+        except Exception as exc:
+            error_logger.error(
+                "DCA entry %s failed for %s: %s", step, symbol, exc
+            )
+            return False
+        if not isinstance(response, dict):
+            return False
+
+        add_qty = safe_float(response.get("executedQty")) or quantity
+        prior_qty = safe_float(trade.get("quantity"))
+        new_qty = prior_qty + add_qty
+        mark_dca_filled(metadata, step)
+        metadata[f"dca_entry{step}_fill"] = safe_float(response.get("avgPrice")) or current_price
+        metadata[f"dca_entry{step}_qty"] = add_qty
+        patch: dict[str, Any] = {
+            "quantity": new_qty,
+            "entry_stage": step,
+            "metadata": metadata,
+        }
+        # Final SL is anchored on the Entry 3 *trigger* — never Binance avg entry.
+        if step >= 3:
+            final_sl = resolved_final_sl(metadata, side)
+            if final_sl > 0:
+                patch["stop_loss"] = final_sl
+                metadata["dca_sl_armed"] = True
+                patch["metadata"] = metadata
+                if Config.ENABLE_NATIVE_TP_SL:
+                    try:
+                        self.exchange.place_native_exit_bracket(
+                            symbol=symbol,
+                            position_side=side,
+                            sl_price=final_sl,
+                            tp_specs=[],
+                        )
+                    except Exception as exc:
+                        error_logger.warning(
+                            "Native final SL after Entry 3 failed for %s: %s",
+                            symbol,
+                            exc,
+                        )
+        self.db.update_trade(str(trade["trade_id"]), patch)
+        trade.update(patch)
+        self.exchange.seed_position_after_fill(symbol, side, new_qty, base)
+        trade_logger.info(
+            "[DCA] Entry %s filled %s %s | add_qty=%.8f total=%.8f | "
+            "base_entry=%.6f entry3_ref=%.6f sl=%s (TP unchanged)",
+            step,
+            symbol,
+            side,
+            add_qty,
+            new_qty,
+            base,
+            safe_float(metadata.get("dca_entry3_px")),
+            f"{safe_float(patch.get('stop_loss')):.6f}" if step >= 3 else "held",
+        )
+        return True

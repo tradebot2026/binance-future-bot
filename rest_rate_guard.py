@@ -255,7 +255,11 @@ class RestUsageTracker:
             return False
         used = int(snap.get("used_weight_1m") or 0)
         hard = Config.rest_hard_weight_cap()
-        if used >= hard or used + max(int(weight), 1) > hard:
+        soft = Config.rest_soft_weight_ceiling()
+        need = max(int(weight), 1)
+        if used >= hard or used + need > hard:
+            return False
+        if component != RestComponent.ORDER and (used >= soft or used + need > soft):
             return False
         if component == RestComponent.NORMAL:
             if used >= Config.rest_weight_throttle_threshold():
@@ -292,6 +296,7 @@ class RestUsageTracker:
         """Atomically reserve component weight under the 1500 hard cap."""
         weight = max(int(weight), 1)
         hard = Config.rest_hard_weight_cap()
+        soft = Config.rest_soft_weight_ceiling()
         throttle = Config.rest_weight_throttle_threshold()
         budget = _component_budget(component)
         with self._lock:
@@ -299,6 +304,10 @@ class RestUsageTracker:
             self._purge_local_weight_locked()
             projected = max(int(self._used_weight_1m), self._local_weight_sum_locked())
             if projected >= hard or projected + weight > hard:
+                return False
+            if component != RestComponent.ORDER and (
+                projected >= soft or projected + weight > soft
+            ):
                 return False
             if component == RestComponent.NORMAL and (
                 projected >= throttle or projected + weight > throttle

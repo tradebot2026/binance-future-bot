@@ -156,6 +156,7 @@ class Config:
     REST_IP_REQUEST_LIMIT_TESTNET: int = _env_int("REST_IP_REQUEST_LIMIT_TESTNET", 6000)
     REST_USED_WEIGHT_LIMIT: int = _env_int("REST_USED_WEIGHT_LIMIT", 2400)
     REST_HARD_WEIGHT_CAP: int = _env_int("REST_HARD_WEIGHT_CAP", 1500)
+    REST_SOFT_WEIGHT_CEILING: int = _env_int("REST_SOFT_WEIGHT_CEILING", 1350)
     REST_PRIORITY_THROTTLE_TOTAL: int = _env_int("REST_PRIORITY_THROTTLE_TOTAL", 1200)
     REST_BUDGET_ORDER_WEIGHT: int = _env_int("REST_BUDGET_ORDER_WEIGHT", 400)
     REST_BUDGET_HOT_WEIGHT: int = _env_int("REST_BUDGET_HOT_WEIGHT", 600)
@@ -229,6 +230,11 @@ class Config:
 
     # ---------------- Risk ----------------
     RISK_PER_TRADE_PERCENT: float = _env_float("RISK_PER_TRADE_PERCENT", 2.0)
+    ENABLE_DCA_LADDER: bool = _env_bool("ENABLE_DCA_LADDER", True)
+    DCA_MAX_ENTRIES: int = _env_int("DCA_MAX_ENTRIES", 3)
+    DCA_ADD_WALLET_PERCENT: float = _env_float("DCA_ADD_WALLET_PERCENT", 1.0)
+    DCA_ENTRY2_SL_FRACTION: float = _env_float("DCA_ENTRY2_SL_FRACTION", 0.45)
+    DCA_ENTRY3_SL_FRACTION: float = _env_float("DCA_ENTRY3_SL_FRACTION", 0.75)
     DAILY_TARGET_PERCENT: float = _env_float("DAILY_TARGET_PERCENT", 20.0)
     DAILY_STOP_PERCENT: float = _env_float("DAILY_STOP_PERCENT", 10.0)
     MAX_DAILY_TRADES: int = _env_int("MAX_DAILY_TRADES", 40)
@@ -835,6 +841,15 @@ class Config:
             max(int(getattr(cls, "REST_HARD_WEIGHT_CAP", 1500)), 1),
             1500,
             cls.rest_used_weight_limit(),
+        )
+
+    @classmethod
+    def rest_soft_weight_ceiling(cls) -> int:
+        """Background REST stop below 1500 so RATE_LIMIT_WARNING pauses stay rare."""
+        hard = cls.rest_hard_weight_cap()
+        return min(
+            max(int(getattr(cls, "REST_SOFT_WEIGHT_CEILING", 1350)), 1),
+            hard,
         )
 
     @classmethod

@@ -269,6 +269,15 @@ class RiskManager:
 
         return True, ""
 
+    def can_add_dca_entry(self, step: int) -> tuple[bool, str]:
+        """Allow Entry 2/3 on an already-open trade. Does not count as a new position."""
+        if step not in (2, 3):
+            return False, f"invalid DCA stage {step}"
+        blocked, reason = self.exchange.is_rest_blocked()
+        if blocked:
+            return False, reason or "REST blocked"
+        return True, ""
+
     def _net_long_exposure_allows_new(self) -> tuple[bool, str]:
         """Reject only when current long notional already meets the net-long cap."""
         balance = self.exchange.get_futures_balance(force_refresh=False)
