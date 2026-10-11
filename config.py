@@ -556,7 +556,7 @@ class Config:
     NORMAL_TIER_COINS_PER_MINUTE: int = _env_int("NORMAL_TIER_COINS_PER_MINUTE", 2)
     NORMAL_TIER_LOCK_HOURS: float = _env_float("NORMAL_TIER_LOCK_HOURS", 3.0)
     HOT_TIER_COINS_PER_MINUTE: int = _env_int("HOT_TIER_COINS_PER_MINUTE", 1)
-    SUPER_TIER_COINS_PER_MINUTE: int = _env_int("SUPER_TIER_COINS_PER_MINUTE", 1)
+    SUPER_TIER_COINS_PER_MINUTE: int = _env_int("SUPER_TIER_COINS_PER_MINUTE", 4)
     MAX_ORDER_REQUESTS_PER_MINUTE: int = _env_int("MAX_ORDER_REQUESTS_PER_MINUTE", 4)
     BACKGROUND_SCAN_BATCH_SIZE: int = _env_int("BACKGROUND_SCAN_BATCH_SIZE", 10)
     BACKGROUND_SCAN_BATCH_DELAY_SECONDS: float = _env_float(
@@ -788,7 +788,7 @@ class Config:
     ENABLE_WEEKLY_REPORT: bool = _env_bool("ENABLE_WEEKLY_REPORT", True)
     ENABLE_MONTHLY_REPORT: bool = _env_bool("ENABLE_MONTHLY_REPORT", True)
     MAX_SCAN_UNIVERSE: int = _env_int("MAX_SCAN_UNIVERSE", 120)
-    MAX_ENTRIES_PER_CYCLE: int = _env_int("MAX_ENTRIES_PER_CYCLE", 1)
+    MAX_ENTRIES_PER_CYCLE: int = _env_int("MAX_ENTRIES_PER_CYCLE", 12)
     MULTI_CONFLUENCE_MIN_SCORE: float = _env_float("MULTI_CONFLUENCE_MIN_SCORE", 65.0)
     NEAR_MISS_SCORE_MIN: float = _env_float("NEAR_MISS_SCORE_MIN", 65.0)
     NEAR_MISS_SCORE_MAX: float = _env_float("NEAR_MISS_SCORE_MAX", 69.0)
@@ -1133,6 +1133,21 @@ class Config:
     def setup_directories(cls) -> None:
         for directory in (cls.DATA_DIR, cls.LOGS_DIR, cls.REPORTS_DIR):
             os.makedirs(directory, exist_ok=True)
+
+    @classmethod
+    @classmethod
+    def super_tier_coins_per_minute(cls) -> int:
+        """At least 4 Super evals/min so more than two qualified coins stay live."""
+        return min(max(int(getattr(cls, "SUPER_TIER_COINS_PER_MINUTE", 4)), 4), 8)
+
+    @classmethod
+    def max_entries_per_cycle(cls) -> int:
+        """New entries per scan cycle — never above the open-position book."""
+        raw = int(getattr(cls, "MAX_ENTRIES_PER_CYCLE", 12))
+        book = max(int(cls.MAX_POSITIONS), 1)
+        if raw <= 1:
+            raw = book
+        return min(max(raw, 1), book)
 
     @classmethod
     def validate_config(cls) -> bool:

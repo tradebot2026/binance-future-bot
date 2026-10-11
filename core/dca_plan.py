@@ -74,7 +74,6 @@ def build_dca_plan(base_entry: float, planned_sl: float) -> dict[str, Any]:
     frac3 = max(dca_entry3_fraction(), frac2 + 0.05)
     sl_dist = structural_sl_distance(base, sl)
     entry3 = interpolate_toward_sl(base, sl, frac3)
-    long_side = is_long_plan(base, sl)
     return {
         "base_entry_price": base,
         "entry_stage": 1,
@@ -84,7 +83,8 @@ def build_dca_plan(base_entry: float, planned_sl: float) -> dict[str, Any]:
         "dca_sl_armed": False,
         "dca_entry2_px": interpolate_toward_sl(base, sl, frac2),
         "dca_entry3_px": entry3,
-        "dca_final_sl": final_sl_from_entry3(entry3, sl_dist, is_long=long_side),
+        # Fixed SL is the original plan from BASE — never Binance avg, never re-anchored.
+        "dca_final_sl": sl,
     }
 
 
@@ -108,18 +108,9 @@ def _ensure_stage_fields(metadata: dict[str, Any]) -> dict[str, Any]:
     metadata["entry_stage"] = stage
     metadata["dca_entries"] = stage
     if safe_float(metadata.get("dca_final_sl")) <= 0:
-        entry3 = safe_float(metadata.get("dca_entry3_px"))
-        sl_dist = safe_float(metadata.get("dca_sl_distance"))
-        if sl_dist <= 0:
-            sl_dist = structural_sl_distance(
-                safe_float(metadata.get("base_entry_price")),
-                safe_float(metadata.get("dca_planned_sl")),
-            )
-        base = safe_float(metadata.get("base_entry_price"))
-        planned = safe_float(metadata.get("dca_planned_sl"))
-        metadata["dca_final_sl"] = final_sl_from_entry3(
-            entry3, sl_dist, is_long=is_long_plan(base, planned) if planned else True
-        )
+        planned = planned_sl_price(metadata)
+        if planned > 0:
+            metadata["dca_final_sl"] = planned
     return metadata
 
 
@@ -138,20 +129,26 @@ def entry3_trigger_price(metadata: dict[str, Any]) -> float:
 
 
 def resolved_final_sl(metadata: dict[str, Any], side: str = "LONG") -> float:
-    """Final SL from the Entry 3 trigger. Ignores any averaged exchange entry."""
+    """Final SL from the original base-entry plan. Ignores Binance avg entry."""
     stored = safe_float(metadata.get("dca_final_sl"))
     if stored > 0:
         return stored
-    entry3 = entry3_trigger_price(metadata)
-    sl_dist = safe_float(metadata.get("dca_sl_distance"))
-    if sl_dist <= 0:
-        sl_dist = structural_sl_distance(
-            base_entry_price(metadata),
-            planned_sl_price(metadata),
-        )
-    return final_sl_from_entry3(
-        entry3, sl_dist, is_long=str(side).upper() == "LONG"
-    )
+    planned = planned_sl_price(metadata)
+    if planned > 0:
+        return planned
+    _ = side
+    return 0.0
+
+
+def telegram_dca_levels(metadata: Optional[dict[str, Any]]) -> dict[str, float]:
+    """Pre-calculated Entry 2 / Entry 3 / fixed SL for the open-trade alert."""
+    meta = metadata or {}
+    return {
+        "base_entry": base_entry_price(meta),
+        "entry2": safe_float(meta.get("dca_entry2_px")),
+        "entry3": safe_float(meta.get("dca_entry3_px")),
+        "final_sl": resolved_final_sl(meta),
+    }
 
 
 def entry_stage_of(

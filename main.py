@@ -35,6 +35,7 @@ from reconciliation import (
 )
 from scheduler import DailyScheduler
 from telegram_bot import TelegramManager
+from core.dca_plan import telegram_dca_levels
 from utils import safe_float, utc_today_str
 from core.monitor_watchdog import start_monitor_watchdog
 from core.validation_queue import AsyncBacktestValidator
@@ -293,11 +294,11 @@ def _execute_candidates(
         )
 
     for candidate in candidates:
-        if entries_this_cycle >= Config.MAX_ENTRIES_PER_CYCLE:
+        if entries_this_cycle >= Config.max_entries_per_cycle():
             system_logger.info(
                 "Entry cap reached for this cycle (%s/%s).",
                 entries_this_cycle,
-                Config.MAX_ENTRIES_PER_CYCLE,
+                Config.max_entries_per_cycle(),
             )
             break
 
@@ -428,6 +429,7 @@ def _execute_candidates(
                     backtest_win_rate=float(normalized.get("backtest_win_rate") or 0.0),
                     backtest_wins=int(normalized.get("backtest_wins") or 0),
                     backtest_trades=int(normalized.get("backtest_trades") or 0),
+                    dca_plan=telegram_dca_levels(result.get("metadata")),
                 )
 
             scheduler.notify_trade_event()
@@ -500,6 +502,7 @@ def _adopt_pending_user_fills(
                 backtest_win_rate=safe_float(meta.get("backtest_win_rate")),
                 backtest_wins=int(safe_float(meta.get("backtest_wins"))),
                 backtest_trades=int(safe_float(meta.get("backtest_trades"))),
+                dca_plan=telegram_dca_levels(meta),
             )
         scheduler.notify_trade_event()
         risk.notify_trade_event()
@@ -843,7 +846,7 @@ def main(controller: Optional[BotController] = None) -> str:
                         allowed, gate_reason = _entries_allowed(scheduler, risk, db)
                         if allowed and not rest_blocked:
                             approved = validator.drain_approved(
-                                max_n=Config.MAX_ENTRIES_PER_CYCLE
+                                max_n=Config.max_entries_per_cycle()
                             )
                             if approved:
                                 _execute_candidates(

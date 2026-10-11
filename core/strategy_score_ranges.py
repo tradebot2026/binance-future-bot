@@ -45,9 +45,9 @@ class StrategyScoreRange:
 # Funnel floors are below execution min-score so valid mid-setup coins can
 # enter Hot REST / Super rotation instead of stalling in Normal.
 _DEFAULT_SUPER: dict[str, float] = {
-    STRATEGY_SMC_TREND: 72.0,
-    STRATEGY_SMC_LEGACY: 72.0,
-    STRATEGY_RANGE_REVERSION: 68.0,
+    STRATEGY_SMC_TREND: 68.0,
+    STRATEGY_SMC_LEGACY: 68.0,
+    STRATEGY_RANGE_REVERSION: 64.0,
 }
 
 _DEFAULT_HOT: dict[str, float] = {

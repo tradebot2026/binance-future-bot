@@ -284,6 +284,7 @@ class TelegramManager:
         backtest_win_rate: float = 0.0,
         backtest_wins: int = 0,
         backtest_trades: int = 0,
+        dca_plan: Optional[dict[str, Any]] = None,
     ) -> None:
         emoji = "🟢" if action == "LONG" else "🔴"
         tp1_qty = quantity * TP1_PORTION if quantity > 0 else 0.0
@@ -320,7 +321,20 @@ class TelegramManager:
         if quantity > 0:
             msg += f"📦 <b>Size:</b> {quantity:.4f}\n"
 
-        msg += f"🛑 <b>SL:</b> {sl:.6f} ({_format_sl_pnl(sl_pnl)})\n"
+        plan = dca_plan or {}
+        entry2 = safe_float(plan.get("entry2"))
+        entry3 = safe_float(plan.get("entry3"))
+        final_sl = safe_float(plan.get("final_sl")) or sl
+        if entry2 > 0 or entry3 > 0:
+            msg += (
+                "\n🔄 <b>DCA map</b> <i>(from base entry, not Binance avg)</i>\n"
+                f"   • Entry 2: {entry2:.6f} <i>(1% wallet)</i>\n"
+                f"   • Entry 3: {entry3:.6f} <i>(1% wallet)</i>\n"
+                f"🛑 <b>Fixed SL</b> <i>(after Entry 3):</i> {final_sl:.6f} "
+                f"({_format_sl_pnl(_leg_pnl_usd(action, price, final_sl, quantity) if quantity > 0 else 0.0)})\n"
+            )
+        else:
+            msg += f"🛑 <b>SL:</b> {sl:.6f} ({_format_sl_pnl(sl_pnl)})\n"
         msg += (
             f"🎯 <b>TP1:</b> {tp1:.6f} "
             f"({_format_tp_pnl(tp1_pnl, TP1_PORTION * 100)})\n"

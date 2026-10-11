@@ -788,7 +788,7 @@ class TradeManager:
                     stop_loss = safety_sl
                 else:
                     stop_loss = 0.0
-            elif safety_sl > 0 and sl_is_armed(metadata, trade):
+            elif safety_sl > 0 and sl_is_armed(metadata, trade) and stop_loss <= 0:
                 stop_loss = safety_sl
             if stop_loss > 0 and current_price <= stop_loss:
                 if self._market_close_is_exhausted(str(trade.get("trade_id", "")), "STOP_LOSS"):
@@ -854,7 +854,7 @@ class TradeManager:
                     stop_loss = safety_sl
                 else:
                     stop_loss = 0.0
-            elif safety_sl > 0 and sl_is_armed(metadata, trade):
+            elif safety_sl > 0 and sl_is_armed(metadata, trade) and stop_loss <= 0:
                 stop_loss = safety_sl
             if stop_loss > 0 and current_price >= stop_loss:
                 if self._market_close_is_exhausted(str(trade.get("trade_id", "")), "STOP_LOSS"):

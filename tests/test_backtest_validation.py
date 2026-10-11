@@ -68,7 +68,7 @@ class TestLightweightWatchlist(unittest.TestCase):
         self.assertGreaterEqual(Config.normal_tier_universe_size(), 120)
         self.assertEqual(Config.NORMAL_TIER_COINS_PER_MINUTE, 2)
         self.assertEqual(Config.HOT_TIER_COINS_PER_MINUTE, 1)
-        self.assertEqual(Config.SUPER_TIER_COINS_PER_MINUTE, 1)
+        self.assertEqual(Config.super_tier_coins_per_minute(), 4)
         self.assertTrue(Config.ENABLE_THREE_TIER_FUNNEL)
         self.assertGreaterEqual(Config.scan_cycle_seconds(), 3600.0)
         self.assertEqual(Config.scan_warmup_seconds(), 0.0)
@@ -395,6 +395,38 @@ class TestTelegramBacktestLine(unittest.TestCase):
             )
         msg = tg.send_message.call_args[0][0]
         self.assertIn("Backtest WR:</b> 68.5% (8/12 Wins)", msg)
+
+    def test_trade_alert_includes_precalculated_dca_map(self) -> None:
+        from telegram_bot import TelegramManager
+
+        tg = TelegramManager.__new__(TelegramManager)
+        tg.send_message = MagicMock()
+        with patch.object(Config, "ENABLE_TP3_RUNNER", False):
+            tg.send_trade_alert(
+                action="LONG",
+                symbol="BTCUSDT",
+                price=8000.0,
+                tp1=8200.0,
+                sl=7700.0,
+                tp2=8400.0,
+                tp3=8600.0,
+                score=80.0,
+                strategy="SMC_TREND",
+                quantity=1.0,
+                dca_plan={
+                    "base_entry": 8000.0,
+                    "entry2": 7865.0,
+                    "entry3": 7775.0,
+                    "final_sl": 7700.0,
+                },
+            )
+        msg = tg.send_message.call_args[0][0]
+        self.assertIn("NEW TRADE EXECUTED", msg)
+        self.assertIn("DCA map", msg)
+        self.assertIn("Entry 2: 7865.000000", msg)
+        self.assertIn("Entry 3: 7775.000000", msg)
+        self.assertIn("Fixed SL", msg)
+        self.assertIn("7700.000000", msg)
 
 
 def _ohlcv_ts(n: int, *, minutes: int = 15) -> pd.DataFrame:

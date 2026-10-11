@@ -99,7 +99,7 @@ class TierFunnel:
         self._promoted: set[str] = set()
         self._normal_clock = MinuteWindow(Config.NORMAL_TIER_COINS_PER_MINUTE)
         self._hot_clock = MinuteWindow(Config.HOT_TIER_COINS_PER_MINUTE)
-        self._super_clock = MinuteWindow(Config.SUPER_TIER_COINS_PER_MINUTE)
+        self._super_clock = MinuteWindow(Config.super_tier_coins_per_minute())
         self._pending_hot_rest: set[str] = set()
         self._history_bars_fn: Optional[HistoryBarsFn] = None
         self._health_fn: Optional[HealthFn] = None
@@ -492,6 +492,17 @@ class TierFunnel:
         key = self._super_order[self._super_index % len(self._super_order)]
         self._super_index = (self._super_index + 1) % len(self._super_order)
         return self._super.get(key)
+
+    def take_super_batch(self, now: float | None = None) -> list[SuperRecord]:
+        """Evaluate every parked Super coin the minute clock still allows (no roster cap)."""
+        n = min(self._super_clock.remaining(now), len(self._super_order))
+        out: list[SuperRecord] = []
+        for _ in range(n):
+            rec = self.take_super(now=now)
+            if rec is None:
+                break
+            out.append(rec)
+        return out
 
     def promote_from_normal(
         self,

@@ -868,32 +868,36 @@ class EventScanOrchestrator:
             book_map=book_map,
         )
 
-        super_rec = self.funnel.take_super(now=now)
+        take_batch = getattr(self.funnel, "take_super_batch", None)
+        due_super = take_batch(now=now) if callable(take_batch) else []
+        if not due_super:
+            one = self.funnel.take_super(now=now)
+            due_super = [one] if one is not None else []
         candidates: list[SignalCandidate] = []
-        if super_rec is not None:
+        for super_rec in due_super:
             if super_rec.symbol in open_symbols:
                 self.funnel.note_filled(super_rec.symbol)
+                continue
+            signal = self._evaluate_super_symbol(
+                super_rec.symbol,
+                timeframe=primary_tf,
+                open_symbols=open_symbols,
+                ticker_map=ticker_map,
+                book_map=book_map,
+            )
+            if signal is not None:
+                candidates.append(signal)
             else:
-                signal = self._evaluate_super_symbol(
+                self._report_super_skip(
                     super_rec.symbol,
-                    timeframe=primary_tf,
-                    open_symbols=open_symbols,
-                    ticker_map=ticker_map,
-                    book_map=book_map,
+                    getattr(self, "_last_super_skip_reason", "")
+                    or "No valid Super setup this bar",
+                    instant=bool(getattr(self, "_last_super_skip_instant", False)),
                 )
-                if signal is not None:
-                    candidates.append(signal)
-                else:
-                    self._report_super_skip(
-                        super_rec.symbol,
-                        getattr(self, "_last_super_skip_reason", "")
-                        or "No valid Super setup this bar",
-                        instant=bool(getattr(self, "_last_super_skip_instant", False)),
-                    )
 
         universe_total = len(self.funnel.scan_pool()) or len(self._tier1_symbols)
         touch_scan_cycle(
-            scanned=len(normal_due) + (1 if super_rec else 0),
+            scanned=len(normal_due) + len(due_super),
             universe_total=max(universe_total, 1),
         )
         dict_results = [c.to_dict() for c in self._dedupe_symbol_candidates(candidates)]

@@ -46,10 +46,12 @@ class TestStrategyScoreRanges(unittest.TestCase):
             rng = score_range_for("RANGE_REVERSION")
         self.assertEqual(smc.classify(61.0), "NORMAL")
         self.assertEqual(smc.classify(62.0), "HOT")
-        self.assertEqual(smc.classify(72.0), "SUPER")
+        self.assertEqual(smc.classify(67.0), "HOT")
+        self.assertEqual(smc.classify(68.0), "SUPER")
         self.assertEqual(rng.classify(57.0), "NORMAL")
         self.assertEqual(rng.classify(58.0), "HOT")
-        self.assertEqual(rng.classify(68.0), "SUPER")
+        self.assertEqual(rng.classify(63.0), "HOT")
+        self.assertEqual(rng.classify(64.0), "SUPER")
         self.assertEqual(classify_score("SMC_TREND", 81.0), smc.classify(81.0))
 
 
@@ -424,7 +426,7 @@ class TestTierFunnel(unittest.TestCase):
                     "AAAUSDT",
                     [
                         _score("AAAUSDT", "SMC_TREND", 60.0),
-                        _score("AAAUSDT", "RANGE_REVERSION", 64.0),
+                        _score("AAAUSDT", "RANGE_REVERSION", 62.0),
                     ],
                 ),
                 "HOT",
@@ -458,6 +460,20 @@ class TestTierFunnel(unittest.TestCase):
             "AAAUSDT", [_score("AAAUSDT", "SMC_TREND", 72.0)]
         )
         self.assertIsNotNone(again)
+
+    def test_take_super_batch_returns_multiple_unique(self) -> None:
+        funnel = TierFunnel()
+        symbols = ("AAAUSDT", "ETHUSDT", "BNBUSDT")
+        funnel.replace_normal_universe(list(symbols), now=1.0)
+        for sym in symbols:
+            funnel.promote_from_normal(sym, [_score(sym, "SMC_TREND", 80.0)])
+            funnel.on_backtest_passed(sym)
+            funnel.apply_hot_scores(sym, [_score(sym, "SMC_TREND", 80.0)])
+        self.assertEqual(len(funnel.super_symbols), 3)
+        batch = funnel.take_super_batch(now=10.0)
+        names = [rec.symbol for rec in batch]
+        self.assertEqual(len(names), 3)
+        self.assertEqual(len(names), len(set(names)))
 
     def test_release_hot_rest_allows_retry(self) -> None:
         funnel = TierFunnel()
