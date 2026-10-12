@@ -266,6 +266,82 @@ class TestMainLoopIsEventDriven(unittest.TestCase):
         self.assertNotIn("scan_unified()", source)
         self.assertNotIn("scan_range_market()", source)
         self.assertNotIn("scan_market()", source)
+        self.assertIn("start_background_ops", source)
+        self.assertNotIn("run_maintenance(", source)
+
+    def test_health_command_is_cache_only_and_has_diagnostics_alias(self) -> None:
+        import inspect
+
+        import telegram_bot as tg_mod
+        from reporter import format_bot_health_message
+
+        source = inspect.getsource(tg_mod.TelegramManager._register_handlers)
+        self.assertIn('commands=["health", "pulse", "diagnostics"]', source)
+        self.assertIn("instant=True", source)
+
+        exchange = MagicMock()
+        exchange.rest_usage_snapshot.return_value = {
+            "state": "HEALTHY",
+            "requests_1m": 4,
+            "used_weight_1m": 22,
+            "weight_limit": 1500,
+            "weight_order_1m": 1,
+            "weight_hot_1m": 5,
+            "weight_normal_1m": 16,
+            "weight_throttle_remaining_seconds": 0,
+            "safety_remaining_seconds": 0,
+        }
+        exchange.fetch_live_account_snapshot.side_effect = AssertionError("REST")
+        exchange.get_ticker.side_effect = AssertionError("REST")
+        exchange.get_market_price.side_effect = AssertionError("REST")
+        exchange._rest_token_bucket.snapshot.return_value = {
+            "tokens": 10.0,
+            "capacity": 10.0,
+            "hard_stop_remaining": 0.0,
+        }
+        hub = MagicMock()
+        hub.get_ws_health_snapshot.return_value = {
+            "state": "HEALTHY",
+            "active_feeds": 3,
+            "ticker_symbols": 40,
+            "kline_streams": 12,
+            "ticker_age_seconds": 0.4,
+            "book_age_seconds": 0.5,
+            "user_stream_age_seconds": 8.0,
+            "user_stream_ok": True,
+            "reconnect_in_progress": False,
+        }
+        conn = MagicMock()
+
+        def _execute(sql, *args):
+            result = MagicMock()
+            if "journal_mode" in str(sql).lower():
+                result.fetchone.return_value = ("wal",)
+            return result
+
+        conn.execute.side_effect = _execute
+        db = MagicMock()
+        db.connection.return_value.__enter__.return_value = conn
+        db.connection.return_value.__exit__.return_value = False
+        db.get_active_trades_count.return_value = 2
+        db.get_recent_critical_errors.return_value = []
+
+        msg = format_bot_health_message(
+            exchange=exchange,
+            market_data=hub,
+            db=db,
+        )
+        self.assertIn("Cache-only", msg)
+        self.assertIn("WAL", msg)
+        self.assertIn("Main:", msg)
+        self.assertIn("Monitor:", msg)
+        self.assertIn("Reconcile:", msg)
+        self.assertIn("miniTicker", msg)
+        self.assertIn("user-data", msg)
+        self.assertIn("lanes:", msg)
+        exchange.fetch_live_account_snapshot.assert_not_called()
+        exchange.get_ticker.assert_not_called()
+        exchange.get_market_price.assert_not_called()
 
 
 class TestRestBanDoesNotFreezeScan(unittest.TestCase):
@@ -427,6 +503,53 @@ class TestCandidateRestPrice(unittest.TestCase):
         executor.exchange.fetch_ticker.assert_called()
         executor.execute_trade.assert_called()
         self.assertEqual(executor.execute_trade.call_args.kwargs["current_price"], 12.5)
+
+    def test_execute_candidates_skips_when_preflight_fails(self) -> None:
+        import main as main_mod
+
+        executor = MagicMock()
+        executor.execute_trade.return_value = {
+            "action": "LONG",
+            "symbol": "ETHUSDT",
+            "entry_price": 100.0,
+            "take_profit_1": 102.0,
+            "stop_loss": 98.0,
+            "quantity": 1.0,
+        }
+        orchestrator = MagicMock()
+        orchestrator.preflight_live_candidate.return_value = (
+            False,
+            "No valid Super setup this bar",
+            {},
+        )
+        candidate = {
+            "symbol": "ETHUSDT",
+            "action": "LONG",
+            "atr": 1.0,
+            "price": 100.0,
+            "score": 90.0,
+            "strategy": "SMC_TREND",
+        }
+        with patch.object(Config, "DRY_RUN", False), patch.object(
+            Config, "MAX_ENTRIES_PER_CYCLE", 3
+        ), patch.object(
+            main_mod, "_entries_allowed", return_value=(True, "")
+        ), patch(
+            "core.risk_engine.RiskEngine.approve_entry", return_value=(True, "")
+        ), patch(
+            "strategies.build_strategy_registry", return_value=MagicMock()
+        ):
+            main_mod._execute_candidates(
+                [candidate],
+                executor,
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                MagicMock(),
+                orchestrator=orchestrator,
+            )
+        orchestrator.preflight_live_candidate.assert_called()
+        executor.execute_trade.assert_not_called()
 
 
 if __name__ == "__main__":

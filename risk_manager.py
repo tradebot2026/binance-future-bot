@@ -65,6 +65,14 @@ def daily_max_loss_reached(metrics: DailyPnLMetrics) -> bool:
     return metrics.equity_day_pnl_percent <= -Config.DAILY_STOP_PERCENT
 
 
+def dca_wallet_loss_cap_usd(balance: float) -> float:
+    """Max USDT the full Entry 1+2+3 ladder may lose at the fixed SL (~4% wallet)."""
+    from core.dca_plan import dca_sl_wallet_cap_percent
+
+    wallet = max(float(balance or 0.0), 0.0)
+    return wallet * (dca_sl_wallet_cap_percent() / 100.0)
+
+
 @dataclass
 class RiskSnapshot:
     """Point-in-time portfolio risk metrics."""

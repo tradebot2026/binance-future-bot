@@ -104,6 +104,17 @@ class ComponentRestPacer:
             time.sleep(pause)
         return pause
 
+    def try_consume(self, component: RestComponent) -> bool:
+        """Take the lane slot if the gap has elapsed. Never sleeps."""
+        gap = rest_pace_seconds(component)
+        with self._lock:
+            now = time.monotonic()
+            last = float(self._last.get(component.value, 0.0) or 0.0)
+            if last > 0 and (now - last) < gap:
+                return False
+            self._last[component.value] = now
+            return True
+
 
 _LANE_PACER = ComponentRestPacer()
 
@@ -119,6 +130,11 @@ def rest_pace_seconds(component: RestComponent) -> float:
 def wait_rest_lane(component: RestComponent) -> float:
     """Block until this lane's interval has elapsed. Returns seconds slept."""
     return _LANE_PACER.wait(component)
+
+
+def try_wait_rest_lane(component: RestComponent) -> bool:
+    """True when the lane is free now (slot consumed). False = skip, no sleep."""
+    return _LANE_PACER.try_consume(component)
 
 
 def reset_rest_lane_pacer() -> None:
@@ -630,7 +646,7 @@ class RestTokenBucket:
             self._last_refill = time.monotonic()
 
     def acquire(self, weight: int = 1) -> None:
-        """Block until `weight` tokens are available (never spin-retry on ban)."""
+        """Block until `weight` tokens are available (execution path only)."""
         weight = max(weight, 1)
         while True:
             with self._lock:
@@ -652,6 +668,38 @@ class RestTokenBucket:
                     deficit = weight - self._tokens
                     wait = deficit / self._refill_rate
             time.sleep(min(max(wait, 0.05), 30.0))
+
+    def try_acquire(self, weight: int = 1) -> bool:
+        """Take tokens if available now. Never sleeps. False = skip the REST call."""
+        weight = max(weight, 1)
+        with self._lock:
+            now = time.monotonic()
+            if now < self._hard_stop_until:
+                return False
+            elapsed = now - self._last_refill
+            if elapsed > 0:
+                self._tokens = min(
+                    self._capacity,
+                    self._tokens + elapsed * self._refill_rate,
+                )
+                self._last_refill = now
+            if self._tokens < weight:
+                return False
+            self._tokens -= weight
+            return True
+
+    def snapshot(self) -> dict[str, float]:
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_refill
+            tokens = self._tokens
+            if elapsed > 0 and now >= self._hard_stop_until:
+                tokens = min(self._capacity, tokens + elapsed * self._refill_rate)
+            return {
+                "tokens": round(float(tokens), 1),
+                "capacity": float(self._capacity),
+                "hard_stop_remaining": max(self._hard_stop_until - now, 0.0),
+            }
 
 
 class RestBlockLogSuppressor:

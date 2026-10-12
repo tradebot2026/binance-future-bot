@@ -42,7 +42,14 @@ from reconciliation import (
     resolve_exchange_close_pnl,
     rest_position_quantity,
 )
-from utils import escape_html, round_step_size, safe_float, utc_now, utc_today_str
+from utils import (
+    escape_html,
+    resolve_binance_fill_price,
+    round_step_size,
+    safe_float,
+    utc_now,
+    utc_today_str,
+)
 
 from core.dca_plan import (
     dca_enabled,
@@ -269,6 +276,7 @@ class TradeManager:
     def monitor_open_trades(self, *, ws_only: bool = False) -> None:
         """Evaluate all active DB trades against live prices and exchange state."""
         try:
+            self._drain_pending_external_flats()
             active_trades = self.db.get_open_trades()
             with self._monitored_lock:
                 self._monitored_symbols = {
@@ -304,7 +312,7 @@ class TradeManager:
         *,
         ws_only: bool = False,
     ) -> dict[tuple[str, str], float]:
-        """WS/cache/DB quantities; REST bulk refresh only on the slow monitor path."""
+        """Exchange snapshot quantities only (0 = flat/missing). No DB ghost fill."""
         qty_map: dict[tuple[str, str], float] = {}
         for trade in active_trades:
             symbol = str(trade.get("symbol", "")).upper()
@@ -313,12 +321,7 @@ class TradeManager:
                 qty = self.exchange.get_position_quantity_cached(symbol, side)
             else:
                 qty = self.exchange.get_position_quantity(symbol, side)
-            if qty > 0:
-                qty_map[(symbol, side)] = qty
-                continue
-            db_qty = self._trade_quantity_from_db(trade)
-            if db_qty > 0:
-                qty_map[(symbol, side)] = db_qty
+            qty_map[(symbol, side)] = max(safe_float(qty), 0.0)
 
         if ws_only:
             return qty_map
@@ -353,14 +356,12 @@ class TradeManager:
         key = (str(symbol).upper(), str(position_side).upper())
 
         live_qty = qty_map.get(key, 0.0)
-        if live_qty <= 0:
-            db_qty = self._trade_quantity_from_db(trade)
-            if db_qty > 0:
-                live_qty = db_qty
-                qty_map[key] = db_qty
+        db_qty = self._trade_quantity_from_db(trade) if live_qty <= 0 else 0.0
 
         if live_qty <= 0 and not ws_only and not self.exchange.rest_account_reads_blocked():
-            rest_qty = self.exchange.get_position_quantity_rest(symbol, position_side)
+            rest_qty = self.exchange.get_position_quantity_rest(
+                symbol, position_side, urgent=True
+            )
             if rest_qty is not None and rest_qty > 0:
                 position_reconcile_guard.note_present(str(trade["trade_id"]))
                 trade_logger.info(
@@ -372,16 +373,17 @@ class TradeManager:
                 qty_map[key] = rest_qty
 
         if live_qty <= 0:
-            if ws_only:
-                db_qty = self._trade_quantity_from_db(trade)
+            if is_within_position_grace_period(trade):
                 if db_qty <= 0:
-                    trade_logger.debug(
-                        "[%s] TP/SL eval skipped — no DB/exchange qty (WS-only path).",
-                        symbol,
-                    )
                     return
                 live_qty = db_qty
                 qty_map[key] = db_qty
+            elif ws_only:
+                trade_logger.debug(
+                    "[%s] TP/SL eval skipped — exchange qty=0 (waiting REST/manual sync).",
+                    symbol,
+                )
+                return
             elif self._defer_external_close(trade, symbol):
                 return
             else:
@@ -396,7 +398,7 @@ class TradeManager:
                     )
                 self._mark_trade_closed(
                     trade,
-                    reason="RECONCILED_EXTERNAL_CLOSE",
+                    reason="RECONCILED_MANUAL_CLOSE",
                     exit_price=exit_px,
                     pnl=resolved.realized_pnl,
                     pnl_source=resolved.source,
@@ -477,7 +479,29 @@ class TradeManager:
         trade["metadata"] = metadata
         self._dca_inflight.add(trade_id)
         try:
-            self.executor.execute_dca_add(trade, step, price)
+            result = self.executor.execute_dca_add(trade, step, price)
+            if result and self.telegram:
+                try:
+                    self.telegram.send_dca_alert(
+                        symbol=str(result.get("symbol") or trade.get("symbol") or ""),
+                        side=str(result.get("side") or trade.get("side") or "LONG"),
+                        step=int(result.get("step") or step),
+                        fill_price=safe_float(result.get("fill_price")),
+                        planned_price=safe_float(result.get("planned_price")),
+                        add_qty=safe_float(result.get("add_qty")),
+                        total_qty=safe_float(result.get("total_qty")),
+                        entry2=safe_float(result.get("entry2")),
+                        entry3=safe_float(result.get("entry3")),
+                        stop_loss=safe_float(result.get("stop_loss")),
+                        sl_armed=bool(result.get("sl_armed")),
+                        live_price=safe_float(result.get("live_price") or price),
+                    )
+                except Exception as exc:
+                    error_logger.warning(
+                        "DCA Telegram alert failed for %s: %s",
+                        trade.get("symbol"),
+                        exc,
+                    )
         except Exception as exc:
             error_logger.error("DCA add failed for %s: %s", trade.get("symbol"), exc)
         finally:
@@ -542,6 +566,70 @@ class TradeManager:
         "1h": 3600,
         "4h": 14400,
     }
+
+    def _drain_pending_external_flats(self) -> None:
+        """Close DB trades when ACCOUNT_UPDATE reports qty=0 and REST confirms flat."""
+        hub = getattr(getattr(self, "exchange", None), "_market_data", None)
+        drain = getattr(hub, "drain_pending_flat_positions", None)
+        if not callable(drain):
+            return
+        try:
+            events = drain()
+        except Exception as exc:
+            error_logger.debug("Pending-flat drain failed: %s", exc)
+            return
+        if not events:
+            return
+        try:
+            open_trades = self.db.get_open_trades()
+        except Exception:
+            return
+        by_key = {
+            (
+                str(t.get("symbol", "")).upper(),
+                str(t.get("side", "LONG")).upper(),
+            ): t
+            for t in open_trades
+        }
+        lock = getattr(self, "_close_lock", None)
+        inflight = getattr(self, "_close_inflight", set())
+        for ev in events:
+            symbol = str(ev.get("symbol", "")).upper()
+            side = str(ev.get("positionSide") or ev.get("side") or "LONG").upper()
+            trade = by_key.get((symbol, side))
+            if not trade:
+                continue
+            trade_id = str(trade.get("trade_id", ""))
+            if trade_id and exit_claim_active(trade_id):
+                continue
+            busy = False
+            if trade_id:
+                if lock is not None:
+                    with lock:
+                        busy = any(
+                            str(k).startswith(f"{trade_id}:") for k in inflight
+                        )
+                else:
+                    busy = any(
+                        str(k).startswith(f"{trade_id}:") for k in inflight
+                    )
+            if busy:
+                continue
+            try:
+                self._reconcile_exchange_flat(
+                    trade,
+                    "ACCOUNT_UPDATE_FLAT",
+                    exit_reason="RECONCILED_MANUAL_CLOSE",
+                    confirmed_by_exchange=True,
+                    force_rest_inspect=True,
+                )
+            except Exception as exc:
+                error_logger.warning(
+                    "Manual-close sync failed for %s %s: %s",
+                    symbol,
+                    side,
+                    exc,
+                )
 
     def _defer_external_close(self, trade: dict[str, Any], symbol: str) -> bool:
         """
@@ -1102,11 +1190,28 @@ class TradeManager:
                     self.db.update_trade(trade["trade_id"], {"metadata": metadata})
 
         if self.telegram:
+            fill_price = safe_float(metadata.get("last_close_fill_price"))
+            fill_qty = safe_float(metadata.get("last_close_fill_qty"))
+            fill_pnl = metadata.get("last_close_fill_pnl")
+            live_px = 0.0
+            try:
+                live_px = safe_float(
+                    self.exchange.get_market_price(
+                        trade["symbol"], str(trade.get("side", "LONG"))
+                    )
+                )
+            except Exception:
+                live_px = 0.0
             self.telegram.send_tp_level_alert(
                 symbol=trade["symbol"],
                 level=level,
                 reason=reason,
                 new_sl=new_sl,
+                pnl=safe_float(fill_pnl) if fill_pnl is not None else None,
+                fill_price=fill_price,
+                quantity=fill_qty,
+                side=str(trade.get("side", "LONG")),
+                live_price=live_px,
             )
 
     def _rollback_tp_lock(self, trade: dict[str, Any], level: str) -> None:
@@ -1187,6 +1292,8 @@ class TradeManager:
         rules = self.exchange.get_symbol_rules(trade["symbol"])
 
         updated = False
+        sl_moved = False
+        new_sl = current_sl
         if is_long:
             if current_price > best_price:
                 best_price = current_price
@@ -1205,6 +1312,8 @@ class TradeManager:
                         {"stop_loss": candidate_sl, "metadata": metadata},
                     )
                     trade["stop_loss"] = candidate_sl
+                    new_sl = candidate_sl
+                    sl_moved = True
                     updated = True
         else:
             if current_price < best_price:
@@ -1224,10 +1333,28 @@ class TradeManager:
                         {"stop_loss": candidate_sl, "metadata": metadata},
                     )
                     trade["stop_loss"] = candidate_sl
+                    new_sl = candidate_sl
+                    sl_moved = True
                     updated = True
 
         if updated and metadata.get("trailing_active"):
             self.db.update_trade(trade["trade_id"], {"metadata": metadata})
+        if sl_moved and self.telegram:
+            try:
+                self.telegram.send_sl_move_alert(
+                    symbol=str(trade.get("symbol", "")),
+                    old_sl=current_sl,
+                    new_sl=new_sl,
+                    live_price=current_price,
+                    kind="TRAILING",
+                    side=str(trade.get("side", "LONG")),
+                )
+            except Exception as exc:
+                error_logger.warning(
+                    "SL-move Telegram alert failed for %s: %s",
+                    trade.get("symbol"),
+                    exc,
+                )
 
     def _metadata_remaining_quantity(self, trade: dict[str, Any]) -> float:
         metadata = self.db.parse_trade_metadata(trade)
@@ -1662,13 +1789,10 @@ class TradeManager:
             order_id,
             position_side=str(position_side),
         )
+        live_mark = safe_float(self.exchange.get_market_price(symbol, position_side))
         exit_price = fill_pnl.exit_price
         if exit_price <= 0:
-            exit_price = safe_float(response.get("avgPrice"))
-        if exit_price <= 0:
-            exit_price = safe_float(
-                self.exchange.get_market_price(symbol, position_side)
-            )
+            exit_price = resolve_binance_fill_price(response, fallback=live_mark)
 
         leg_pnl = fill_pnl.realized_pnl
         pnl_source = fill_pnl.source
@@ -1714,6 +1838,9 @@ class TradeManager:
         metadata = self.db.parse_trade_metadata(trade)
         metadata["last_fill_order_id"] = order_id
         metadata["last_fill_pnl_source"] = pnl_source
+        metadata["last_close_fill_price"] = exit_price
+        metadata["last_close_fill_qty"] = close_qty
+        metadata["last_close_fill_pnl"] = leg_pnl
         self.db.update_trade(
             trade_id,
             {
@@ -1915,6 +2042,12 @@ class TradeManager:
         position_side = str(trade.get("side", "LONG")).upper()
         closed_at = utc_now().isoformat()
         self._clear_market_close_attempts(trade_id)
+        dca_stage = getattr(self, "_dca_stage", None)
+        if isinstance(dca_stage, dict):
+            dca_stage.pop(trade_id, None)
+        inflight = getattr(self, "_dca_inflight", None)
+        if isinstance(inflight, set):
+            inflight.discard(trade_id)
 
         opened_at_raw = trade.get("opened_at")
         duration: Optional[int] = None
@@ -1973,12 +2106,23 @@ class TradeManager:
         )
 
         if notify and self.telegram:
+            live_px = 0.0
+            try:
+                live_px = safe_float(
+                    self.exchange.get_market_price(symbol, position_side)
+                )
+            except Exception:
+                live_px = 0.0
+            close_px = exit_price if exit_price > 0 else live_px
             self.telegram.send_close_alert(
                 symbol=symbol,
                 reason=reason,
                 pnl=safe_float(trade.get("pnl")),
                 strategy=str(trade.get("strategy", "")),
                 trade_id=trade_id,
+                exit_price=close_px,
+                live_price=live_px,
+                side=position_side,
             )
 
         outcome = "WIN" if safe_float(trade.get("pnl")) > 0 else "LOSS"

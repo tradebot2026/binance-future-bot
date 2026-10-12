@@ -235,6 +235,11 @@ class Config:
     DCA_ADD_WALLET_PERCENT: float = _env_float("DCA_ADD_WALLET_PERCENT", 1.0)
     DCA_ENTRY2_SL_FRACTION: float = _env_float("DCA_ENTRY2_SL_FRACTION", 0.45)
     DCA_ENTRY3_SL_FRACTION: float = _env_float("DCA_ENTRY3_SL_FRACTION", 0.75)
+    DCA_SL_WALLET_CAP_PERCENT: float = _env_float("DCA_SL_WALLET_CAP_PERCENT", 4.0)
+    DAY_VALIDATION_SECONDS_PER_SUPER: int = _env_int(
+        "DAY_VALIDATION_SECONDS_PER_SUPER", 180
+    )
+    DAY_VALIDATION_MAX_SECONDS: int = _env_int("DAY_VALIDATION_MAX_SECONDS", 2700)
     DAILY_TARGET_PERCENT: float = _env_float("DAILY_TARGET_PERCENT", 20.0)
     DAILY_STOP_PERCENT: float = _env_float("DAILY_STOP_PERCENT", 10.0)
     MAX_DAILY_TRADES: int = _env_int("MAX_DAILY_TRADES", 40)
@@ -557,7 +562,7 @@ class Config:
     NORMAL_TIER_LOCK_HOURS: float = _env_float("NORMAL_TIER_LOCK_HOURS", 3.0)
     HOT_TIER_COINS_PER_MINUTE: int = _env_int("HOT_TIER_COINS_PER_MINUTE", 1)
     SUPER_TIER_COINS_PER_MINUTE: int = _env_int("SUPER_TIER_COINS_PER_MINUTE", 4)
-    MAX_ORDER_REQUESTS_PER_MINUTE: int = _env_int("MAX_ORDER_REQUESTS_PER_MINUTE", 4)
+    MAX_ORDER_REQUESTS_PER_MINUTE: int = _env_int("MAX_ORDER_REQUESTS_PER_MINUTE", 12)
     BACKGROUND_SCAN_BATCH_SIZE: int = _env_int("BACKGROUND_SCAN_BATCH_SIZE", 10)
     BACKGROUND_SCAN_BATCH_DELAY_SECONDS: float = _env_float(
         "BACKGROUND_SCAN_BATCH_DELAY_SECONDS", 10.0
@@ -1148,6 +1153,42 @@ class Config:
         if raw <= 1:
             raw = book
         return min(max(raw, 1), book)
+
+    @classmethod
+    def max_entry_orders_per_minute(cls) -> int:
+        """IP-safe Super/Check-Phase entry REST cap — leftover 4/min becomes the book."""
+        book = max(int(cls.MAX_POSITIONS), 1)
+        raw = int(getattr(cls, "MAX_ORDER_REQUESTS_PER_MINUTE", book) or 0)
+        if raw <= 4:
+            raw = book
+        return min(max(raw, 1), book)
+
+    @classmethod
+    def super_eval_batch_size(cls) -> int:
+        """WS-only Super + Check-Phase evals per tick (no REST). At least the book."""
+        book = max(int(cls.MAX_POSITIONS), 1)
+        return max(book, cls.super_tier_coins_per_minute())
+
+    @classmethod
+    def dca_sl_wallet_cap_percent(cls) -> float:
+        raw = float(getattr(cls, "DCA_SL_WALLET_CAP_PERCENT", 4.0) or 0.0)
+        if raw <= 0:
+            raw = 4.0
+        return min(max(raw, 2.0), 6.0)
+
+    @classmethod
+    def day_validation_seconds_per_super(cls) -> int:
+        raw = int(getattr(cls, "DAY_VALIDATION_SECONDS_PER_SUPER", 180) or 0)
+        if raw <= 0:
+            raw = 180
+        return min(max(raw, 60), 300)
+
+    @classmethod
+    def day_validation_max_seconds(cls) -> int:
+        raw = int(getattr(cls, "DAY_VALIDATION_MAX_SECONDS", 2700) or 0)
+        if raw <= 0:
+            raw = 2700
+        return min(max(raw, 180), 3600)
 
     @classmethod
     def validate_config(cls) -> bool:

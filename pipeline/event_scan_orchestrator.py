@@ -14,7 +14,7 @@ from core.portfolio_allocator import PortfolioAllocator
 from core.scan_priority_queue import ScanPriorityQueue
 from core.scoring_engine import ScoringEngine
 from core.symbol_conflict_guard import SymbolConflictGuard
-from core.tier_funnel import HotRecord, TierFunnel
+from core.tier_funnel import HotRecord, TierFunnel, _effective_score
 from core.types import CandleCloseEvent, SignalCandidate, StrategyScore
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
@@ -868,32 +868,44 @@ class EventScanOrchestrator:
             book_map=book_map,
         )
 
-        take_batch = getattr(self.funnel, "take_super_batch", None)
-        due_super = take_batch(now=now) if callable(take_batch) else []
-        if not due_super:
-            one = self.funnel.take_super(now=now)
-            due_super = [one] if one is not None else []
+        if self.funnel.maybe_finish_day_validation(now=now):
+            self._notify_day_validation_resume()
+
+        due_super: list[Any] = []
         candidates: list[SignalCandidate] = []
-        for super_rec in due_super:
-            if super_rec.symbol in open_symbols:
-                self.funnel.note_filled(super_rec.symbol)
-                continue
-            signal = self._evaluate_super_symbol(
-                super_rec.symbol,
+        if self.funnel.day_validation_active(now):
+            due_super = self._run_super_day_validation(
+                now=now,
                 timeframe=primary_tf,
                 open_symbols=open_symbols,
                 ticker_map=ticker_map,
                 book_map=book_map,
             )
-            if signal is not None:
-                candidates.append(signal)
-            else:
-                self._report_super_skip(
+        else:
+            due_super = self._take_super_eval_batch(now)
+            for super_rec in due_super:
+                if super_rec is None:
+                    continue
+                if super_rec.symbol in open_symbols:
+                    self.funnel.note_filled(super_rec.symbol)
+                    continue
+                signal = self._evaluate_super_symbol(
                     super_rec.symbol,
-                    getattr(self, "_last_super_skip_reason", "")
-                    or "No valid Super setup this bar",
-                    instant=bool(getattr(self, "_last_super_skip_instant", False)),
+                    timeframe=primary_tf,
+                    open_symbols=open_symbols,
+                    ticker_map=ticker_map,
+                    book_map=book_map,
+                    live_score_only=False,
                 )
+                if signal is not None:
+                    candidates.append(signal)
+                else:
+                    self._report_super_skip(
+                        super_rec.symbol,
+                        getattr(self, "_last_super_skip_reason", "")
+                        or "No valid Super setup this bar",
+                        instant=bool(getattr(self, "_last_super_skip_instant", False)),
+                    )
 
         universe_total = len(self.funnel.scan_pool()) or len(self._tier1_symbols)
         touch_scan_cycle(
@@ -1147,6 +1159,175 @@ class EventScanOrchestrator:
         if callable(note):
             note(symbol, label, instant=instant)
 
+    def on_utc_day_rollover(self, day_str: str = "") -> None:
+        """Start the Super validation window after UTC day reset."""
+        duration = self.funnel.begin_day_validation()
+        remaining = len(self.funnel.super_symbols)
+        if duration <= 0:
+            scanner_logger.info(
+                "UTC day %s — no Super coins parked; skip validation window.",
+                day_str or "rollover",
+            )
+            return
+        minutes = max(duration / 60.0, 0.1)
+        scanner_logger.info(
+            "UTC day %s — Super validation window %.0fs (%.1f min) for %s coin(s).",
+            day_str or "rollover",
+            duration,
+            minutes,
+            remaining,
+        )
+        if self._telegram is not None:
+            try:
+                self._telegram.send_message(
+                    "🔍 <b>New-day Super validation</b>\n"
+                    f"🪙 {remaining} Super coin(s)\n"
+                    f"⏱ Window: {minutes:.0f} min "
+                    f"({Config.day_validation_seconds_per_super()}s each)\n"
+                    "<i>Super entries paused until live re-check finishes. "
+                    "Hot/Normal scan continues.</i>"
+                )
+            except Exception:
+                pass
+
+    def _notify_day_validation_resume(self) -> None:
+        if self._telegram is None:
+            return
+        try:
+            self._telegram.send_message(
+                "✅ <b>Super validation complete</b>\n"
+                f"🪙 Super remaining: {len(self.funnel.super_symbols)}\n"
+                "<i>Normal Super execution resumed.</i>"
+            )
+        except Exception:
+            pass
+
+    def _take_super_eval_batch(self, now: float) -> list[Any]:
+        """Shared Super-Tier / Check-Phase selector — same WS batch, no extra REST."""
+        take_batch = getattr(self.funnel, "take_super_batch", None)
+        if callable(take_batch):
+            return [rec for rec in (take_batch(now=now) or []) if rec is not None]
+        one = self.funnel.take_super(now=now)
+        return [one] if one is not None else []
+
+    def _run_super_day_validation(
+        self,
+        *,
+        now: float,
+        timeframe: str,
+        open_symbols: set[str],
+        ticker_map: dict[str, Any],
+        book_map: dict[str, Any],
+    ) -> list[Any]:
+        due = self._take_super_eval_batch(now)
+        for rec in due:
+            if rec is None:
+                continue
+            if rec.symbol in open_symbols:
+                self.funnel.note_filled(rec.symbol)
+                continue
+            snapshot = self._build_eval_snapshot(rec.symbol, ticker_map, book_map)
+            max_spread = float(Config.MAX_SPREAD_PERCENT)
+            spread = (
+                float(getattr(snapshot, "spread_pct", 0.0) or 0.0)
+                if snapshot is not None
+                else 0.0
+            )
+            if snapshot is None:
+                self.funnel.demote_super_to_normal(
+                    rec.symbol, reason="Day validation: insufficient kline history"
+                )
+                continue
+            if spread > max_spread:
+                self.funnel.demote_super_to_normal(
+                    rec.symbol,
+                    reason=f"Day validation: spread {spread:.3f}% > {max_spread:.3f}%",
+                )
+                continue
+            scores = self._score_symbol(
+                rec.symbol,
+                timeframe=timeframe,
+                open_symbols=open_symbols,
+                ticker_map=ticker_map,
+                book_map=book_map,
+            )
+            if not scores:
+                self.funnel.demote_super_to_normal(
+                    rec.symbol, reason="Day validation: no live Super score"
+                )
+                continue
+            best = max(scores, key=_effective_score)
+            live = _effective_score(best)
+            from core.strategy_score_ranges import score_range_for
+
+            if not score_range_for(best.strategy).meets_super(live):
+                self.funnel.demote_super_to_normal(
+                    rec.symbol,
+                    reason=(
+                        f"Day validation: live score {live:.1f} below Super "
+                        f"{score_range_for(best.strategy).super_score:.1f}"
+                    ),
+                )
+                continue
+            rec.score = live
+            rec.strategy = best.strategy
+            scanner_logger.info(
+                "[TIER_SUPER] day-validation keep %s score=%.1f",
+                rec.symbol,
+                rec.score,
+            )
+        return due
+
+    def preflight_live_candidate(
+        self, candidate: dict[str, Any]
+    ) -> tuple[bool, str, dict[str, Any]]:
+        """Live kline/spread/strategy re-check at the moment of order submission."""
+        payload = dict(candidate or {})
+        symbol = str(payload.get("symbol", "")).strip().upper()
+        if not symbol:
+            return False, "missing symbol", payload
+        if self.funnel.day_validation_active():
+            return False, "new-day Super validation window", payload
+        trigger_tfs = Config.get_scan_trigger_timeframes()
+        primary_tf = trigger_tfs[0] if trigger_tfs else Config.ENTRY_TIMEFRAME
+        ticker_map = self._ws_ticker_map()
+        book_map = self._ws_book_map(ticker_map)
+        open_symbols = self._open_symbols()
+        if symbol in open_symbols:
+            return False, "exchange position already open", payload
+        signal = self._evaluate_super_symbol(
+            symbol,
+            timeframe=primary_tf,
+            open_symbols=open_symbols,
+            ticker_map=ticker_map,
+            book_map=book_map,
+            live_score_only=True,
+        )
+        if signal is None:
+            reason = (
+                getattr(self, "_last_super_skip_reason", "")
+                or "live setup no longer valid"
+            )
+            return False, reason, payload
+        wanted = str(payload.get("action") or "").upper()
+        if wanted in ("LONG", "SHORT") and signal.action != wanted:
+            return False, f"side flipped {wanted}→{signal.action}", payload
+        refreshed = signal.to_dict()
+        meta = dict(payload.get("structure_metadata") or {})
+        meta.update(refreshed.get("structure_metadata") or {})
+        refreshed["structure_metadata"] = meta
+        for key in (
+            "backtest_validated",
+            "backtest_win_rate",
+            "backtest_wins",
+            "backtest_trades",
+        ):
+            if key in payload and key not in refreshed:
+                refreshed[key] = payload[key]
+            if key in meta:
+                refreshed.setdefault(key, meta[key])
+        return True, "", refreshed
+
     def _evaluate_super_symbol(
         self,
         symbol: str,
@@ -1155,6 +1336,7 @@ class EventScanOrchestrator:
         open_symbols: set[str],
         ticker_map: dict[str, Any],
         book_map: dict[str, Any],
+        live_score_only: bool = False,
     ) -> Optional[SignalCandidate]:
         from constants import SMC_STRATEGY_TAGS
         from core.strategy_score_ranges import score_range_for
@@ -1188,6 +1370,7 @@ class EventScanOrchestrator:
             open_symbols=open_symbols,
             ticker_map=ticker_map,
             book_map=book_map,
+            ignore_rotation_memory=True,
         )
         if signal is None:
             strat = str(getattr(rec, "strategy", "") or "")
@@ -1202,7 +1385,8 @@ class EventScanOrchestrator:
         band = score_range_for(signal.strategy)
         live = float(signal.score or 0.0)
         remembered = float(rec.score or 0.0) if rec is not None else 0.0
-        if not band.meets_super(max(live, remembered)):
+        score_for_band = live if live_score_only else max(live, remembered)
+        if not band.meets_super(score_for_band):
             self._last_super_skip_reason = (
                 f"Super score {live:.1f} below {band.super_score:.1f}"
             )
@@ -1393,9 +1577,10 @@ class EventScanOrchestrator:
         ticker_map: dict[str, Any],
         book_map: dict[str, Any],
         mark_event: Optional[CandleCloseEvent] = None,
+        ignore_rotation_memory: bool = False,
     ) -> Optional[SignalCandidate]:
         symbol = symbol.upper()
-        skip_rotation_memory = Config.USE_TESTNET
+        skip_rotation_memory = Config.USE_TESTNET or ignore_rotation_memory
         if (
             not skip_rotation_memory
             and self.priority_queue.rotation.is_in_evaluated_memory(symbol)

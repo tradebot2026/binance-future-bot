@@ -12,10 +12,12 @@ from config import Config, _env_use_testnet
 from core.execution_ledger import ExecutionLedger, ExecutionPhase
 from rest_rate_guard import (
     RestComponent,
+    RestTokenBucket,
     RestUsageTracker,
     kline_rest_delay_seconds,
     reset_rest_lane_pacer,
     rest_pace_seconds,
+    try_wait_rest_lane,
     wait_rest_lane,
     weight_for_call,
 )
@@ -172,6 +174,23 @@ class TestRestUsageTracker(unittest.TestCase):
         self.assertEqual(rest_pace_seconds(RestComponent.NORMAL), 2.0)
         self.assertEqual(rest_pace_seconds(RestComponent.HOT), 3.0)
         self.assertEqual(rest_pace_seconds(RestComponent.ORDER), 1.0)
+
+    def test_try_wait_rest_lane_does_not_sleep(self) -> None:
+        reset_rest_lane_pacer()
+        sleeps: list[float] = []
+        with patch("rest_rate_guard.time.sleep", side_effect=lambda s: sleeps.append(s)):
+            self.assertTrue(try_wait_rest_lane(RestComponent.HOT))
+            self.assertFalse(try_wait_rest_lane(RestComponent.HOT))
+        self.assertEqual(sleeps, [])
+        reset_rest_lane_pacer()
+
+    def test_token_bucket_try_acquire_never_sleeps(self) -> None:
+        bucket = RestTokenBucket(capacity=1.0, refill_per_second=0.01)
+        bucket.trigger_hard_stop(120.0)
+        sleeps: list[float] = []
+        with patch("rest_rate_guard.time.sleep", side_effect=lambda s: sleeps.append(s)):
+            self.assertFalse(bucket.try_acquire(1))
+        self.assertEqual(sleeps, [])
 
     def test_lane_pacer_gaps_second_call(self) -> None:
         reset_rest_lane_pacer()

@@ -24,6 +24,7 @@ from rest_rate_guard import (
     RestUsageTracker,
     build_default_token_bucket,
     kline_rest_delay_seconds,
+    try_wait_rest_lane,
     wait_rest_lane,
     weight_for_call,
 )
@@ -180,6 +181,16 @@ class RateLimiter:
             if elapsed < self._min_interval:
                 time.sleep(self._min_interval - elapsed)
             self._last_request = time.monotonic()
+
+    def try_wait(self) -> bool:
+        """True if the min interval has elapsed (slot consumed). Never sleeps."""
+        with self._lock:
+            now = time.monotonic()
+            elapsed = now - self._last_request
+            if elapsed < self._min_interval:
+                return False
+            self._last_request = now
+            return True
 
 
 class BinanceExchangeManager:
@@ -1212,6 +1223,30 @@ class BinanceExchangeManager:
         self._last_account_rest_at = time.monotonic()
         self._last_balance_rest_at = self._last_account_rest_at
 
+    def _defer_non_execution_rest(
+        self,
+        func: Any,
+        *,
+        bypass_account_cache: bool,
+        priority: bool,
+        is_bootstrap_kline: bool,
+        reason: str,
+    ) -> Any:
+        """Skip a background REST call without sleeping the caller."""
+        if self._is_account_rest_call(func):
+            if bypass_account_cache and priority:
+                raise ExchangeRateLimitError(reason)
+            return self._return_cached_account_call(func)
+        if is_bootstrap_kline:
+            return []
+        if self._rest_block_log.should_log(reason):
+            error_logger.warning(
+                "REST call skipped (fail-fast): %s | endpoint=%s",
+                reason,
+                getattr(func, "__name__", "unknown"),
+            )
+        raise ExchangeRateLimitError(reason)
+
     def _throttled_call(
         self,
         func: Any,
@@ -1317,6 +1352,30 @@ class BinanceExchangeManager:
 
         if Config.ENABLE_STRICT_RATE_LIMIT:
             if lane != RestLane.EXECUTION:
+                if not try_wait_rest_lane(self._lane_component(lane)):
+                    return self._defer_non_execution_rest(
+                        func,
+                        bypass_account_cache=bypass_account_cache,
+                        priority=priority,
+                        is_bootstrap_kline=is_bootstrap_kline,
+                        reason="REST lane pacing — skipped (fail-fast)",
+                    )
+                if not self._rate_limiter.try_wait():
+                    return self._defer_non_execution_rest(
+                        func,
+                        bypass_account_cache=bypass_account_cache,
+                        priority=priority,
+                        is_bootstrap_kline=is_bootstrap_kline,
+                        reason="REST min-interval — skipped (fail-fast)",
+                    )
+                if not self._rest_token_bucket.try_acquire(call_weight):
+                    return self._defer_non_execution_rest(
+                        func,
+                        bypass_account_cache=bypass_account_cache,
+                        priority=priority,
+                        is_bootstrap_kline=is_bootstrap_kline,
+                        reason="REST token bucket empty — skipped (fail-fast)",
+                    )
                 if not self._rest_budget.acquire(call_weight, lane):
                     if self._is_account_rest_call(func):
                         if bypass_account_cache and priority:
@@ -1371,7 +1430,7 @@ class BinanceExchangeManager:
                     )
             else:
                 self._rest_usage.note_outgoing_weight(call_weight)
-            self._rest_token_bucket.acquire(call_weight)
+                self._rest_token_bucket.acquire(call_weight)
         elif lane != RestLane.EXECUTION:
             reserved = (
                 self._rest_usage.try_reserve_hot(call_weight)
@@ -1394,7 +1453,7 @@ class BinanceExchangeManager:
         is_order_submit = func_name == "futures_create_order"
         network_retries = 1 if is_order_submit else max(Config.REST_NETWORK_MAX_RETRIES, 1)
         for attempt in range(1, network_retries + 1):
-            if Config.ENABLE_STRICT_RATE_LIMIT:
+            if Config.ENABLE_STRICT_RATE_LIMIT and lane == RestLane.EXECUTION:
                 wait_rest_lane(self._lane_component(lane))
                 limiter.wait()
             if is_bootstrap_kline:

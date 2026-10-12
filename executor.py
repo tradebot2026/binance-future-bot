@@ -44,6 +44,7 @@ from utils import (
     amount_to_precision,
     cap_quantity_to_notional,
     minimum_order_quantity,
+    resolve_binance_fill_price,
     round_step_size,
     safe_float,
     utc_now,
@@ -1301,16 +1302,9 @@ class TradeExecutor:
                 else ExecutionPhase.PARTIALLY_FILLED,
                 binance_order_id=exchange_order_id,
                 quantity=quantity,
-                entry=safe_float(response.get("avgPrice")) or current_price,
+                entry=resolve_binance_fill_price(response, fallback=current_price),
             )
-        fill_price = safe_float(response.get("avgPrice"))
-        if fill_price <= 0:
-            executed = safe_float(response.get("executedQty"))
-            cum_quote = safe_float(response.get("cumQuote"))
-            if executed > 0 and cum_quote > 0:
-                fill_price = cum_quote / executed
-        if fill_price <= 0:
-            fill_price = current_price
+        fill_price = resolve_binance_fill_price(response, fallback=current_price)
 
         post_levels = self._resolve_execution_levels(
             action, fill_price, atr, rules, structure, strategy
@@ -1351,7 +1345,25 @@ class TradeExecutor:
         metadata["best_price"] = fill_price
         metadata["r_distance"] = abs(fill_price - sl)
         if dca_enabled():
-            apply_initial_dca_plan(metadata, fill_price, sl)
+            wallet = 0.0
+            try:
+                wallet = float(self.exchange.get_futures_balance(force_refresh=False) or 0.0)
+            except Exception:
+                wallet = 0.0
+            apply_initial_dca_plan(
+                metadata,
+                fill_price,
+                sl,
+                structure=structure,
+                wallet=wallet,
+                entry1_qty=quantity,
+                leverage=leverage,
+                side=action,
+            )
+            capped_sl = resolved_final_sl(metadata, action)
+            if capped_sl > 0:
+                sl = capped_sl
+                metadata["r_distance"] = abs(fill_price - sl)
 
         trade_id = str(uuid.uuid4())
         opened_at = utc_now().isoformat()
@@ -1442,7 +1454,29 @@ class TradeExecutor:
                             }
                         )
                         if dca_enabled() and dca_entry_count(metadata) <= 1:
-                            metadata.update(build_dca_plan(fill_price, sl))
+                            wallet = 0.0
+                            try:
+                                wallet = float(
+                                    self.exchange.get_futures_balance(force_refresh=False)
+                                    or 0.0
+                                )
+                            except Exception:
+                                wallet = 0.0
+                            metadata.update(
+                                build_dca_plan(
+                                    fill_price,
+                                    sl,
+                                    structure=structure,
+                                    wallet=wallet,
+                                    entry1_qty=quantity,
+                                    leverage=leverage,
+                                    side=action,
+                                )
+                            )
+                            capped_sl = resolved_final_sl(metadata, action)
+                            if capped_sl > 0:
+                                sl = capped_sl
+                                trade_data["stop_loss"] = sl
                         self._apply_execution_levels(
                             trade_id=trade_id,
                             fill_price=fill_price,
@@ -1530,32 +1564,32 @@ class TradeExecutor:
         trade: dict[str, Any],
         step: int,
         current_price: float,
-    ) -> bool:
+    ) -> Optional[dict[str, Any]]:
         """Add Entry 2 or 3 using 1% of wallet. Does not move TP or Base Entry Price."""
         if not dca_enabled() or Config.DRY_RUN:
-            return False
+            return None
         if step not in (2, 3):
-            return False
+            return None
         symbol = str(trade.get("symbol") or "")
         side = str(trade.get("side") or "LONG").upper()
         if not symbol or current_price <= 0:
-            return False
+            return None
         metadata = self.db.parse_trade_metadata(trade)
         stage = entry_stage_of(trade, metadata)
         # Stage must already be claimed (from_stage+1) so restarts cannot re-fire.
         if stage != step:
-            return False
+            return None
         base = safe_float(metadata.get("base_entry_price")) or safe_float(
             trade.get("entry_price")
         )
         if base <= 0:
-            return False
+            return None
         if self.exchange.is_rest_blocked()[0]:
-            return False
+            return None
 
         balance = self.exchange.get_futures_balance(force_refresh=False)
         if balance <= 0:
-            return False
+            return None
         rules = self.exchange.get_symbol_rules(symbol)
         notional = balance * dca_add_wallet_fraction()
         quantity = notional / current_price
@@ -1579,7 +1613,7 @@ class TradeExecutor:
             rules.quantity_precision,
         )
         if quantity <= 0:
-            return False
+            return None
 
         order_side = "BUY" if side == "LONG" else "SELL"
         try:
@@ -1596,22 +1630,32 @@ class TradeExecutor:
             error_logger.error(
                 "DCA entry %s failed for %s: %s", step, symbol, exc
             )
-            return False
+            return None
         if not isinstance(response, dict):
-            return False
+            return None
 
         add_qty = safe_float(response.get("executedQty")) or quantity
         prior_qty = safe_float(trade.get("quantity"))
         new_qty = prior_qty + add_qty
         mark_dca_filled(metadata, step)
-        metadata[f"dca_entry{step}_fill"] = safe_float(response.get("avgPrice")) or current_price
+        live_mark = 0.0
+        try:
+            live_mark = safe_float(
+                self.exchange.get_market_price(symbol, side)
+            )
+        except Exception:
+            live_mark = 0.0
+        fill_price = resolve_binance_fill_price(
+            response, fallback=live_mark or current_price
+        )
+        metadata[f"dca_entry{step}_fill"] = fill_price
         metadata[f"dca_entry{step}_qty"] = add_qty
         patch: dict[str, Any] = {
             "quantity": new_qty,
             "entry_stage": step,
             "metadata": metadata,
         }
-        # Final SL is anchored on the Entry 3 *trigger* — never Binance avg entry.
+        # Final SL is the Entry-1 plan (wallet-capped) — never Binance avg entry.
         if step >= 3:
             final_sl = resolved_final_sl(metadata, side)
             if final_sl > 0:
@@ -1635,16 +1679,33 @@ class TradeExecutor:
         self.db.update_trade(str(trade["trade_id"]), patch)
         trade.update(patch)
         self.exchange.seed_position_after_fill(symbol, side, new_qty, base)
+        sl_now = safe_float(patch.get("stop_loss")) or safe_float(trade.get("stop_loss"))
         trade_logger.info(
             "[DCA] Entry %s filled %s %s | add_qty=%.8f total=%.8f | "
-            "base_entry=%.6f entry3_ref=%.6f sl=%s (TP unchanged)",
+            "fill=%.6f base_entry=%.6f entry3_ref=%.6f sl=%s (TP unchanged)",
             step,
             symbol,
             side,
             add_qty,
             new_qty,
+            fill_price,
             base,
             safe_float(metadata.get("dca_entry3_px")),
-            f"{safe_float(patch.get('stop_loss')):.6f}" if step >= 3 else "held",
+            f"{sl_now:.6f}" if step >= 3 else "held",
         )
-        return True
+        return {
+            "ok": True,
+            "step": step,
+            "symbol": symbol,
+            "side": side,
+            "fill_price": fill_price,
+            "live_price": live_mark,
+            "planned_price": safe_float(metadata.get(f"dca_entry{step}_px")),
+            "add_qty": add_qty,
+            "total_qty": new_qty,
+            "base_entry": base,
+            "entry2": safe_float(metadata.get("dca_entry2_px")),
+            "entry3": safe_float(metadata.get("dca_entry3_px")),
+            "stop_loss": sl_now,
+            "sl_armed": step >= 3,
+        }

@@ -109,6 +109,9 @@ class TierFunnel:
         self._digest_demoted: list[tuple[str, str]] = []
         self._digest_started: float = 0.0
         self._super_skip_tg_at: dict[str, float] = {}
+        self._day_validation_until: float = 0.0
+        self._day_validation_started: float = 0.0
+        self._day_validation_initial: int = 0
 
     @property
     def normal_symbols(self) -> list[str]:
@@ -494,14 +497,31 @@ class TierFunnel:
         return self._super.get(key)
 
     def take_super_batch(self, now: float | None = None) -> list[SuperRecord]:
-        """Evaluate every parked Super coin the minute clock still allows (no roster cap)."""
-        n = min(self._super_clock.remaining(now), len(self._super_order))
+        """WS-only Super + Check-Phase batch: every parked Super coin this tick.
+
+        Local kline eval is not REST. Do not use the old 4/min Super clock here
+        — that clock was the implicit ~2-trade throttle. Execution still honors
+        MAX_POSITIONS, the entry governor, and the 1s ORDER REST lane.
+        """
+        _ = now
+        cap = Config.super_eval_batch_size()
         out: list[SuperRecord] = []
-        for _ in range(n):
-            rec = self.take_super(now=now)
-            if rec is None:
+        seen: set[str] = set()
+        order = list(self._super_order)
+        if not order:
+            return out
+        start = self._super_index % len(order)
+        for offset in range(len(order)):
+            if len(out) >= cap:
                 break
+            key = order[(start + offset) % len(order)]
+            rec = self._super.get(key)
+            if rec is None or key in seen:
+                continue
+            seen.add(key)
             out.append(rec)
+        if out:
+            self._super_index = (start + len(out)) % max(len(order), 1)
         return out
 
     def promote_from_normal(
@@ -813,12 +833,76 @@ class TierFunnel:
             scanner_logger.info("[TIER_SUPER] cleared %s after fill", key)
 
     def demote_super(self, symbol: str, *, reason: str) -> None:
+        self.demote_super_to_normal(symbol, reason=reason)
+
+    def demote_super_to_normal(self, symbol: str, *, reason: str) -> None:
+        """Drop Super and put the coin back on the Normal scan cycle."""
         key = str(symbol).upper()
+        if key not in self._super and key not in self._super_order:
+            return
         self.drop_super(key)
         self._promoted.discard(key)
+        if key and key not in {s.upper() for s in self._normal}:
+            self._normal.append(key)
         if key not in {s.upper() for s in self._demoted_hold}:
             self._demoted_hold.append(key)
-        scanner_logger.info("[TIER_SUPER] demote %s — %s", key, reason)
+        scanner_logger.info("[TIER_SUPER] demote %s → Normal — %s", key, reason)
+        self._emit(
+            "⬇️ <b>Super → Normal</b>\n"
+            f"🪙 {key}\n"
+            f"<i>{reason}</i>",
+            instant=False,
+            digest=f"⬇️ Super demote {key} — {reason}",
+            digest_demote=(key, reason),
+        )
+
+    def begin_day_validation(self, *, now: float | None = None) -> float:
+        """Pause Super execution for N Super coins × seconds-per-coin."""
+        stamp = time.monotonic() if now is None else now
+        count = len(self._super_order)
+        if count <= 0:
+            self._day_validation_until = 0.0
+            self._day_validation_started = 0.0
+            self._day_validation_initial = 0
+            return 0.0
+        per = Config.day_validation_seconds_per_super()
+        duration = min(float(count * per), float(Config.day_validation_max_seconds()))
+        self._day_validation_started = stamp
+        self._day_validation_until = stamp + duration
+        self._day_validation_initial = count
+        scanner_logger.info(
+            "[TIER_SUPER] new-day validation window %.0fs for %s Super coin(s).",
+            duration,
+            count,
+        )
+        return duration
+
+    def day_validation_active(self, now: float | None = None) -> bool:
+        stamp = time.monotonic() if now is None else now
+        return self._day_validation_until > 0 and stamp < self._day_validation_until
+
+    def day_validation_remaining(self, now: float | None = None) -> float:
+        stamp = time.monotonic() if now is None else now
+        if self._day_validation_until <= 0:
+            return 0.0
+        return max(self._day_validation_until - stamp, 0.0)
+
+    def maybe_finish_day_validation(self, now: float | None = None) -> bool:
+        """True once when the window expires and Super execution may resume."""
+        stamp = time.monotonic() if now is None else now
+        if self._day_validation_until <= 0:
+            return False
+        if stamp < self._day_validation_until:
+            return False
+        count = self._day_validation_initial
+        self._day_validation_until = 0.0
+        self._day_validation_started = 0.0
+        self._day_validation_initial = 0
+        scanner_logger.info(
+            "[TIER_SUPER] new-day validation complete (started with %s) — Super execution resumed.",
+            count,
+        )
+        return True
 
     def hot_summary(self) -> list[tuple[str, str, float]]:
         rows = [

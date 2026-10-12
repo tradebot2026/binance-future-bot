@@ -7,7 +7,7 @@ Pause state blocks new entries only — open-position monitoring continues in Tr
 from __future__ import annotations
 
 import time
-from typing import Optional, TYPE_CHECKING
+from typing import Callable, Optional, TYPE_CHECKING
 
 from config import Config
 from constants import DAILY_STATUS_ACTIVE, DAILY_STATUS_PAUSED
@@ -52,6 +52,11 @@ class DailyScheduler:
         self._last_limit_check_at = 0.0
         self._limit_check_interval = float(Config.BALANCE_CACHE_TTL_SECONDS)
         self._startup_initialized = False
+        self._on_day_rollover: Optional[Callable[[str], None]] = None
+
+    def attach_day_rollover_hook(self, hook: Callable[[str], None]) -> None:
+        """Called after UTC day reset so Super can enter the validation window."""
+        self._on_day_rollover = hook
 
     def ensure_startup_initialized(self) -> None:
         """Initialize daily stats once WS/REST balance is available (startup retries)."""
@@ -294,6 +299,14 @@ class DailyScheduler:
             self.telegram.send_message(
                 f"🔄 <b>New trading day started</b>: {current_day} (UTC)"
             )
+        hook = getattr(self, "_on_day_rollover", None)
+        if callable(hook):
+            try:
+                hook(current_day)
+            except Exception as exc:
+                system_logger.error(
+                    "New-day Super validation hook failed: %s", exc
+                )
 
     def _initialize_trading_day(self, force_balance_refresh: bool) -> None:
         baseline = on_utc_day_rollover(

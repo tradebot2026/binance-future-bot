@@ -29,15 +29,14 @@ from risk_manager import RiskManager
 from core.instance_lock import acquire_main_lock, release_main_lock
 from core.minute_clock import MinuteScanClock
 from reconciliation import (
-    reconcile_positions,
     reconcile_positions_at_startup,
-    reconcile_uncertain_executions,
 )
 from scheduler import DailyScheduler
 from telegram_bot import TelegramManager
 from core.dca_plan import telegram_dca_levels
 from utils import safe_float, utc_today_str
 from core.monitor_watchdog import start_monitor_watchdog
+from core.ops_workers import BackgroundOps, start_background_ops
 from core.validation_queue import AsyncBacktestValidator
 
 try:
@@ -269,6 +268,7 @@ def _execute_candidates(
     critical_alerts: Optional[CriticalAlertService] = None,
     manager: Optional[TradeManager] = None,
     funnel: Any = None,
+    orchestrator: Any = None,
 ) -> None:
     entries_this_cycle = 0
 
@@ -375,6 +375,33 @@ def _execute_candidates(
                             strategy=normalized["strategy"],
                         )
                         break
+
+            if orchestrator is not None:
+                preflight = getattr(orchestrator, "preflight_live_candidate", None)
+                if callable(preflight):
+                    live_ok, live_reason, refreshed = preflight(normalized)
+                    if not live_ok:
+                        log_execution_rejected(
+                            symbol,
+                            f"preflight live re-check failed — {live_reason}",
+                            strategy=normalized["strategy"],
+                        )
+                        skip_fn = getattr(funnel, "note_super_skip", None)
+                        if callable(skip_fn):
+                            skip_fn(symbol, live_reason, instant=False)
+                        continue
+                    if isinstance(refreshed, dict) and refreshed:
+                        for key in (
+                            "price",
+                            "atr",
+                            "score",
+                            "strategy",
+                            "action",
+                            "structure_metadata",
+                        ):
+                            if key in refreshed and refreshed[key] not in (None, "", 0, 0.0):
+                                normalized[key] = refreshed[key]
+                        action = normalized["action"]
 
             attach_native = bool(Config.ENABLE_NATIVE_TP_SL)
             result: Optional[dict[str, Any]] = executor.execute_trade(
@@ -658,6 +685,7 @@ def main(controller: Optional[BotController] = None) -> str:
     tg: Optional[TelegramManager] = None
     manager: Optional[TradeManager] = None
     validator: Optional[AsyncBacktestValidator] = None
+    background_ops: Optional[BackgroundOps] = None
     shutdown_done = False
     try:
         tg = TelegramManager(
@@ -690,6 +718,9 @@ def main(controller: Optional[BotController] = None) -> str:
         if scanner is not None and scanner.orchestrator is not None:
             scanner.orchestrator.attach_validator(validator)
             scanner.orchestrator.attach_telegram(tg)
+            scheduler.attach_day_rollover_hook(
+                scanner.orchestrator.on_utc_day_rollover
+            )
         if Config.ENABLE_ASYNC_BACKTEST_VALIDATION:
             validator.start()
 
@@ -725,14 +756,19 @@ def main(controller: Optional[BotController] = None) -> str:
             _bootstrap_scan_universe_at_startup(scanner, exchange, market_data)
 
         start_monitor_watchdog(market_data, telegram=tg, stop_event=manager.stop_event)
+        background_ops = start_background_ops(
+            exchange,
+            db,
+            telegram=tg,
+            manager=manager,
+            executor=executor,
+            controller=controller,
+        )
 
         system_logger.info("Initialization complete. Entering main trading loop.")
 
         last_heartbeat = time.monotonic()
-        last_uncertain_reconcile = 0.0
         last_report_day = ""
-        last_reconciliation = time.monotonic()
-        last_maintenance = time.monotonic()
         cycle = 0
         consecutive_errors = 0
         scan_clock = MinuteScanClock(
@@ -754,34 +790,11 @@ def main(controller: Optional[BotController] = None) -> str:
                 if not rest_blocked and not exchange._full_init_done:
                     exchange.ensure_initialized()
 
-                # Step 1 — Periodic DB/exchange reconciliation (every 15 min)
-                now_mono = time.monotonic()
+                # Step 1 — Adopt WS fills (fast). Periodic REST reconcile + VACUUM
+                # run on ops-reconcile / ops-db-maint workers, not this tick loop.
                 _adopt_pending_user_fills(
                     market_data, executor, tg, scheduler, risk, manager, funnel=funnel
                 )
-                if (
-                    now_mono - last_uncertain_reconcile
-                    >= Config.UNCERTAIN_ORDER_RECONCILE_SECONDS
-                    and not rest_blocked
-                ):
-                    late = reconcile_uncertain_executions(exchange, executor)
-                    if late:
-                        system_logger.info(
-                            "Late-fill reconcile confirmed %s position(s).", late
-                        )
-                    last_uncertain_reconcile = now_mono
-                if now_mono - last_reconciliation >= Config.RECONCILIATION_INTERVAL_SECONDS:
-                    if not rest_blocked:
-                        reconcile_positions(
-                            exchange, db, tg, manager=manager, context="periodic"
-                        )
-                    db.cleanup_expired_cooldowns()
-                    last_reconciliation = now_mono
-
-                # Step 1b — Periodic DB purge + VACUUM (default: daily)
-                if now_mono - last_maintenance >= Config.DB_MAINTENANCE_INTERVAL_SECONDS:
-                    db.run_maintenance(retention_days=Config.DB_RETENTION_DAYS, vacuum=True)
-                    last_maintenance = now_mono
 
                 # Step 2 — 3-tier scanner always ticks; entry gate only blocks Super orders
                 if scanner is None:
@@ -797,9 +810,11 @@ def main(controller: Optional[BotController] = None) -> str:
                         )
                 else:
                     if scan_clock.due():
+                        scheduler.check_daily_limits()
                         candidates = scanner.process_priority_scan_cycle()
                         allowed, gate_reason = _entries_allowed(scheduler, risk, db)
                         can_place = allowed and not rest_blocked
+                        orch = getattr(scanner, "orchestrator", None)
                         if Config.ENABLE_THREE_TIER_FUNNEL:
                             if can_place and candidates:
                                 _execute_candidates(
@@ -812,6 +827,7 @@ def main(controller: Optional[BotController] = None) -> str:
                                     critical_alerts=critical_alerts,
                                     manager=manager,
                                     funnel=funnel,
+                                    orchestrator=orch,
                                 )
                             elif not allowed and gate_reason:
                                 system_logger.info("Entries paused: %s", gate_reason)
@@ -835,6 +851,7 @@ def main(controller: Optional[BotController] = None) -> str:
                                         critical_alerts=critical_alerts,
                                         manager=manager,
                                         funnel=funnel,
+                                        orchestrator=getattr(scanner, "orchestrator", None),
                                     )
                             elif gate_reason:
                                 system_logger.info("Entries paused: %s", gate_reason)
@@ -859,6 +876,7 @@ def main(controller: Optional[BotController] = None) -> str:
                                     critical_alerts=critical_alerts,
                                     manager=manager,
                                     funnel=funnel,
+                                    orchestrator=getattr(scanner, "orchestrator", None),
                                 )
 
                 # Step 3 — Optional daily CSV export (once per UTC day)
@@ -910,6 +928,8 @@ def main(controller: Optional[BotController] = None) -> str:
 
         # Graceful shutdown
         shutdown_done = True
+        if background_ops is not None:
+            background_ops.stop()
         if validator is not None:
             validator.stop()
         if manager is not None:
@@ -926,6 +946,8 @@ def main(controller: Optional[BotController] = None) -> str:
         return "stop"
     finally:
         if not shutdown_done:
+            if background_ops is not None:
+                background_ops.stop()
             if validator is not None:
                 validator.stop()
             if manager is not None:

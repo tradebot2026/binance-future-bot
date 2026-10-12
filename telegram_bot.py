@@ -317,7 +317,9 @@ class TelegramManager:
                 f"📊 <b>Backtest WR:</b> {backtest_win_rate:.1f}% "
                 f"({int(backtest_wins)}/{int(backtest_trades)} Wins)\n"
             )
-        msg += f"💵 <b>Entry:</b> {price:.6f}\n"
+        display_px = self._actual_display_price(symbol, price, action)
+        if display_px > 0:
+            msg += f"💵 <b>Fill (Binance):</b> {display_px:.6f}\n"
         if quantity > 0:
             msg += f"📦 <b>Size:</b> {quantity:.4f}\n"
 
@@ -368,6 +370,9 @@ class TelegramManager:
         strategy: str = "",
         *,
         trade_id: str = "",
+        exit_price: float = 0.0,
+        live_price: float = 0.0,
+        side: str = "",
     ) -> None:
         from core.close_notification_guard import try_claim_close_notification
 
@@ -378,7 +383,11 @@ class TelegramManager:
             return
 
         reason_upper = reason.upper()
-        if pnl is not None and pnl > 0:
+        external = reason_upper.startswith("RECONCILED")
+        if external:
+            emoji = "ℹ️"
+            title = "CLOSED EXTERNALLY (BINANCE)"
+        elif pnl is not None and pnl > 0:
             if "STOP" in reason_upper:
                 emoji = "🎯"
                 title = "TRAILING / PROFIT SL HIT"
@@ -401,11 +410,14 @@ class TelegramManager:
             emoji = "ℹ️"
             title = "POSITION CLOSED"
 
+        close_px = self._actual_display_price(symbol, exit_price, side, live_price)
         msg = (
             f"{emoji} <b>{escape_html(title)}</b>\n\n"
             f"🪙 <b>Pair:</b> {escape_html(symbol)}\n"
             f"📌 <b>Trigger:</b> {escape_html(reason)}"
         )
+        if close_px > 0:
+            msg += f"\n💵 <b>Close fill:</b> {close_px:.6f}"
         if strategy:
             msg += f"\n🧠 <b>Strategy:</b> {escape_html(strategy_display_label(strategy))}"
         if pnl is not None:
@@ -424,17 +436,119 @@ class TelegramManager:
         reason: str,
         new_sl: Optional[float] = None,
         pnl: Optional[float] = None,
+        *,
+        fill_price: float = 0.0,
+        quantity: float = 0.0,
+        side: str = "",
+        live_price: float = 0.0,
     ) -> None:
+        close_px = self._actual_display_price(symbol, fill_price, side, live_price)
         msg = (
             f"✅ <b>{escape_html(level)} HIT</b>\n\n"
             f"🪙 <b>Pair:</b> {escape_html(symbol)}\n"
             f"📌 <b>Action:</b> {escape_html(reason)}"
         )
+        if close_px > 0:
+            msg += f"\n💵 <b>Close fill:</b> {close_px:.6f}"
+        if quantity > 0:
+            msg += f"\n📦 <b>Closed size:</b> {quantity:.4f}"
         if new_sl is not None:
             msg += f"\n🛑 <b>New SL:</b> {new_sl:.6f}"
         if pnl is not None:
             msg += f"\n💰 <b>Partial PnL:</b> ${pnl:.4f}"
         self.send_message(msg)
+
+    def send_dca_alert(
+        self,
+        symbol: str,
+        side: str,
+        step: int,
+        *,
+        fill_price: float,
+        planned_price: float = 0.0,
+        add_qty: float = 0.0,
+        total_qty: float = 0.0,
+        entry2: float = 0.0,
+        entry3: float = 0.0,
+        stop_loss: float = 0.0,
+        sl_armed: bool = False,
+        live_price: float = 0.0,
+    ) -> None:
+        fill_px = self._actual_display_price(symbol, fill_price, side, live_price)
+        remaining_step = 3 if step == 2 else 0
+        remaining_px = entry3 if step == 2 else 0.0
+        msg = (
+            f"🔄 <b>DCA ENTRY {int(step)} FILLED</b>\n\n"
+            f"🪙 <b>Pair:</b> {escape_html(symbol)}\n"
+            f"🎯 <b>Side:</b> {escape_html(side)}"
+        )
+        if planned_price > 0:
+            msg += f"\n📐 <b>Planned:</b> {planned_price:.6f}"
+        if fill_px > 0:
+            msg += f"\n💵 <b>Fill (Binance):</b> {fill_px:.6f}"
+        if add_qty > 0:
+            msg += f"\n📦 <b>Add size:</b> {add_qty:.4f}"
+        if total_qty > 0:
+            msg += f"\n📦 <b>Total size:</b> {total_qty:.4f}"
+        if remaining_step and remaining_px > 0:
+            msg += (
+                f"\n\n🔄 <b>Remaining map</b> <i>(from base entry)</i>\n"
+                f"   • Entry {remaining_step}: {remaining_px:.6f}"
+            )
+        if stop_loss > 0:
+            if sl_armed:
+                msg += f"\n🛑 <b>SL armed:</b> {stop_loss:.6f}"
+            else:
+                msg += f"\n🛑 <b>Fixed SL (after Entry 3):</b> {stop_loss:.6f}"
+        self.send_message(msg)
+
+    def send_sl_move_alert(
+        self,
+        symbol: str,
+        *,
+        old_sl: float,
+        new_sl: float,
+        live_price: float = 0.0,
+        kind: str = "TRAILING",
+        side: str = "",
+    ) -> None:
+        mark = self._actual_display_price(symbol, live_price, side)
+        label = "BREAK-EVEN" if str(kind).upper() in {"BE", "BREAK-EVEN", "BREAKEVEN"} else "TRAILING"
+        msg = (
+            f"🛡 <b>SL {escape_html(label)} MOVE</b>\n\n"
+            f"🪙 <b>Pair:</b> {escape_html(symbol)}\n"
+            f"🛑 <b>Previous SL:</b> {old_sl:.6f}\n"
+            f"🛑 <b>New SL:</b> {new_sl:.6f}"
+        )
+        if mark > 0:
+            msg += f"\n💵 <b>Live price:</b> {mark:.6f}"
+        self.send_message(msg)
+
+    def _actual_display_price(
+        self,
+        symbol: str,
+        preferred: float = 0.0,
+        side: str = "",
+        live_price: float = 0.0,
+    ) -> float:
+        """Prefer Binance fill/trigger; live ticker only when fill is missing."""
+        px = safe_float(preferred)
+        if px > 0:
+            return px
+        live = safe_float(live_price)
+        if live > 0:
+            return live
+        exchange = getattr(self, "exchange", None)
+        if exchange is not None:
+            try:
+                mark = safe_float(
+                    exchange.get_market_price(symbol, side or "LONG")
+                )
+                if mark > 0:
+                    return mark
+            except Exception:
+                pass
+        return 0.0
 
     # ---------------- Command helpers ----------------
 
@@ -675,8 +789,8 @@ class TelegramManager:
                 f"({escape_html(mode)}{dry}).",
             )
 
-        @self.bot.message_handler(commands=["health", "pulse"])
-        @authorized
+        @self.bot.message_handler(commands=["health", "pulse", "diagnostics"])
+        @authorized(instant=True)
         def health_handler(message: telebot.types.Message) -> None:
             text = format_bot_health_message(
                 exchange=self.exchange,
@@ -684,6 +798,8 @@ class TelegramManager:
                 scanner=self.scanner,
                 controller=self.controller,
                 scheduler=self.scheduler,
+                db=self.db,
+                manager=self.manager,
             )
             self._reply(message, text)
 
@@ -1025,7 +1141,7 @@ class TelegramManager:
                 "/balance — live futures balance\n"
                 "/active — open positions (DB + Binance REST)\n"
                 "/watchlist — 3-tier dynamic scan funnel\n"
-                "/health — system diagnostics (alias /pulse)\n"
+                "/health — system diagnostics (aliases /pulse /diagnostics)\n"
                 "/testtrade SYMBOL — Testnet min-size market order (REST price)\n"
                 "/ping — quick online check\n"
                 "/help — this message",

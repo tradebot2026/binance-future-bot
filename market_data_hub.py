@@ -199,6 +199,7 @@ class MarketDataHub:
         self._last_book_event_at: float = 0.0
         self._last_ws_seen_at: float = 0.0
         self._pending_order_fills: list[dict[str, Any]] = []
+        self._pending_flat_positions: list[dict[str, Any]] = []
         self._bootstrap_series_window: deque[float] = deque()
         self._bootstrap_coin_window: deque[float] = deque()
         self._last_user_event_at: float = 0.0
@@ -940,6 +941,13 @@ class MarketDataHub:
         with self._lock:
             rows = list(self._pending_order_fills)
             self._pending_order_fills.clear()
+            return rows
+
+    def drain_pending_flat_positions(self) -> list[dict[str, Any]]:
+        """ACCOUNT_UPDATE rows that went to qty=0 since the last drain."""
+        with self._lock:
+            rows = list(self._pending_flat_positions)
+            self._pending_flat_positions.clear()
             return rows
 
     def is_ws_warming_up(self) -> bool:
@@ -2064,7 +2072,20 @@ class MarketDataHub:
                             quantity = abs(safe_float(pos.get("pa")))
                             key = (symbol, position_side)
                             if quantity <= 0:
-                                pos_by_key.pop(key, None)
+                                existed = pos_by_key.pop(key, None)
+                                if existed:
+                                    mark = (
+                                        safe_float(pos.get("mp"))
+                                        or safe_float(existed.get("mark_price"))
+                                    )
+                                    self._pending_flat_positions.append(
+                                        {
+                                            "symbol": symbol,
+                                            "positionSide": position_side,
+                                            "mark_price": mark,
+                                            "timestamp": time.time(),
+                                        }
+                                    )
                                 continue
                             existing = pos_by_key.get(key, {})
                             pos_by_key[key] = {

@@ -422,11 +422,91 @@ class TestTelegramBacktestLine(unittest.TestCase):
             )
         msg = tg.send_message.call_args[0][0]
         self.assertIn("NEW TRADE EXECUTED", msg)
+        self.assertIn("Fill (Binance):</b> 8000.000000", msg)
         self.assertIn("DCA map", msg)
         self.assertIn("Entry 2: 7865.000000", msg)
         self.assertIn("Entry 3: 7775.000000", msg)
         self.assertIn("Fixed SL", msg)
         self.assertIn("7700.000000", msg)
+
+    def test_close_alert_includes_binance_fill_price(self) -> None:
+        from telegram_bot import TelegramManager
+
+        tg = TelegramManager.__new__(TelegramManager)
+        tg.send_message = MagicMock()
+        tg.exchange = None
+        tg.send_close_alert(
+            symbol="ETHUSDT",
+            reason="STOP_LOSS",
+            pnl=-1.25,
+            strategy="SMC_TREND",
+            exit_price=99.4321,
+        )
+        msg = tg.send_message.call_args[0][0]
+        self.assertIn("STOP LOSS HIT", msg)
+        self.assertIn("Close fill:</b> 99.432100", msg)
+
+    def test_manual_close_alert_uses_external_title(self) -> None:
+        from telegram_bot import TelegramManager
+
+        tg = TelegramManager.__new__(TelegramManager)
+        tg.send_message = MagicMock()
+        tg.exchange = None
+        tg.send_close_alert(
+            symbol="ETHUSDT",
+            reason="RECONCILED_MANUAL_CLOSE",
+            pnl=-0.5,
+            exit_price=101.25,
+        )
+        msg = tg.send_message.call_args[0][0]
+        self.assertIn("CLOSED EXTERNALLY (BINANCE)", msg)
+        self.assertIn("Close fill:</b> 101.250000", msg)
+
+    def test_tp_alert_includes_fill_price(self) -> None:
+        from telegram_bot import TelegramManager
+
+        tg = TelegramManager.__new__(TelegramManager)
+        tg.send_message = MagicMock()
+        tg.exchange = None
+        tg.send_tp_level_alert(
+            symbol="BTCUSDT",
+            level="TP1",
+            reason="TP1_PARTIAL",
+            new_sl=8000.0,
+            pnl=12.5,
+            fill_price=8210.5,
+            quantity=0.33,
+        )
+        msg = tg.send_message.call_args[0][0]
+        self.assertIn("TP1 HIT", msg)
+        self.assertIn("Close fill:</b> 8210.500000", msg)
+        self.assertIn("Closed size:</b> 0.3300", msg)
+
+    def test_dca_entry_alert_includes_fill_and_size(self) -> None:
+        from telegram_bot import TelegramManager
+
+        tg = TelegramManager.__new__(TelegramManager)
+        tg.send_message = MagicMock()
+        tg.exchange = None
+        tg.send_dca_alert(
+            symbol="BTCUSDT",
+            side="LONG",
+            step=2,
+            fill_price=7864.12,
+            planned_price=7865.0,
+            add_qty=0.012,
+            total_qty=0.112,
+            entry2=7865.0,
+            entry3=7775.0,
+            stop_loss=7700.0,
+            sl_armed=False,
+        )
+        msg = tg.send_message.call_args[0][0]
+        self.assertIn("DCA ENTRY 2 FILLED", msg)
+        self.assertIn("Fill (Binance):</b> 7864.120000", msg)
+        self.assertIn("Add size:</b> 0.0120", msg)
+        self.assertIn("Total size:</b> 0.1120", msg)
+        self.assertIn("Entry 3: 7775.000000", msg)
 
 
 def _ohlcv_ts(n: int, *, minutes: int = 15) -> pd.DataFrame:

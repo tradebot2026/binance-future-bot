@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 import math
 from datetime import datetime, timezone
-from typing import Union
+from typing import Any, Optional, Union
 
 Number = Union[int, float]
 
@@ -130,3 +130,38 @@ def safe_float(value: object, default: float = 0.0) -> float:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return default
+
+
+def resolve_binance_fill_price(
+    response: Optional[dict[str, Any]],
+    *,
+    fallback: float = 0.0,
+) -> float:
+    """Actual Binance fill/avg price from an order response; ticker only as last resort."""
+    if not isinstance(response, dict):
+        return max(safe_float(fallback), 0.0)
+    avg = safe_float(response.get("avgPrice"))
+    if avg > 0:
+        return avg
+    last = safe_float(response.get("lastFilledPrice"))
+    if last > 0:
+        return last
+    executed = safe_float(response.get("executedQty"))
+    cum_quote = safe_float(response.get("cumQuote"))
+    if executed > 0 and cum_quote > 0:
+        return cum_quote / executed
+    fills = response.get("fills")
+    if isinstance(fills, list) and fills:
+        qty_sum = 0.0
+        notional = 0.0
+        for fill in fills:
+            if not isinstance(fill, dict):
+                continue
+            px = safe_float(fill.get("price"))
+            qty = safe_float(fill.get("qty"))
+            if px > 0 and qty > 0:
+                notional += px * qty
+                qty_sum += qty
+        if qty_sum > 0:
+            return notional / qty_sum
+    return max(safe_float(fallback), 0.0)

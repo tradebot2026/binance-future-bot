@@ -49,144 +49,20 @@ def format_bot_health_message(
     scanner: Any = None,
     controller: Any = None,
     scheduler: Any = None,
+    db: Any = None,
+    manager: Any = None,
 ) -> str:
-    """Build /health and /pulse Telegram diagnostic report."""
-    from core.bot_health import (
-        get_monitor_stall_recoveries,
-        get_scan_age_seconds,
-        get_scan_counts,
-        get_uptime_seconds,
-        is_monitor_watchdog_active,
-    )
-    from core.ops_heartbeat import (
-        get_main_stall_seconds,
-        get_monitor_stall_seconds,
-        read_heartbeat_payload,
-    )
-    from utils import escape_html, utc_now
+    """Build /health, /pulse, and /diagnostics from caches + SQLite (no REST)."""
+    from core.diagnostics import format_cache_only_health_message
 
-    now = utc_now()
-    refreshed = now.strftime("%Y-%m-%d %H:%M:%S UTC")
-
-    hb_payload = read_heartbeat_payload()
-    hb_ts = safe_float(hb_payload.get("timestamp"))
-    if hb_ts > 0:
-        hb_age = max(now.timestamp() - hb_ts, 0.0)
-    else:
-        hb_age = get_main_stall_seconds()
-        if hb_age == float("inf"):
-            hb_age = -1.0
-
-    main_stall = get_main_stall_seconds()
-    monitor_stall = get_monitor_stall_seconds()
-    heartbeat_ok = hb_age >= 0 and hb_age <= max(
-        float(Config.HEARTBEAT_SECONDS) * 3, 90.0
-    )
-    if heartbeat_ok:
-        hb_line = f"Alive (Last ping: {_format_duration(hb_age)} ago)"
-    elif hb_age < 0:
-        hb_line = "Unknown (no heartbeat yet)"
-    else:
-        hb_line = f"STALE (Last ping: {_format_duration(hb_age)} ago)"
-
-    hub = market_data
-    if hub is None and exchange is not None:
-        hub = exchange.get_market_data_hub()
-    if hub is not None and hasattr(hub, "get_ws_health_snapshot"):
-        ws = hub.get_ws_health_snapshot()
-        ws_state = str(ws.get("state", "UNKNOWN")).upper()
-        feeds = int(ws.get("active_feeds", 0))
-        tickers = int(ws.get("ticker_symbols", 0))
-        if ws_state in {"HEALTHY", "CONNECTED"}:
-            ws_line = f"HEALTHY ({feeds} active feeds | {tickers} tickers cached)"
-        elif ws_state == "RECONNECTING":
-            ws_line = f"RECONNECTING ({feeds} feeds scheduled)"
-        elif ws_state == "WARMING":
-            ws_line = (
-                f"WARMING ({feeds} feeds | waiting for first tick, "
-                f"age {_format_duration(safe_float(ws.get('ticker_age_seconds', -1)))})"
-            )
-        else:
-            ws_line = f"{ws_state} ({feeds} feeds | ticker age {_format_duration(safe_float(ws.get('ticker_age_seconds', -1)))})"
-    else:
-        ws_line = "UNAVAILABLE (market data hub not attached)"
-
-    engine_stalled = main_stall > max(float(Config.HEARTBEAT_SECONDS) * 2, 60.0)
-    entries_paused = False
-    pause_reason = ""
-    if scheduler is not None:
-        entries_paused, pause_reason = scheduler.is_entry_paused()
-    elif controller is not None:
-        entries_paused, pause_reason = controller.is_manually_paused()
-
-    if engine_stalled:
-        engine_line = "STALLED"
-    elif entries_paused:
-        engine_line = f"IDLE ({escape_html(pause_reason[:60])})" if pause_reason else "IDLE (entries paused)"
-    else:
-        engine_line = "RUNNING"
-
-    scan_age = get_scan_age_seconds()
-    scanned, universe_total = get_scan_counts()
-    if scanner is not None and universe_total <= 0:
-        pipeline = getattr(scanner, "_pipeline", None)
-        if pipeline is not None:
-            syms = getattr(pipeline, "_last_universe_symbols", []) or []
-            universe_total = len(syms)
-            scanned = universe_total
-    if scan_age is None:
-        scan_line = f"No scan yet | Universe: {universe_total} symbols"
-    else:
-        scan_line = (
-            f"Last scan {_format_duration(scan_age)} ago | "
-            f"Scanned: {scanned} / {universe_total} symbols"
-        )
-
-    watchdog_active = is_monitor_watchdog_active()
-    stall_recoveries = get_monitor_stall_recoveries()
-    uptime = _format_duration(get_uptime_seconds())
-    if watchdog_active:
-        watchdog_line = (
-            f"ACTIVE (Monitor stall: {_format_duration(monitor_stall)} | "
-            f"Stalls recovered: {stall_recoveries})"
-        )
-    else:
-        watchdog_line = f"INACTIVE (Stalls recovered: {stall_recoveries})"
-
-    mode = "TESTNET" if Config.USE_TESTNET else "MAINNET"
-    cycle = hb_payload.get("cycle")
-    cycle_line = f"🔄 <b>Main cycle:</b> {cycle}\n" if cycle is not None else ""
-
-    api_line = "UNKNOWN"
-    exec_line = "UNKNOWN"
-    if exchange is not None:
-        if hasattr(exchange, "rest_usage_snapshot"):
-            usage = exchange.rest_usage_snapshot() or {}
-            api_line = (
-                f"{usage.get('state', 'UNKNOWN')} "
-                f"({int(usage.get('requests_1m') or 0)} req/min, "
-                f"weight {int(usage.get('used_weight_1m') or 0)})"
-            )
-        if hasattr(exchange, "get_execution_safety"):
-            exec_state, exec_reason = exchange.get_execution_safety()
-            exec_line = exec_state if exec_state == "EXECUTION_SAFE" else (
-                f"{exec_state} ({exec_reason})" if exec_reason else exec_state
-            )
-
-    return (
-        f"🩺 <b>BOT HEALTH AND DIAGNOSTICS</b>\n"
-        f"🌐 <b>Mode:</b> {escape_html(mode)}\n\n"
-        f"⏱️ <b>Last Refreshed:</b> {refreshed}\n"
-        f"💓 <b>Heartbeat:</b> {escape_html(hb_line)}\n"
-        f"🌐 <b>WebSocket State:</b> {escape_html(ws_line)}\n"
-        f"🛡 <b>API Health:</b> {escape_html(api_line)}\n"
-        f"🚦 <b>Execution:</b> {escape_html(exec_line)}\n"
-        f"🧠 <b>Decision Engine:</b> {escape_html(engine_line)}\n"
-        f"📊 <b>Scanner:</b> {escape_html(scan_line)}\n"
-        f"🛡️ <b>Watchdog:</b> {escape_html(watchdog_line)}\n"
-        f"⏳ <b>Uptime:</b> {uptime}\n"
-        f"{cycle_line}"
-        f"📡 <b>Response:</b> {now.strftime('%H:%M:%S UTC')}"
+    return format_cache_only_health_message(
+        exchange=exchange,
+        market_data=market_data,
+        scanner=scanner,
+        controller=controller,
+        scheduler=scheduler,
+        db=db,
+        manager=manager,
     )
 
 

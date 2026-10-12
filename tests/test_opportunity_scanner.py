@@ -935,5 +935,153 @@ class TestStopLossMarketCloseLoop(unittest.TestCase):
         close.assert_not_called()
 
 
+class TestManualCloseSyncAndFillPrices(unittest.TestCase):
+    def test_rest_zero_allows_close_without_miss_threshold(self) -> None:
+        from datetime import timedelta
+
+        from reconciliation import confirm_external_close_allowed, position_reconcile_guard
+        from utils import utc_now
+
+        trade = {
+            "trade_id": "manual-1",
+            "symbol": "ETHUSDT",
+            "side": "LONG",
+            "opened_at": (utc_now() - timedelta(seconds=200)).isoformat(),
+        }
+        position_reconcile_guard.note_present("manual-1")
+        exchange = MagicMock()
+        exchange.is_rest_blocked.return_value = (False, "")
+        exchange.get_position_quantity_rest.return_value = 0.0
+        self.assertTrue(confirm_external_close_allowed(exchange, trade))
+
+    def test_rest_unavailable_still_defers_without_threshold(self) -> None:
+        from datetime import timedelta
+
+        from reconciliation import confirm_external_close_allowed, position_reconcile_guard
+        from utils import utc_now
+
+        trade = {
+            "trade_id": "manual-2",
+            "symbol": "ETHUSDT",
+            "side": "LONG",
+            "opened_at": (utc_now() - timedelta(seconds=200)).isoformat(),
+        }
+        position_reconcile_guard.note_present("manual-2")
+        exchange = MagicMock()
+        exchange.is_rest_blocked.return_value = (True, "ban")
+        exchange.get_position_quantity_rest.return_value = None
+        self.assertFalse(confirm_external_close_allowed(exchange, trade))
+
+    def test_monitor_rest_flat_closes_as_manual_same_cycle(self) -> None:
+        from datetime import timedelta
+
+        from exchange import ClosedPositionPnl
+        from manager import TradeManager
+        from utils import utc_now
+
+        mgr = TradeManager.__new__(TradeManager)
+        mgr.exchange = MagicMock()
+        mgr.db = MagicMock()
+        mgr.telegram = None
+        mgr.executor = None
+        mgr._dca_stage = {}
+        mgr._dca_inflight = set()
+        mgr._mark_trade_closed = MagicMock()
+        mgr._trade_quantity_from_db = MagicMock(return_value=1.0)
+        mgr.exchange.rest_account_reads_blocked.return_value = False
+        mgr.exchange.get_position_quantity_rest.return_value = 0.0
+        trade = {
+            "trade_id": "t-man",
+            "symbol": "ETHUSDT",
+            "side": "LONG",
+            "opened_at": (utc_now() - timedelta(seconds=200)).isoformat(),
+            "status": "OPEN",
+        }
+        with patch("manager.is_within_position_grace_period", return_value=False), patch(
+            "manager.confirm_external_close_allowed", return_value=True
+        ), patch(
+            "manager.resolve_exchange_close_pnl",
+            return_value=ClosedPositionPnl(
+                realized_pnl=-2.0,
+                exit_price=99.5,
+                source="userTrades",
+                fill_count=1,
+            ),
+        ):
+            mgr._monitor_single_trade(
+                trade, {("ETHUSDT", "LONG"): 0.0}, ws_only=False
+            )
+        mgr._mark_trade_closed.assert_called_once()
+        kwargs = mgr._mark_trade_closed.call_args.kwargs
+        self.assertEqual(kwargs["reason"], "RECONCILED_MANUAL_CLOSE")
+        self.assertEqual(kwargs["exit_price"], 99.5)
+
+    def test_drain_pending_flat_reconciles_manual_close(self) -> None:
+        import threading
+
+        from manager import TradeManager
+
+        mgr = TradeManager.__new__(TradeManager)
+        hub = MagicMock()
+        hub.drain_pending_flat_positions.return_value = [
+            {"symbol": "ETHUSDT", "positionSide": "LONG", "mark_price": 101.0}
+        ]
+        mgr.exchange = MagicMock()
+        mgr.exchange._market_data = hub
+        mgr.db = MagicMock()
+        mgr.db.get_open_trades.return_value = [
+            {"trade_id": "t1", "symbol": "ETHUSDT", "side": "LONG"}
+        ]
+        mgr._close_lock = threading.Lock()
+        mgr._close_inflight = set()
+        mgr._reconcile_exchange_flat = MagicMock(return_value=True)
+        mgr._drain_pending_external_flats()
+        mgr._reconcile_exchange_flat.assert_called_once()
+        self.assertEqual(
+            mgr._reconcile_exchange_flat.call_args.kwargs["exit_reason"],
+            "RECONCILED_MANUAL_CLOSE",
+        )
+
+    def test_account_update_zero_queues_pending_flat(self) -> None:
+        from market_data_hub import MarketDataHub
+
+        hub = MarketDataHub(MagicMock())
+        hub._positions = [
+            {
+                "symbol": "ETHUSDT",
+                "positionSide": "LONG",
+                "quantity": 1.0,
+                "mark_price": 100.0,
+            }
+        ]
+        hub._on_user_message(
+            {
+                "e": "ACCOUNT_UPDATE",
+                "a": {
+                    "B": [],
+                    "P": [{"s": "ETHUSDT", "ps": "LONG", "pa": "0", "mp": "101.5"}],
+                },
+            }
+        )
+        rows = hub.drain_pending_flat_positions()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["symbol"], "ETHUSDT")
+        self.assertAlmostEqual(rows[0]["mark_price"], 101.5)
+
+    def test_binance_fill_price_prefers_avg_over_ticker(self) -> None:
+        from utils import resolve_binance_fill_price
+
+        px = resolve_binance_fill_price(
+            {"avgPrice": "100.25", "executedQty": "2", "cumQuote": "0"},
+            fallback=99.0,
+        )
+        self.assertAlmostEqual(px, 100.25)
+        px = resolve_binance_fill_price(
+            {"avgPrice": "0", "executedQty": "2", "cumQuote": "200.5"},
+            fallback=99.0,
+        )
+        self.assertAlmostEqual(px, 100.25)
+
+
 if __name__ == "__main__":
     unittest.main()

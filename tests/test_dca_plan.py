@@ -8,11 +8,14 @@ from core.dca_plan import (
     apply_initial_dca_plan,
     base_entry_price,
     build_dca_plan,
+    dca_sl_wallet_cap_percent,
     entry_stage_of,
     interpolate_toward_sl,
+    ladder_stop_loss_usd,
     last_resort_sl_hit,
     mark_dca_filled,
     next_dca_step,
+    pick_structural_entries,
     resolved_final_sl,
     should_trigger_add,
     sl_is_armed,
@@ -81,6 +84,50 @@ class TestDcaPlan(unittest.TestCase):
         self.assertAlmostEqual(levels["entry2"], interpolate_toward_sl(8000.0, 7700.0, 0.45))
         self.assertAlmostEqual(levels["entry3"], interpolate_toward_sl(8000.0, 7700.0, 0.75))
         self.assertEqual(levels["final_sl"], 7700.0)
+
+    def test_structural_pullbacks_beat_blind_interpolation(self) -> None:
+        entry2, entry3, used = pick_structural_entries(
+            8000.0,
+            7700.0,
+            {"ob_zone_low": 7900.0, "sweep_level": 7780.0},
+        )
+        self.assertTrue(used)
+        self.assertAlmostEqual(entry2, 7900.0)
+        self.assertAlmostEqual(entry3, 7780.0)
+        plan = build_dca_plan(
+            8000.0, 7700.0, structure={"ob_zone_low": 7900.0, "sweep_level": 7780.0}
+        )
+        self.assertTrue(plan["dca_structural_entries"])
+        self.assertAlmostEqual(plan["dca_entry2_px"], 7900.0)
+        self.assertAlmostEqual(plan["dca_entry3_px"], 7780.0)
+        self.assertEqual(plan["dca_final_sl"], 7700.0)
+
+    def test_wallet_cap_tightens_sl_and_ignores_binance_avg(self) -> None:
+        plan = build_dca_plan(
+            8000.0,
+            7700.0,
+            wallet=10_000.0,
+            entry1_qty=10.0,
+            leverage=20.0,
+            side="LONG",
+        )
+        self.assertTrue(plan["dca_sl_capped"])
+        self.assertEqual(plan["dca_uncapped_sl"], 7700.0)
+        self.assertGreater(plan["dca_final_sl"], 7700.0)
+        self.assertLess(plan["dca_final_sl"], 8000.0)
+        cap = 10_000.0 * (dca_sl_wallet_cap_percent() / 100.0)
+        loss = ladder_stop_loss_usd(
+            8000.0,
+            plan["dca_final_sl"],
+            plan["dca_entry2_px"],
+            plan["dca_entry3_px"],
+            10.0,
+            10_000.0,
+            is_long=True,
+        )
+        self.assertLessEqual(loss, cap + 1.0)
+        self.assertEqual(base_entry_price(plan, fallback=7950.0), 8000.0)
+        self.assertNotAlmostEqual(plan["dca_final_sl"], 7950.0 - 300.0)
 
 
 if __name__ == "__main__":

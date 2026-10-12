@@ -72,6 +72,19 @@ class TestPaceAndGovernor(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("4/min", reason)
 
+    def test_execution_governor_default_matches_position_book(self) -> None:
+        with patch.object(Config, "MAX_POSITIONS", 12), patch.object(
+            Config, "MAX_ORDER_REQUESTS_PER_MINUTE", 4
+        ):
+            self.assertEqual(Config.max_entry_orders_per_minute(), 12)
+            gov = ExecutionGovernor()
+            for _ in range(12):
+                ok, _reason = gov.allow_entry_order()
+                self.assertTrue(ok)
+            ok, reason = gov.allow_entry_order()
+            self.assertFalse(ok)
+            self.assertIn("12/min", reason)
+
 
 class TestTierFunnel(unittest.TestCase):
     def test_normal_lock_and_two_coins_per_minute(self) -> None:
@@ -473,6 +486,21 @@ class TestTierFunnel(unittest.TestCase):
         batch = funnel.take_super_batch(now=10.0)
         names = [rec.symbol for rec in batch]
         self.assertEqual(len(names), 3)
+        self.assertEqual(len(names), len(set(names)))
+
+    def test_take_super_batch_ignores_four_per_minute_clock(self) -> None:
+        funnel = TierFunnel()
+        symbols = ("AAAUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT")
+        funnel.replace_normal_universe(list(symbols), now=1.0)
+        for sym in symbols:
+            funnel.promote_from_normal(sym, [_score(sym, "SMC_TREND", 80.0)])
+            funnel.on_backtest_passed(sym)
+            funnel.apply_hot_scores(sym, [_score(sym, "SMC_TREND", 80.0)])
+        funnel._super_clock = MinuteWindow(1)
+        with patch.object(Config, "MAX_POSITIONS", 12):
+            batch = funnel.take_super_batch(now=10.0)
+        names = [rec.symbol for rec in batch]
+        self.assertEqual(len(names), 5)
         self.assertEqual(len(names), len(set(names)))
 
     def test_release_hot_rest_allows_retry(self) -> None:
@@ -983,6 +1011,41 @@ class TestStartupKlinePace(unittest.TestCase):
         self.assertEqual(batch, ["AAAUSDT", "BBBUSDT"])
         rest_batch = scanner._hub.bootstrap_klines_for_symbols.call_args[0][0]
         self.assertEqual(rest_batch, ["AAAUSDT", "BBBUSDT"])
+
+    def test_day_validation_window_scales_with_super_count(self) -> None:
+        funnel = TierFunnel()
+        symbols = ("AAAUSDT", "ETHUSDT", "BNBUSDT")
+        funnel.replace_normal_universe(list(symbols), now=1.0)
+        for sym in symbols:
+            funnel.promote_from_normal(sym, [_score(sym, "SMC_TREND", 80.0)])
+            funnel.on_backtest_passed(sym)
+            funnel.apply_hot_scores(sym, [_score(sym, "SMC_TREND", 80.0)])
+        with patch.object(Config, "DAY_VALIDATION_SECONDS_PER_SUPER", 180), patch.object(
+            Config, "DAY_VALIDATION_MAX_SECONDS", 2700
+        ):
+            duration = funnel.begin_day_validation(now=1000.0)
+        self.assertEqual(duration, 3 * 180)
+        self.assertTrue(funnel.day_validation_active(now=1000.0))
+        self.assertTrue(funnel.day_validation_active(now=1000.0 + 500))
+        self.assertFalse(funnel.day_validation_active(now=1000.0 + 540))
+        self.assertTrue(funnel.maybe_finish_day_validation(now=1000.0 + 540))
+        self.assertFalse(funnel.day_validation_active(now=1000.0 + 541))
+
+    def test_demote_super_returns_coin_to_normal(self) -> None:
+        funnel = TierFunnel()
+        funnel.replace_normal_universe(["AAAUSDT"], now=1.0)
+        funnel.promote_from_normal("AAAUSDT", [_score("AAAUSDT", "SMC_TREND", 80.0)])
+        funnel.on_backtest_passed("AAAUSDT")
+        funnel.apply_hot_scores("AAAUSDT", [_score("AAAUSDT", "SMC_TREND", 80.0)])
+        self.assertIn("AAAUSDT", funnel.super_symbols)
+        funnel.demote_super_to_normal("AAAUSDT", reason="Day validation: live score 50")
+        self.assertNotIn("AAAUSDT", funnel.super_symbols)
+        self.assertIn("AAAUSDT", funnel.normal_symbols)
+
+    def test_zero_super_skips_validation_window(self) -> None:
+        funnel = TierFunnel()
+        self.assertEqual(funnel.begin_day_validation(now=1.0), 0.0)
+        self.assertFalse(funnel.day_validation_active(now=1.0))
 
 
 if __name__ == "__main__":

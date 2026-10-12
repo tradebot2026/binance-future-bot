@@ -217,10 +217,13 @@ def rest_position_quantity(
 def confirm_external_close_allowed(
     exchange: "BinanceExchangeManager",
     trade: dict[str, Any],
+    *,
+    urgent: bool = True,
 ) -> bool:
     """
-    True only when miss threshold is met AND REST confirms positionAmt == 0.
-    Never closes on WS/cache misses alone.
+    True when REST confirms positionAmt == 0 after the open-fill grace period.
+    Never closes on WS/cache misses alone. Miss threshold is only a fallback
+    while REST is unavailable (do not close until REST returns 0).
     """
     trade_id = str(trade["trade_id"])
     symbol = str(trade["symbol"]).upper()
@@ -229,11 +232,12 @@ def confirm_external_close_allowed(
     if is_within_position_grace_period(trade):
         return False
 
-    if not position_reconcile_guard.should_confirm_external_close(trade):
-        return False
-
-    rest_qty = rest_position_quantity(exchange, symbol, position_side)
+    rest_qty = rest_position_quantity(
+        exchange, symbol, position_side, urgent=urgent
+    )
     if rest_qty is None:
+        if not position_reconcile_guard.should_confirm_external_close(trade):
+            return False
         system_logger.warning(
             "Deferring external close — REST verification unavailable: %s %s | id=%s",
             symbol,
@@ -492,6 +496,34 @@ def reconcile_positions(
                         trade["symbol"],
                         trade["side"],
                         trade_id[:8],
+                    )
+                    continue
+
+                rest_qty = rest_position_quantity(
+                    exchange,
+                    str(trade["symbol"]),
+                    str(trade.get("side", "LONG")),
+                    urgent=True,
+                )
+                if rest_qty is not None and rest_qty > 0:
+                    position_reconcile_guard.note_present(trade_id)
+                    continue
+                if rest_qty is not None and rest_qty <= 0:
+                    closed_pnl = finalize_reconciled_trade_close(
+                        exchange,
+                        db,
+                        trade,
+                        "RECONCILED_MANUAL_CLOSE",
+                        manager=manager,
+                    )
+                    position_reconcile_guard.note_present(trade_id)
+                    closed_externally += 1
+                    system_logger.warning(
+                        "Purged DB trade after REST-confirmed manual close: %s %s | id=%s | exchange_pnl=%.4f",
+                        trade["symbol"],
+                        trade["side"],
+                        trade_id[:8],
+                        closed_pnl,
                     )
                     continue
 
