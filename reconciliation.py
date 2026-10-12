@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import Any, Optional, TYPE_CHECKING
 
@@ -48,31 +49,32 @@ def resolve_exchange_close_pnl(
     trade: dict[str, Any],
 ) -> ClosedPositionPnl:
     """
-    Fetch authoritative realized PnL from Binance userTrades/income.
+    Fetch authoritative realized PnL from Binance userTrades/income/WS fills.
     Falls back to local price estimate only when REST history is unavailable.
     """
     symbol = str(trade.get("symbol", "")).upper()
     side = str(trade.get("side", "LONG")).upper()
     opened_ms = trade_opened_at_ms(trade)
+    if opened_ms <= 0:
+        opened_ms = max(int(time.time() * 1000) - 7 * 24 * 60 * 60 * 1000, 0)
 
-    if opened_ms > 0:
-        api_pnl = exchange.fetch_closed_position_realized_pnl(
-            symbol, side, opened_ms
+    api_pnl = exchange.fetch_closed_position_realized_pnl(
+        symbol, side, opened_ms, rest_retries=3
+    )
+    if api_pnl.source in ("userTrades", "income", "ws"):
+        if api_pnl.exit_price <= 0:
+            mark = safe_float(exchange.get_market_price(symbol, side))
+            if mark > 0:
+                api_pnl.exit_price = mark
+        trade_logger.info(
+            "[%s] Exchange PnL from %s | realized=%.4f | fills=%s | exit=%.6f",
+            symbol,
+            api_pnl.source,
+            api_pnl.realized_pnl,
+            api_pnl.fill_count,
+            api_pnl.exit_price,
         )
-        if api_pnl.source in ("userTrades", "income"):
-            if api_pnl.exit_price <= 0:
-                mark = safe_float(exchange.get_market_price(symbol, side))
-                if mark > 0:
-                    api_pnl.exit_price = mark
-            trade_logger.info(
-                "[%s] Exchange PnL from %s | realized=%.4f | fills=%s | exit=%.6f",
-                symbol,
-                api_pnl.source,
-                api_pnl.realized_pnl,
-                api_pnl.fill_count,
-                api_pnl.exit_price,
-            )
-            return api_pnl
+        return api_pnl
 
     exit_price = safe_float(exchange.get_market_price(symbol, side))
     estimated = db.estimate_trade_pnl(trade, exit_price)

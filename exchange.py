@@ -2370,6 +2370,42 @@ class BinanceExchangeManager:
     def _closing_trade_side(position_side: str) -> str:
         return "SELL" if position_side.upper() == "LONG" else "BUY"
 
+    def _closed_pnl_from_ws(
+        self,
+        symbol: str,
+        position_side: str,
+        start_ms: int,
+    ) -> Optional[ClosedPositionPnl]:
+        hub = getattr(self, "_market_data", None)
+        tracker = getattr(hub, "fill_tracker", None) if hub is not None else None
+        if tracker is None or not hasattr(tracker, "aggregate_for_position"):
+            return None
+        close_side = self._closing_trade_side(position_side)
+        ws_fill = tracker.aggregate_for_position(
+            symbol,
+            position_side,
+            since_ms=max(start_ms, 0),
+            close_side=close_side,
+        )
+        if ws_fill is None:
+            return None
+        result = ClosedPositionPnl(
+            realized_pnl=ws_fill.realized_pnl,
+            commission=ws_fill.commission,
+            exit_price=ws_fill.fill_price,
+            fill_count=1 if ws_fill.fill_qty > 0 or abs(ws_fill.realized_pnl) > 1e-12 else 0,
+            source="ws",
+        )
+        if result.fill_count <= 0 and abs(result.realized_pnl) <= 1e-12:
+            return None
+        trade_logger.info(
+            "[%s] Close PnL from WS fills | rp=%.4f | px=%.6f",
+            symbol,
+            result.realized_pnl,
+            result.exit_price,
+        )
+        return result
+
     def fetch_closed_position_realized_pnl(
         self,
         symbol: str,
@@ -2377,32 +2413,80 @@ class BinanceExchangeManager:
         opened_at_ms: int,
         *,
         until_ms: Optional[int] = None,
+        rest_retries: int = 1,
     ) -> ClosedPositionPnl:
         """
         Sum realized PnL from Binance userTrades (preferred) or income history.
         Used when a DB trade is closed externally on the exchange.
+        Only closing fills (or non-zero realizedPnl) count as a completed fetch —
+        entry fills with rp=0 are not treated as the close result.
         """
         symbol = symbol.upper()
         position_side = position_side.upper()
         close_side = self._closing_trade_side(position_side)
-        result = ClosedPositionPnl()
+        now_ms = int(time.time() * 1000)
+        if opened_at_ms <= 0:
+            opened_at_ms = max(now_ms - 7 * 24 * 60 * 60 * 1000, 0)
+        start_ms = max(opened_at_ms - 60_000, 0)
+        end_ms = until_ms or now_ms
 
+        ws_pnl = self._closed_pnl_from_ws(symbol, position_side, start_ms)
+        if ws_pnl is not None:
+            return ws_pnl
+
+        result = ClosedPositionPnl()
         if self.is_rest_blocked()[0]:
             return result
 
-        start_ms = max(opened_at_ms - 60_000, 0)
-        end_ms = until_ms or int(time.time() * 1000)
+        attempts = max(int(rest_retries), 1)
+        for attempt in range(1, attempts + 1):
+            user_pnl = self._fetch_user_trades_close_pnl(
+                symbol, position_side, close_side, start_ms, end_ms
+            )
+            if user_pnl.source == "userTrades":
+                return user_pnl
+            income_pnl = self._fetch_income_close_pnl(symbol, start_ms, end_ms)
+            if income_pnl.source == "income":
+                return income_pnl
+            if user_pnl.source != "unknown":
+                result = user_pnl
+            elif income_pnl.source != "unknown":
+                result = income_pnl
+            if attempt < attempts:
+                time.sleep(1.0 * attempt)
+                end_ms = int(time.time() * 1000)
+                ws_pnl = self._closed_pnl_from_ws(symbol, position_side, start_ms)
+                if ws_pnl is not None:
+                    return ws_pnl
 
+        return result
+
+    def _fetch_user_trades_close_pnl(
+        self,
+        symbol: str,
+        position_side: str,
+        close_side: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> ClosedPositionPnl:
+        result = ClosedPositionPnl()
         try:
-            rows = self._throttled_call(
+            raw = self._throttled_call(
                 self.client.futures_account_trades,
                 symbol=symbol,
                 startTime=start_ms,
                 limit=1000,
+                execution_priority=True,
+                bypass_account_cache=True,
             )
+            payload = self._coerce_api_payload(raw)
+            rows = payload if isinstance(payload, list) else []
             close_qty = 0.0
             close_notional = 0.0
-            for row in rows or []:
+            close_fills = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
                 trade_time = int(safe_float(row.get("time")))
                 if trade_time < start_ms or trade_time > end_ms:
                     continue
@@ -2410,20 +2494,21 @@ class BinanceExchangeManager:
                 if row_ps not in (position_side, "BOTH"):
                     continue
                 realized = safe_float(row.get("realizedPnl"))
-                commission = safe_float(row.get("commission"))
                 result.realized_pnl += realized
-                result.commission += commission
-                result.fill_count += 1
+                result.commission += safe_float(row.get("commission"))
                 side = str(row.get("side", "")).upper()
-                if side == close_side:
-                    qty = safe_float(row.get("qty"))
-                    price = safe_float(row.get("price"))
-                    if qty > 0 and price > 0:
+                qty = safe_float(row.get("qty"))
+                price = safe_float(row.get("price"))
+                is_close = side == close_side and qty > 0
+                if is_close or abs(realized) > 1e-12:
+                    close_fills += 1
+                    if qty > 0 and price > 0 and is_close:
                         close_qty += qty
                         close_notional += price * qty
 
-            if result.fill_count > 0:
+            if close_fills > 0 or abs(result.realized_pnl) > 1e-12:
                 result.source = "userTrades"
+                result.fill_count = close_fills if close_fills > 0 else 1
                 if close_qty > 0:
                     result.exit_price = close_notional / close_qty
                 return result
@@ -2435,18 +2520,32 @@ class BinanceExchangeManager:
                     position_side,
                     exc,
                 )
+        return result
 
+    def _fetch_income_close_pnl(
+        self,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> ClosedPositionPnl:
+        result = ClosedPositionPnl()
         try:
-            rows = self._throttled_call(
+            raw = self._throttled_call(
                 self.client.futures_income_history,
                 symbol=symbol,
                 startTime=start_ms,
                 incomeType="REALIZED_PNL",
                 limit=1000,
+                execution_priority=True,
+                bypass_account_cache=True,
             )
+            payload = self._coerce_api_payload(raw)
+            rows = payload if isinstance(payload, list) else []
             income_total = 0.0
             income_rows = 0
-            for row in rows or []:
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
                 trade_time = int(safe_float(row.get("time")))
                 if trade_time < start_ms or trade_time > end_ms:
                     continue
@@ -2465,10 +2564,8 @@ class BinanceExchangeManager:
                 error_logger.warning(
                     "Income PnL fetch failed for %s %s: %s",
                     symbol,
-                    position_side,
                     exc,
                 )
-
         return result
 
     def resolve_order_fill_pnl(

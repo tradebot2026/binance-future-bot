@@ -2067,20 +2067,18 @@ class TradeManager:
             self._monitored_symbols.discard(symbol.upper())
         balance = self.exchange.refresh_wallet_after_trade()
 
-        if pnl is None and is_exchange_sync_close_reason(reason):
+        if is_exchange_sync_close_reason(reason) and (
+            pnl is None
+            or (
+                abs(safe_float(pnl)) < 1e-12
+                and pnl_source not in ("userTrades", "income", "ws")
+            )
+        ):
             resolved = resolve_exchange_close_pnl(self.exchange, self.db, trade)
             pnl = resolved.realized_pnl
             pnl_source = resolved.source
             if resolved.exit_price > 0:
                 exit_price = resolved.exit_price
-
-        if safe_float(pnl) == 0 and pnl_source in ("unknown", "unavailable", ""):
-            resolved = resolve_exchange_close_pnl(self.exchange, self.db, trade)
-            if resolved.fill_count > 0 or abs(resolved.realized_pnl) > 0:
-                pnl = resolved.realized_pnl
-                pnl_source = resolved.source
-                if resolved.exit_price > 0:
-                    exit_price = resolved.exit_price
 
         total_pnl = self.db.close_trade_and_sync_stats(
             trade,

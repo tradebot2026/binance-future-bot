@@ -2142,6 +2142,7 @@ class MarketDataHub:
                 trade_id=str(order.get("t", "")),
                 timestamp_ms=int(safe_float(order.get("T"))),
                 source="ws",
+                side=str(order.get("S", "")).upper(),
             )
         )
         if status in {"FILLED", "PARTIALLY_FILLED"} or fill_qty > 0:

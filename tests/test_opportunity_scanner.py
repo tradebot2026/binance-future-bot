@@ -1015,6 +1015,7 @@ class TestManualCloseSyncAndFillPrices(unittest.TestCase):
         kwargs = mgr._mark_trade_closed.call_args.kwargs
         self.assertEqual(kwargs["reason"], "RECONCILED_MANUAL_CLOSE")
         self.assertEqual(kwargs["exit_price"], 99.5)
+        self.assertEqual(kwargs["pnl"], -2.0)
 
     def test_drain_pending_flat_reconciles_manual_close(self) -> None:
         import threading
@@ -1081,6 +1082,203 @@ class TestManualCloseSyncAndFillPrices(unittest.TestCase):
             fallback=99.0,
         )
         self.assertAlmostEqual(px, 100.25)
+
+
+class TestReconciledCloseRealizedPnl(unittest.TestCase):
+    def _exchange(self):
+        from exchange import BinanceExchangeManager
+
+        ex = BinanceExchangeManager.__new__(BinanceExchangeManager)
+        ex.client = MagicMock()
+        ex.client.futures_account_trades.__name__ = "futures_account_trades"
+        ex.client.futures_income_history.__name__ = "futures_income_history"
+        ex._market_data = None
+        ex._rest_block_log = MagicMock()
+        ex._rest_block_log.should_log.return_value = False
+        ex.is_rest_blocked = MagicMock(return_value=(False, ""))
+        return ex
+
+    def test_user_trades_ignores_entry_fills_until_close(self) -> None:
+        from exchange import BinanceExchangeManager
+
+        ex = self._exchange()
+        opened_ms = 1_700_000_000_000
+        pages = [
+            [
+                {
+                    "side": "BUY",
+                    "positionSide": "LONG",
+                    "realizedPnl": "0",
+                    "commission": "0.04",
+                    "qty": "1",
+                    "price": "100",
+                    "time": opened_ms + 1_000,
+                }
+            ],
+            [
+                {
+                    "side": "BUY",
+                    "positionSide": "LONG",
+                    "realizedPnl": "0",
+                    "commission": "0.04",
+                    "qty": "1",
+                    "price": "100",
+                    "time": opened_ms + 1_000,
+                },
+                {
+                    "side": "SELL",
+                    "positionSide": "LONG",
+                    "realizedPnl": "-2.50",
+                    "commission": "0.04",
+                    "qty": "1",
+                    "price": "97.5",
+                    "time": opened_ms + 5_000,
+                },
+            ],
+        ]
+        trade_calls = {"n": 0}
+
+        def throttled(func, *args, **kwargs):
+            self.assertTrue(kwargs.get("execution_priority"))
+            name = getattr(func, "__name__", "")
+            if name == "futures_account_trades":
+                idx = min(trade_calls["n"], len(pages) - 1)
+                trade_calls["n"] += 1
+                return pages[idx]
+            return []
+
+        ex._throttled_call = throttled
+        with patch("exchange.time.sleep"):
+            result = BinanceExchangeManager.fetch_closed_position_realized_pnl(
+                ex, "ETHUSDT", "LONG", opened_ms, rest_retries=3
+            )
+        self.assertEqual(result.source, "userTrades")
+        self.assertAlmostEqual(result.realized_pnl, -2.50)
+        self.assertAlmostEqual(result.exit_price, 97.5)
+        self.assertGreaterEqual(trade_calls["n"], 2)
+
+    def test_ws_close_fill_used_without_rest(self) -> None:
+        from types import SimpleNamespace
+
+        from core.fill_pnl_tracker import FillPnlRecord, FillPnlTracker
+        from exchange import BinanceExchangeManager
+
+        tracker = FillPnlTracker()
+        tracker.record(
+            FillPnlRecord(
+                order_id="1",
+                symbol="ETHUSDT",
+                position_side="LONG",
+                realized_pnl=0.0,
+                commission=0.04,
+                fill_price=100.0,
+                fill_qty=1.0,
+                trade_id="t1",
+                timestamp_ms=1_700_000_001_000,
+                side="BUY",
+            )
+        )
+        tracker.record(
+            FillPnlRecord(
+                order_id="2",
+                symbol="ETHUSDT",
+                position_side="LONG",
+                realized_pnl=-1.75,
+                commission=0.04,
+                fill_price=98.0,
+                fill_qty=1.0,
+                trade_id="t2",
+                timestamp_ms=1_700_000_005_000,
+                side="SELL",
+            )
+        )
+        ex = self._exchange()
+        ex._market_data = SimpleNamespace(fill_tracker=tracker)
+        ex._throttled_call = MagicMock(side_effect=AssertionError("REST should not run"))
+        result = BinanceExchangeManager.fetch_closed_position_realized_pnl(
+            ex, "ETHUSDT", "LONG", 1_700_000_000_000
+        )
+        self.assertEqual(result.source, "ws")
+        self.assertAlmostEqual(result.realized_pnl, -1.75)
+        self.assertAlmostEqual(result.exit_price, 98.0)
+
+    def test_resolve_fetches_history_without_opened_at(self) -> None:
+        from exchange import ClosedPositionPnl
+        from reconciliation import resolve_exchange_close_pnl
+
+        exchange = MagicMock()
+        exchange.fetch_closed_position_realized_pnl.return_value = ClosedPositionPnl(
+            realized_pnl=4.2,
+            exit_price=101.0,
+            fill_count=1,
+            source="income",
+        )
+        db = MagicMock()
+        resolved = resolve_exchange_close_pnl(
+            exchange, db, {"symbol": "ETHUSDT", "side": "LONG"}
+        )
+        self.assertAlmostEqual(resolved.realized_pnl, 4.2)
+        self.assertEqual(resolved.source, "income")
+        kwargs = exchange.fetch_closed_position_realized_pnl.call_args
+        self.assertEqual(kwargs.kwargs.get("rest_retries"), 3)
+        self.assertGreater(kwargs.args[2], 0)
+        db.estimate_trade_pnl.assert_not_called()
+
+    def test_finalize_sends_exchange_pnl_to_telegram_and_db(self) -> None:
+        import threading
+
+        from exchange import ClosedPositionPnl
+        from manager import TradeManager
+
+        mgr = TradeManager.__new__(TradeManager)
+        mgr.exchange = MagicMock()
+        mgr.db = MagicMock()
+        mgr.telegram = MagicMock()
+        mgr.scheduler = None
+        mgr.risk_manager = None
+        mgr._dca_stage = {}
+        mgr._dca_inflight = set()
+        mgr._monitored_lock = threading.Lock()
+        mgr._monitored_symbols = set()
+        mgr._clear_market_close_attempts = MagicMock()
+        mgr._cancel_all_native_orders = MagicMock()
+        mgr._log_position_closed = MagicMock()
+        mgr.exchange.refresh_wallet_after_trade.return_value = 1000.0
+        mgr.exchange.get_market_price.return_value = 97.5
+        mgr.db.close_trade_and_sync_stats.side_effect = (
+            lambda trade, **kwargs: kwargs.get("pnl")
+        )
+        trade = {
+            "trade_id": "abc12345xxxx",
+            "symbol": "ETHUSDT",
+            "side": "LONG",
+            "strategy": "SMC",
+        }
+        with patch(
+            "manager.resolve_exchange_close_pnl",
+            return_value=ClosedPositionPnl(
+                realized_pnl=-3.42,
+                exit_price=97.5,
+                source="userTrades",
+                fill_count=1,
+            ),
+        ):
+            total = mgr._finalize_trade_closed(
+                trade,
+                reason="RECONCILED_MANUAL_CLOSE",
+                exit_price=0.0,
+                notify=True,
+                book_daily_pnl=True,
+                pnl=0.0,
+                pnl_source="estimate",
+            )
+        self.assertAlmostEqual(total, -3.42)
+        mgr.telegram.send_close_alert.assert_called_once()
+        alert = mgr.telegram.send_close_alert.call_args.kwargs
+        self.assertAlmostEqual(alert["pnl"], -3.42)
+        self.assertAlmostEqual(
+            mgr.db.close_trade_and_sync_stats.call_args.kwargs["pnl"], -3.42
+        )
 
 
 if __name__ == "__main__":

@@ -23,6 +23,7 @@ class FillPnlRecord:
     trade_id: str
     timestamp_ms: int
     source: str = "ws"
+    side: str = ""
 
 
 class FillPnlTracker:
@@ -50,6 +51,7 @@ class FillPnlTracker:
                     trade_id=record.trade_id or existing.trade_id,
                     timestamp_ms=max(record.timestamp_ms, existing.timestamp_ms),
                     source=record.source,
+                    side=record.side or existing.side,
                 )
             self._by_order[record.order_id] = record
             if len(self._by_order) > self._max_orders:
@@ -73,3 +75,60 @@ class FillPnlTracker:
                 return record
             time.sleep(0.05)
         return self.get(order_id)
+
+    def aggregate_for_position(
+        self,
+        symbol: str,
+        position_side: str = "",
+        *,
+        since_ms: int = 0,
+        close_side: str = "",
+    ) -> Optional[FillPnlRecord]:
+        """Sum WS fills for a symbol/side. None until a closing fill is present."""
+        symbol = str(symbol).upper()
+        position_side = str(position_side).upper()
+        close_side = str(close_side).upper()
+        with self._lock:
+            matches = [
+                rec
+                for rec in self._by_order.values()
+                if rec.symbol.upper() == symbol
+                and rec.timestamp_ms >= since_ms
+                and (
+                    not position_side
+                    or rec.position_side in (position_side, "BOTH", "")
+                )
+            ]
+        if not matches:
+            return None
+
+        close_fills = [
+            rec
+            for rec in matches
+            if abs(rec.realized_pnl) > 1e-12
+            or (close_side and rec.side.upper() == close_side)
+        ]
+        if not close_fills:
+            return None
+
+        close_qty = sum(rec.fill_qty for rec in close_fills if rec.fill_qty > 0)
+        close_notional = sum(
+            rec.fill_price * rec.fill_qty
+            for rec in close_fills
+            if rec.fill_price > 0 and rec.fill_qty > 0
+        )
+        exit_price = (close_notional / close_qty) if close_qty > 0 else 0.0
+        latest = max(close_fills, key=lambda rec: rec.timestamp_ms)
+        return FillPnlRecord(
+            order_id=latest.order_id,
+            symbol=symbol,
+            position_side=position_side or latest.position_side,
+            realized_pnl=sum(rec.realized_pnl for rec in matches),
+            commission=sum(rec.commission for rec in matches),
+            fill_price=exit_price or latest.fill_price,
+            fill_qty=close_qty,
+            trade_id=latest.trade_id,
+            timestamp_ms=latest.timestamp_ms,
+            source="ws",
+            side=close_side or latest.side,
+        )
