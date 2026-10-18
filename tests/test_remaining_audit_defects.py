@@ -603,6 +603,9 @@ class TestHighMediumResidualRepairs(unittest.TestCase):
         self.assertIn("spawn_detached_python", restart_src)
         emergency_src = inspect.getsource(PositionWatchdog.check_open_positions)
         self.assertIn("native_unprotected_open", emergency_src)
+        init_src = inspect.getsource(PositionWatchdog.__init__)
+        self.assertIn("DatabaseManager()", init_src)
+        self.assertNotIn("DatabaseManager(Config.DB_PATH)", init_src)
 
     def test_peak_resets_when_utc_day_changes(self) -> None:
         from risk_manager import RiskManager

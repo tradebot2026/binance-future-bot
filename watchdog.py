@@ -122,7 +122,7 @@ class PositionWatchdog:
             watchdog_logger.error("Invalid configuration — check API keys and .env.")
             sys.exit(1)
 
-        self.db = DatabaseManager(Config.DB_PATH)
+        self.db = DatabaseManager()
         self.exchange = BinanceExchangeManager()
         self.telegram = TelegramManager(db=self.db, exchange=self.exchange)
         self.state = WatchdogState(Config.WATCHDOG_STATE_FILE)
