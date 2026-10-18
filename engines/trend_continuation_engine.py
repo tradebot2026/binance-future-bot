@@ -94,7 +94,9 @@ def evaluate_trend_continuation(
         score += 5.0
 
     result.score = min(score, 94.0)
-    result.passed = result.score >= Config.TREND_MOMENTUM_MIN_SCORE
+    result.passed = result.score >= Config.effective_min_score(
+        Config.TREND_MOMENTUM_MIN_SCORE
+    )
     result.entry = entry
     result.stop_loss = sl
     result.tp1 = tp1

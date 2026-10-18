@@ -108,7 +108,7 @@ def evaluate_volatility_squeeze(
         score += 6.0
 
     result.score = min(score, 93.0)
-    result.passed = result.score >= Config.VOL_SQUEEZE_MIN_SCORE
+    result.passed = result.score >= Config.effective_min_score(Config.VOL_SQUEEZE_MIN_SCORE)
     result.entry = entry
     result.stop_loss = sl
     result.tp1 = tp1

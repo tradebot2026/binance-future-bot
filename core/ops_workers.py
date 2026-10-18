@@ -12,7 +12,11 @@ from typing import Any
 from config import Config
 from logger import error_logger, system_logger
 from core.ops_heartbeat import touch_reconcile_loop
-from reconciliation import reconcile_positions, reconcile_uncertain_executions
+from reconciliation import (
+    recover_orphan_fills_from_disk,
+    reconcile_positions,
+    reconcile_uncertain_executions,
+)
 
 
 class BackgroundOps:
@@ -63,7 +67,7 @@ class BackgroundOps:
     def stop(self) -> None:
         self._stop.set()
         for thread in self._threads:
-            thread.join(timeout=2.0)
+            thread.join(timeout=8.0)
         self._threads = []
 
     def _shutdown_requested(self) -> bool:
@@ -102,7 +106,7 @@ class BackgroundOps:
                 ):
                     try:
                         late = reconcile_uncertain_executions(
-                            self.exchange, self.executor
+                            self.exchange, self.executor, manager=self.manager
                         )
                         if late:
                             system_logger.info(
@@ -112,6 +116,22 @@ class BackgroundOps:
                     except Exception as exc:
                         error_logger.error(
                             "Uncertain-order reconcile worker failed: %s", exc
+                        )
+                    try:
+                        recovered = recover_orphan_fills_from_disk(self.db)
+                        if recovered:
+                            system_logger.info(
+                                "Recovered %s orphan fill(s) into the trade DB.",
+                                recovered,
+                            )
+                            purge = getattr(
+                                self.executor, "purge_orphans_present_in_db", None
+                            )
+                            if callable(purge):
+                                purge()
+                    except Exception as exc:
+                        error_logger.error(
+                            "Orphan-fill disk recovery failed: %s", exc
                         )
                     last_uncertain = now
                 if now - last_reconcile >= rec_interval:
@@ -128,6 +148,23 @@ class BackgroundOps:
                             error_logger.error(
                                 "Periodic reconcile worker failed: %s", exc
                             )
+                    try:
+                        from core.exchange_protection import restore_open_trade_protection
+                        from core.ops_heartbeat import touch_protection
+
+                        restore_open_trade_protection(
+                            self.exchange,
+                            self.db,
+                            manager=self.manager,
+                            telegram=self.telegram,
+                            failsafe_on_failure=False,
+                        )
+                        if Config.ENABLE_NATIVE_TP_SL:
+                            touch_protection(source="periodic_verify")
+                    except Exception as exc:
+                        error_logger.error(
+                            "Periodic protection inventory/verify failed: %s", exc
+                        )
                     try:
                         self.db.cleanup_expired_cooldowns()
                     except Exception as exc:

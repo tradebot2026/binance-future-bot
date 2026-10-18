@@ -6,12 +6,13 @@ and realized-PnL-based drawdown. Works alongside DailyScheduler (daily pause).
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from config import Config
 from constants import (
-    DAILY_STATUS_ACTIVE,
     DAILY_STATUS_PAUSED,
     STRATEGY_RANGE_REVERSION,
     TRADE_STATUS_CLOSED,
@@ -26,6 +27,30 @@ from utils import minimum_order_quantity, safe_float, utc_now, utc_today_str
 
 if TYPE_CHECKING:
     from bot_controller import BotController
+
+_RISK_STATE_PATH = os.path.join(Config.DATA_DIR, "risk_runtime_state.json")
+
+
+def _load_risk_runtime_state() -> dict:
+    try:
+        if not os.path.isfile(_RISK_STATE_PATH):
+            return {}
+        with open(_RISK_STATE_PATH, encoding="utf-8") as handle:
+            raw = json.load(handle)
+        return raw if isinstance(raw, dict) else {}
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return {}
+
+
+def _save_risk_runtime_state(payload: dict) -> None:
+    try:
+        os.makedirs(Config.DATA_DIR, exist_ok=True)
+        tmp = f"{_RISK_STATE_PATH}.tmp"
+        with open(tmp, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+        os.replace(tmp, _RISK_STATE_PATH)
+    except OSError:
+        pass
 
 
 @dataclass
@@ -58,7 +83,7 @@ def daily_profit_target_reached(metrics: DailyPnLMetrics) -> bool:
 
 def daily_max_loss_reached(metrics: DailyPnLMetrics) -> bool:
     """Never trip max loss while wallet equity is above the day's starting balance."""
-    if metrics.start_balance <= 0:
+    if metrics.start_balance <= 0 or metrics.current_wallet <= 0:
         return False
     if metrics.current_wallet > metrics.start_balance:
         return False
@@ -115,18 +140,6 @@ def compute_daily_pnl_metrics(
         equity_day_pnl = current_wallet - start_balance
         equity_day_pnl_percent = (equity_day_pnl / start_balance) * 100.0
 
-    if (
-        start_balance > 0
-        and current_wallet > start_balance
-        and stats.get("status") == DAILY_STATUS_PAUSED
-    ):
-        db.set_daily_status(date_str, DAILY_STATUS_ACTIVE, current_wallet)
-        system_logger.info(
-            "Daily status auto-cleared to ACTIVE — wallet $%.2f above start $%.2f.",
-            current_wallet,
-            start_balance,
-        )
-
     trade_analytics = db.get_daily_trade_analytics(date_str)
     db_realized_pnl = safe_float(trade_analytics.get("total_pnl"))
     if db_realized_pnl == 0:
@@ -170,15 +183,20 @@ class RiskManager:
         self.exchange = exchange
         self.db = db
         self.controller = controller
-        self._peak_realized_pnl = 0.0
-        self._reference_balance = 0.0
-        # Only closed trades after this timestamp count toward consecutive-loss blocks.
-        self._consecutive_loss_reset_at = utc_now().isoformat()
+        saved = _load_risk_runtime_state()
+        self._peak_realized_pnl = safe_float(saved.get("peak_realized_pnl"))
+        self._reference_balance = safe_float(saved.get("reference_balance"))
+        self._peak_utc_day = str(saved.get("utc_day") or "").strip()
+        saved_reset = str(saved.get("consecutive_loss_reset_at") or "").strip()
+        self._consecutive_loss_reset_at = saved_reset or utc_now().isoformat()
         balance = self.exchange.get_futures_balance(force_refresh=False)
-        if balance > 0:
+        if balance > 0 and self._reference_balance <= 0:
             self._reference_balance = balance
+        self._maybe_reset_peak_for_new_day()
+        self._persist_runtime_state()
         system_logger.info(
-            "Risk manager initialized — consecutive loss streak reset (0/%s).",
+            "Risk manager initialized — consecutive-loss window from %s (cap %s).",
+            self._consecutive_loss_reset_at,
             Config.MAX_CONSECUTIVE_LOSSES,
         )
 
@@ -188,10 +206,43 @@ class RiskManager:
         Historical losses before this point no longer block new entries.
         """
         self._consecutive_loss_reset_at = utc_now().isoformat()
+        self._persist_runtime_state()
         trade_logger.info(
             "Consecutive loss block cleared — counter reset to 0/%s.",
             Config.MAX_CONSECUTIVE_LOSSES,
         )
+
+    def _persist_runtime_state(self) -> None:
+        _save_risk_runtime_state(
+            {
+                "peak_realized_pnl": self._peak_realized_pnl,
+                "reference_balance": self._reference_balance,
+                "consecutive_loss_reset_at": self._consecutive_loss_reset_at,
+                "utc_day": getattr(self, "_peak_utc_day", "") or utc_today_str(),
+            }
+        )
+
+    def _maybe_reset_peak_for_new_day(self) -> None:
+        """Drop yesterday's peak so MAX_ACCOUNT_DRAWDOWN cannot false-block today."""
+        today = utc_today_str()
+        stored = str(getattr(self, "_peak_utc_day", "") or "").strip()
+        if stored == today:
+            return
+        if stored:
+            system_logger.info(
+                "UTC day rollover — resetting peak realized PnL (was %.4f on %s).",
+                self._peak_realized_pnl,
+                stored,
+            )
+        self._peak_realized_pnl = 0.0
+        self._peak_utc_day = today
+        self._persist_runtime_state()
+
+    def reset_daily_drawdown_peak(self) -> None:
+        """UTC midnight hook: start a fresh realized-PnL peak for today's drawdown."""
+        self._peak_realized_pnl = 0.0
+        self._peak_utc_day = utc_today_str()
+        self._persist_runtime_state()
 
     # ---------------- Public API ----------------
 
@@ -286,16 +337,30 @@ class RiskManager:
             return False, reason or "REST blocked"
         return True, ""
 
+    def net_long_exposure_allows_new(self) -> tuple[bool, str]:
+        """Public alias — new longs are denied when wallet or positions cannot be read."""
+        return self._net_long_exposure_allows_new()
+
     def _net_long_exposure_allows_new(self) -> tuple[bool, str]:
         """Reject only when current long notional already meets the net-long cap."""
-        balance = self.exchange.get_futures_balance(force_refresh=False)
+        try:
+            balance = float(self.exchange.get_futures_balance(force_refresh=False) or 0.0)
+        except Exception:
+            return False, "Net long exposure check unavailable (wallet fetch failed)."
         if balance <= 0:
-            return True, ""
-        long_notional = 0.0
+            return False, "Net long exposure check unavailable (wallet <= 0)."
+        authoritative = getattr(self.exchange, "position_snapshot_authoritative", None)
+        if callable(authoritative) and not bool(authoritative()):
+            return False, (
+                "Net long exposure check unavailable (position snapshot not authoritative)."
+            )
         try:
             positions = self.exchange.get_all_open_positions(force_refresh=False)
         except Exception:
-            return True, ""
+            return False, "Net long exposure check unavailable (positions fetch failed)."
+        if positions is None:
+            return False, "Net long exposure check unavailable (positions unavailable)."
+        long_notional = 0.0
         for pos in positions:
             if str(pos.get("positionSide", "")).upper() != "LONG":
                 continue
@@ -367,19 +432,12 @@ class RiskManager:
         metrics = compute_daily_pnl_metrics(self.exchange, self.db, today)
         stats = self.db.get_daily_stats(today) or {}
         if stats.get("status") == DAILY_STATUS_PAUSED:
-            still_in_breach = daily_profit_target_reached(
-                metrics
-            ) or daily_max_loss_reached(metrics)
-            if still_in_breach:
-                return True, "Daily limit already reached — entries paused for today."
-            balance = metrics.current_wallet if metrics.current_wallet > 0 else 0.0
-            self.db.set_daily_status(today, DAILY_STATUS_ACTIVE, balance)
-            system_logger.info(
-                "Daily PAUSED status cleared for %s — limits not in breach.",
-                today,
+            return True, "Daily limit already reached — entries paused for today."
+        if metrics.start_balance <= 0 or metrics.current_wallet <= 0:
+            return True, (
+                "Daily PnL check unavailable (invalid start/current wallet) — "
+                "new entries blocked."
             )
-        if metrics.start_balance <= 0:
-            return False, ""
 
         if daily_profit_target_reached(metrics):
             reason = (
@@ -404,6 +462,14 @@ class RiskManager:
 
     def get_risk_snapshot(self) -> RiskSnapshot:
         """Compute current risk metrics and whether entries are allowed."""
+        self._maybe_reset_peak_for_new_day()
+        snapshot_ok = True
+        authoritative = getattr(self.exchange, "position_snapshot_authoritative", None)
+        if callable(authoritative):
+            try:
+                snapshot_ok = bool(authoritative())
+            except Exception:
+                snapshot_ok = False
         exchange_open = self.get_exchange_open_positions_count()
         try:
             db_open = self.db.get_active_trades_count()
@@ -437,6 +503,7 @@ class RiskManager:
         consecutive_losses = self._count_consecutive_losses(Config.MAX_CONSECUTIVE_LOSSES)
         if pnl_metrics.realized_pnl > self._peak_realized_pnl:
             self._peak_realized_pnl = pnl_metrics.realized_pnl
+            self._persist_runtime_state()
 
         drawdown = self._calculate_realized_drawdown_percent(
             current_realized=pnl_metrics.realized_pnl,
@@ -448,24 +515,19 @@ class RiskManager:
         daily_override = self._daily_limit_override_active()
 
         if not daily_override and daily_stats.get("status") == DAILY_STATUS_PAUSED:
-            still_in_breach = daily_profit_target_reached(
-                pnl_metrics
-            ) or daily_max_loss_reached(pnl_metrics)
-            if still_in_breach:
-                block_reason = "Daily PnL limit reached — entries paused for today."
-            else:
-                self.db.set_daily_status(
-                    today,
-                    DAILY_STATUS_ACTIVE,
-                    pnl_metrics.current_wallet if pnl_metrics.current_wallet > 0 else current_balance,
-                )
+            block_reason = "Daily PnL limit reached — entries paused for today."
 
+        booked_open = max(exchange_open, db_open)
         if block_reason:
             pass
-        elif exchange_open >= Config.MAX_POSITIONS:
+        elif not snapshot_ok:
             block_reason = (
-                f"Max open positions reached on exchange "
-                f"({exchange_open}/{Config.MAX_POSITIONS})."
+                "Position snapshot not authoritative — new entries blocked."
+            )
+        elif booked_open >= Config.MAX_POSITIONS:
+            block_reason = (
+                f"Max open positions reached "
+                f"({booked_open}/{Config.MAX_POSITIONS})."
             )
         elif daily_entries >= Config.MAX_DAILY_TRADES:
             block_reason = (
@@ -481,6 +543,13 @@ class RiskManager:
                 f"Realized PnL drawdown limit reached ({drawdown:.2f}% >= "
                 f"{Config.MAX_ACCOUNT_DRAWDOWN:.2f}%)."
             )
+        elif not daily_override and (
+            pnl_metrics.start_balance <= 0 or pnl_metrics.current_wallet <= 0
+        ):
+            block_reason = (
+                "Daily PnL check unavailable (invalid start/current wallet) — "
+                "new entries blocked."
+            )
         elif not daily_override and daily_profit_target_reached(pnl_metrics):
             block_reason = (
                 f"Daily profit target reached (+{pnl_metrics.equity_day_pnl_percent:.2f}%)."
@@ -495,7 +564,7 @@ class RiskManager:
             trade_logger.warning("Entry blocked | %s", block_reason)
 
         return RiskSnapshot(
-            open_positions=open_positions,
+            open_positions=booked_open,
             exchange_open_positions=exchange_open,
             daily_entries=daily_entries,
             daily_trades=daily_trades,
@@ -517,10 +586,12 @@ class RiskManager:
             self.exchange.invalidate_balance_cache()
             self.exchange.get_futures_balance(force_refresh=True)
 
+        self._maybe_reset_peak_for_new_day()
         today = utc_today_str()
         metrics = compute_daily_pnl_metrics(self.exchange, self.db, today)
         if metrics.realized_pnl > self._peak_realized_pnl:
             self._peak_realized_pnl = metrics.realized_pnl
+            self._persist_runtime_state()
 
         balance = metrics.current_wallet or self.exchange.get_futures_balance(
             force_refresh=False

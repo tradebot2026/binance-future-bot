@@ -29,10 +29,10 @@ class TestDryRunGuard(unittest.TestCase):
         self.assertIsNone(result)
         exchange.execution_context.assert_not_called()
 
-    def test_missing_or_empty_dry_run_follows_network(self) -> None:
+    def test_missing_or_empty_dry_run_is_fail_closed(self) -> None:
         with patch.dict(os.environ, {"USE_TESTNET": "true"}, clear=False):
             os.environ.pop("DRY_RUN", None)
-            self.assertFalse(_env_dry_run())
+            self.assertTrue(_env_dry_run())
         with patch.dict(
             os.environ,
             {"BINANCE_ENV": "MAINNET", "USE_TESTNET": "false", "DRY_RUN": "  "},
@@ -42,6 +42,8 @@ class TestDryRunGuard(unittest.TestCase):
         with patch.dict(os.environ, {"DRY_RUN": "false"}, clear=False):
             self.assertFalse(_env_dry_run())
         with patch.dict(os.environ, {"DRY_RUN": "true"}, clear=False):
+            self.assertTrue(_env_dry_run())
+        with patch.dict(os.environ, {"DRY_RUN": "maybe"}, clear=False):
             self.assertTrue(_env_dry_run())
 
     def test_execute_trade_places_order_when_dry_run_false(self) -> None:
@@ -458,14 +460,45 @@ class TestTelegramTestTrade(unittest.TestCase):
         }
         with patch.object(Config, "USE_TESTNET", True), patch.object(
             Config, "DRY_RUN", False
-        ), patch.object(Config, "QUOTE_ASSET", "USDT"):
+        ), patch.object(Config, "ENABLE_TESTTRADE_COMMAND", True), patch.object(
+            Config, "QUOTE_ASSET", "USDT"
+        ):
             msg = tg._place_testnet_test_trade("ONGUSDT")
-        self.assertIn("TEST TRADE SUBMITTED", msg)
+        self.assertIn("TEST TRADE FILLED", msg)
+        self.assertIn("Status:</b> FILLED", msg)
         tg.exchange.fetch_ticker.assert_called_once_with("ONGUSDT")
         tg.exchange.execute_futures_order.assert_called_once()
         kwargs = tg.exchange.execute_futures_order.call_args.kwargs
         self.assertEqual(kwargs["side"], "BUY")
         self.assertEqual(kwargs["position_side"], "LONG")
+
+    def test_testtrade_submitted_is_not_a_confirmed_fill(self) -> None:
+        from telegram_bot import TelegramManager
+
+        tg = TelegramManager.__new__(TelegramManager)
+        tg.exchange = MagicMock()
+        tg.exchange.fetch_ticker.return_value = 1.25
+        rules = MagicMock()
+        rules.min_qty = 1.0
+        rules.min_notional = 5.0
+        rules.step_size = 1.0
+        rules.quantity_precision = 0
+        tg.exchange.get_symbol_rules.return_value = rules
+        tg.exchange.execute_futures_order.return_value = {
+            "orderId": 99,
+            "status": "NEW",
+            "avgPrice": "0",
+            "executedQty": "0",
+        }
+        with patch.object(Config, "USE_TESTNET", True), patch.object(
+            Config, "DRY_RUN", False
+        ), patch.object(Config, "ENABLE_TESTTRADE_COMMAND", True), patch.object(
+            Config, "QUOTE_ASSET", "USDT"
+        ):
+            msg = tg._place_testnet_test_trade("ONGUSDT")
+        self.assertIn("TEST TRADE SUBMITTED", msg)
+        self.assertNotIn("TEST TRADE FILLED", msg)
+        self.assertIn("Not a confirmed fill", msg)
 
 
 class TestCandidateRestPrice(unittest.TestCase):

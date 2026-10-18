@@ -83,7 +83,9 @@ def evaluate_false_breakout_sfp(
         score += 4.0
 
     result.score = min(score, 95.0)
-    result.passed = result.score >= Config.FALSE_BREAKOUT_SFP_MIN_SCORE
+    result.passed = result.score >= Config.effective_min_score(
+        Config.FALSE_BREAKOUT_SFP_MIN_SCORE
+    )
     result.entry = entry
     result.stop_loss = sl
     result.tp1 = tp1

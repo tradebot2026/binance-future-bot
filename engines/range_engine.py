@@ -195,8 +195,9 @@ def evaluate_range_setup(
     if room_to_eq < min_room:
         reasons.append(f"insufficient_room_to_equilibrium_{room_to_eq:.6f}")
 
-    if score < Config.RANGE_MIN_SCORE:
-        reasons.append(f"score_below_min_{score:.1f}_required_{Config.RANGE_MIN_SCORE:.1f}")
+    min_required = Config.effective_min_score(Config.RANGE_MIN_SCORE)
+    if score < min_required:
+        reasons.append(f"score_below_min_{score:.1f}_required_{min_required:.1f}")
 
     passed = len(reasons) == 0
     return RangeGateResult(passed, reasons, meta, min(score, 100.0))

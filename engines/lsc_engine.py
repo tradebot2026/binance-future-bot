@@ -72,7 +72,7 @@ def evaluate_lsc_setup(
         score += 5.0
 
     result.score = min(score, 95.0)
-    result.passed = result.score >= Config.LSC_MIN_SCORE
+    result.passed = result.score >= Config.effective_min_score(Config.LSC_MIN_SCORE)
     if not result.passed:
         result.reasons.append(f"score_below_min_{result.score:.1f}")
     return result

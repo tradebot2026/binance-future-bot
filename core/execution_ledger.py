@@ -190,9 +190,8 @@ class ExecutionLedger:
         with self._lock:
             return [
                 rec
-                for exec_id in list(self._order)
-                if (rec := self._records.get(exec_id)) is not None
-                and rec.phase in _UNRESOLVED
+                for rec in self._records.values()
+                if rec.phase in _UNRESOLVED
             ]
 
     def find_by_ids(
@@ -270,9 +269,8 @@ class ExecutionLedger:
 
     def _persist_unlocked(self) -> None:
         rows = []
-        for exec_id in list(self._order):
-            rec = self._records.get(exec_id)
-            if rec is None or rec.phase not in _UNRESOLVED:
+        for rec in self._records.values():
+            if rec.phase not in _UNRESOLVED:
                 continue
             payload = asdict(rec)
             payload["phase"] = rec.phase.value
@@ -324,6 +322,21 @@ class ExecutionLedger:
                 continue
             self._records[record.exec_id] = record
             self._order.append(record.exec_id)
+            self._restore_seq_from_id(record.exec_id)
+
+    def _restore_seq_from_id(self, exec_id: str) -> None:
+        parts = str(exec_id or "").split("-")
+        if len(parts) != 3 or parts[0] != "EXEC":
+            return
+        day, seq_raw = parts[1], parts[2]
+        try:
+            seq = int(seq_raw)
+        except ValueError:
+            return
+        today = datetime.now(timezone.utc).strftime("%Y%m%d")
+        if day == today and seq > self._seq:
+            self._day = day
+            self._seq = seq
 
     def _next_id(self) -> str:
         day = datetime.now(timezone.utc).strftime("%Y%m%d")

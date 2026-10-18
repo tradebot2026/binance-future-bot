@@ -474,6 +474,49 @@ def last_resort_sl_hit(side: str, price: float, sl_price: float) -> bool:
     return price >= sl_price
 
 
+def sl_is_valid_vs_entry(side: str, entry: float, sl_price: float) -> bool:
+    """True when SL is strictly on the protective side of the reference entry."""
+    if entry <= 0 or sl_price <= 0:
+        return False
+    if str(side).upper() == "LONG":
+        return sl_price < entry
+    return sl_price > entry
+
+
+def weighted_average_entry(
+    fills: list[tuple[float, float]],
+) -> float:
+    """Qty-weighted average fill. Ignores non-positive price/qty pairs."""
+    notional = 0.0
+    qty = 0.0
+    for price, amount in fills:
+        px = float(price or 0.0)
+        q = float(amount or 0.0)
+        if px > 0 and q > 0:
+            notional += px * q
+            qty += q
+    if qty <= 0:
+        return 0.0
+    return notional / qty
+
+
+def update_weighted_average(
+    metadata: dict[str, Any],
+    *,
+    prior_avg: float,
+    prior_qty: float,
+    fill_price: float,
+    add_qty: float,
+) -> float:
+    """Persist avg_entry_price from confirmed fills. Does not move base_entry_price."""
+    avg = weighted_average_entry(
+        [(prior_avg, prior_qty), (fill_price, add_qty)]
+    )
+    if avg > 0:
+        metadata["avg_entry_price"] = avg
+    return avg
+
+
 def mark_dca_filled(metadata: dict[str, Any], step: int) -> dict[str, Any]:
     stage = min(max(int(step), 1), dca_max_entries())
     metadata["entry_stage"] = stage

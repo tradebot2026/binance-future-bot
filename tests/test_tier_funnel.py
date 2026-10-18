@@ -47,11 +47,15 @@ class TestStrategyScoreRanges(unittest.TestCase):
         self.assertEqual(smc.classify(61.0), "NORMAL")
         self.assertEqual(smc.classify(62.0), "HOT")
         self.assertEqual(smc.classify(67.0), "HOT")
-        self.assertEqual(smc.classify(68.0), "SUPER")
+        self.assertEqual(smc.classify(68.0), "HOT")
+        self.assertEqual(smc.classify(70.0), "SUPER")
+        self.assertGreaterEqual(smc.super_score, smc.execution_min)
         self.assertEqual(rng.classify(57.0), "NORMAL")
         self.assertEqual(rng.classify(58.0), "HOT")
         self.assertEqual(rng.classify(63.0), "HOT")
-        self.assertEqual(rng.classify(64.0), "SUPER")
+        self.assertEqual(rng.classify(64.0), "HOT")
+        self.assertEqual(rng.classify(65.0), "SUPER")
+        self.assertGreaterEqual(rng.super_score, rng.execution_min)
         self.assertEqual(classify_score("SMC_TREND", 81.0), smc.classify(81.0))
 
 

@@ -279,6 +279,13 @@ class MarketDataHub:
             else:
                 state = "HEALTHY"
 
+            try:
+                from core.ops_heartbeat import set_ws_health_state
+
+                set_ws_health_state(state)
+            except Exception:
+                pass
+
             return {
                 "state": state,
                 "active_feeds": active_feeds,

@@ -472,12 +472,16 @@ class TestWatchdogNoDuplicateRestart(unittest.TestCase):
         wd.state = MagicMock()
         wd._alert_main_down = MagicMock()
         wd._maybe_restart_main = MagicMock()
-        with patch.object(PositionWatchdog, "main_bot_stale_seconds", return_value=120.0):
-            with patch.object(PositionWatchdog, "is_main_process_running", return_value=True):
-                with patch.object(Config, "WATCHDOG_MAIN_STALE_SECONDS", 60):
-                    healthy = PositionWatchdog.check_main_bot_health(wd)
-        self.assertTrue(healthy)
+        payload = {"monitor_wall": time.time() - 120.0, "timestamp": time.time()}
+        with patch(
+            "core.ops_heartbeat.read_heartbeat_payload", return_value=payload
+        ), patch.object(
+            PositionWatchdog, "is_main_process_running", return_value=True
+        ), patch.object(Config, "WATCHDOG_MAIN_STALE_SECONDS", 60):
+            healthy = PositionWatchdog.check_main_bot_health(wd)
+        self.assertFalse(healthy)
         wd._maybe_restart_main.assert_not_called()
+        wd._alert_main_down.assert_called()
 
 
 class TestExecutorSafetyGate(unittest.TestCase):

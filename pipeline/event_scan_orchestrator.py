@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any, Optional
 
@@ -19,12 +20,37 @@ from core.types import CandleCloseEvent, SignalCandidate, StrategyScore
 from database import DatabaseManager
 from exchange import BinanceExchangeManager
 from executor import log_execution_rejected, log_scan_rejected
-from indicators.market_analyzer import MIN_ANALYZER_BARS
 from logger import log_trade_approved, scanner_logger
-from pipeline.snapshot_factory import SnapshotFactory
+from pipeline.snapshot_factory import SnapshotFactory, _required_bars_for_timeframe
 from pipeline.universe_builder import UniverseBuilder
 from rest_rate_guard import maybe_pause_warmup_rest
 from strategies import build_strategy_registry
+
+
+def _snapshot_kline_fingerprint(snapshot: Any) -> tuple:
+    """Closed-bar identity so Super can skip identical indicator work."""
+    candles = getattr(snapshot, "candles", None) or {}
+    parts: list[tuple] = []
+    for tf in sorted(candles):
+        df = candles.get(tf)
+        if df is None or getattr(df, "empty", True) or len(df) == 0:
+            parts.append((str(tf), 0, 0.0))
+            continue
+        row = df.iloc[-2] if len(df) >= 2 else df.iloc[-1]
+        ts = row["timestamp"] if "timestamp" in getattr(df, "columns", []) else 0
+        if hasattr(ts, "value"):
+            ts_i = int(ts.value)
+        else:
+            try:
+                ts_i = int(ts)
+            except (TypeError, ValueError):
+                ts_i = hash(str(ts)) & 0xFFFFFFFF
+        try:
+            close = round(float(row["close"]), 8)
+        except Exception:
+            close = 0.0
+        parts.append((str(tf), ts_i, close))
+    return tuple(parts)
 
 
 class EventScanOrchestrator:
@@ -66,6 +92,9 @@ class EventScanOrchestrator:
         self.funnel.attach_health_fn(self._funnel_health)
         self._validator: Any = None
         self._telegram: Any = None
+        self._scan_cycle_lock = threading.Lock()
+        self._last_super_dispatch: list[dict[str, Any]] = []
+        self._super_eval_cache: dict[str, tuple[tuple, Optional[Any], str, bool]] = {}
 
     def _local_backtest_bars(self, symbol: str) -> int:
         """Closed 15m bars from the WS/memory buffer — never REST."""
@@ -535,8 +564,8 @@ class EventScanOrchestrator:
         return dict_results
 
     def _maybe_fetch_single_closed_kline(self, symbols: list[str]) -> None:
-        """At most one limit=2 REST kline for a nearly-complete hot symbol."""
-        if bool(getattr(Config, "SCAN_WS_ONLY", True)):
+        """One incomplete (symbol, timeframe) REST seed at required scan depth."""
+        if bool(getattr(Config, "SCAN_WS_ONLY", True)) and not Config.allow_bounded_kline_rest_topup():
             return
         if not symbols or self._hub is None or self.exchange.in_scan_mode:
             return
@@ -549,32 +578,55 @@ class EventScanOrchestrator:
         if callable(can_rest) and not can_rest(2):
             return
 
+        inflight = getattr(self, "_kline_rest_inflight", None)
+        if inflight is None:
+            inflight = set()
+            self._kline_rest_inflight = inflight
+
         try:
             hot = {str(s).upper() for s in (self.priority_queue.hot_symbols or [])}
         except Exception:
             hot = set()
-        target = next((s for s in symbols if s.upper() in hot), "")
+        ordered = [str(s).upper() for s in symbols if s]
+        target = next((s for s in ordered if s in hot), "")
+        if not target and ordered:
+            target = ordered[0]
         if not target:
             return
 
         timeframes = Config.get_scan_kline_intervals()
         need_tf = ""
+        fetch_limit = int(Config.scan_kline_fetch_limit())
         for tf in timeframes:
+            key = (target, str(tf))
+            if key in inflight:
+                continue
             cached = self._hub.get_candles_cached_only(
                 target, tf, Config.CANDLE_FETCH_LIMIT
             )
             n = 0 if cached is None or getattr(cached, "empty", True) else len(cached)
-            if MIN_ANALYZER_BARS - 2 <= n < MIN_ANALYZER_BARS:
+            need = _required_bars_for_timeframe(tf)
+            if n < need:
                 need_tf = tf
+                fetch_limit = max(need, int(Config.scan_kline_fetch_limit()))
                 break
         if not need_tf:
             return
 
+        pair = (target, str(need_tf))
+        inflight.add(pair)
         try:
             with self.exchange.bootstrap_context():
-                df = self.exchange.fetch_bootstrap_klines_df(target, need_tf, 2)
+                df = self.exchange.fetch_bootstrap_klines_df(
+                    target, need_tf, fetch_limit
+                )
         except Exception:
+            mark = getattr(self, "_mark_kline_bootstrap_cooldown", None)
+            if callable(mark):
+                mark(target)
             return
+        finally:
+            inflight.discard(pair)
         if df is None or getattr(df, "empty", True):
             return
         try:
@@ -582,9 +634,11 @@ class EventScanOrchestrator:
         except Exception:
             return
         scanner_logger.info(
-            "[SCAN_KLINE_TOPUP] %s %s — fetched latest closed bar (limit=2)",
+            "[SCAN_KLINE_TOPUP] %s %s — REST seeded %s bars (need>=%s)",
             target,
             need_tf,
+            len(df),
+            _required_bars_for_timeframe(need_tf),
         )
 
     def refresh_tier1_universe(
@@ -772,10 +826,43 @@ class EventScanOrchestrator:
 
     def process_priority_scan_cycle(self) -> list[dict[str, Any]]:
         """
-        3-tier funnel tick: 1 Normal coin / 30s (2/min), 1 Hot REST/min, 1 Super eval/min.
-        Only Super-tier candidates are returned for execution.
+        3-tier funnel tick: 2 Normal coins/min, 1 Hot REST/min.
+        Super evals up to super_eval_batch_size() parked Super symbols per tick
+        (WS-only; not the old 1/min clock). Only Super is returned for execution.
         Normal/Hot always tick (even when entries are paused or REST is banned).
         """
+        lock = getattr(self, "_scan_cycle_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._scan_cycle_lock = lock
+        if not lock.acquire(blocking=False):
+            scanner_logger.warning(
+                "SCAN_OVERLAP — previous cycle still running; skip this tick"
+            )
+            log_scan_rejected("*", "scan overlap — previous cycle still running")
+            # Do not re-dispatch the previous Super list — that can duplicate entries.
+            return []
+        started = time.perf_counter()
+        try:
+            return self._process_priority_scan_cycle_inner()
+        finally:
+            duration_ms = (time.perf_counter() - started) * 1000.0
+            try:
+                from core.ops_heartbeat import record_scan_duration_ms, touch_scan_loop
+
+                record_scan_duration_ms(duration_ms)
+                touch_scan_loop(source="scanner", duration_ms=duration_ms)
+            except Exception:
+                pass
+            if duration_ms >= 5000.0:
+                scanner_logger.warning(
+                    "SCAN_SLOW %.0fms — protection loop is a separate thread; "
+                    "scan must not skip TP/SL checks",
+                    duration_ms,
+                )
+            lock.release()
+
+    def _process_priority_scan_cycle_inner(self) -> list[dict[str, Any]]:
         funnel_on = bool(Config.ENABLE_THREE_TIER_FUNNEL)
         rest_blocked = self._rest_is_blocked()
         if not funnel_on:
@@ -807,6 +894,7 @@ class EventScanOrchestrator:
 
     def _process_funnel_cycle(self) -> list[dict[str, Any]]:
         now = time.monotonic()
+        self._super_history_skips = 0
         if (
             self._tier1_symbols
             and (
@@ -828,6 +916,7 @@ class EventScanOrchestrator:
         ready, missing = self._partition_kline_ready(normal_due)
         self._note_missing_scan_klines(missing)
         if missing:
+            self._maybe_fetch_single_closed_kline(missing)
             self._bootstrap_missing_scan_klines(missing)
             ready, missing = self._partition_kline_ready(normal_due)
             self._note_missing_scan_klines(missing)
@@ -900,10 +989,17 @@ class EventScanOrchestrator:
                 if signal is not None:
                     candidates.append(signal)
                 else:
+                    reason = getattr(self, "_last_super_skip_reason", "") or (
+                        "No valid Super setup this bar"
+                    )
+                    if "kline history" in reason.lower():
+                        self._super_history_skips = int(
+                            getattr(self, "_super_history_skips", 0)
+                        ) + 1
+                        self._note_missing_scan_klines([super_rec.symbol])
                     self._report_super_skip(
                         super_rec.symbol,
-                        getattr(self, "_last_super_skip_reason", "")
-                        or "No valid Super setup this bar",
+                        reason,
                         instant=bool(getattr(self, "_last_super_skip_instant", False)),
                     )
 
@@ -911,6 +1007,7 @@ class EventScanOrchestrator:
         touch_scan_cycle(
             scanned=len(normal_due) + len(due_super),
             universe_total=max(universe_total, 1),
+            incomplete_klines=len(missing) + int(getattr(self, "_super_history_skips", 0)),
         )
         dict_results = [c.to_dict() for c in self._dedupe_symbol_candidates(candidates)]
         if dict_results:
@@ -932,6 +1029,7 @@ class EventScanOrchestrator:
                 super_n=len(self.funnel.super_symbols),
             )
         self._funnel_maybe_flush_digest(now)
+        self._last_super_dispatch = dict_results
         return dict_results
 
     def _log_empty_universe(self) -> None:
@@ -1234,9 +1332,15 @@ class EventScanOrchestrator:
                 else 0.0
             )
             if snapshot is None:
-                self.funnel.demote_super_to_normal(
-                    rec.symbol, reason="Day validation: insufficient kline history"
-                )
+                status = self.snapshot_factory.kline_history_status(rec.symbol)
+                skip_fn = getattr(self.funnel, "note_super_skip", None)
+                if callable(skip_fn):
+                    skip_fn(
+                        rec.symbol,
+                        "Day validation: "
+                        + str(status.get("reason") or "insufficient kline history"),
+                        instant=False,
+                    )
                 continue
             if spread > max_spread:
                 self.funnel.demote_super_to_normal(
@@ -1252,9 +1356,13 @@ class EventScanOrchestrator:
                 book_map=book_map,
             )
             if not scores:
-                self.funnel.demote_super_to_normal(
-                    rec.symbol, reason="Day validation: no live Super score"
-                )
+                skip_fn = getattr(self.funnel, "note_super_skip", None)
+                if callable(skip_fn):
+                    skip_fn(
+                        rec.symbol,
+                        "Day validation: no live Super score",
+                        instant=False,
+                    )
                 continue
             best = max(scores, key=_effective_score)
             live = _effective_score(best)
@@ -1349,7 +1457,10 @@ class EventScanOrchestrator:
         max_spread = float(Config.MAX_SPREAD_PERCENT)
         spread = float(getattr(snapshot, "spread_pct", 0.0) or 0.0) if snapshot is not None else 0.0
         if snapshot is None:
-            self._last_super_skip_reason = "Insufficient kline history"
+            status = self.snapshot_factory.kline_history_status(key)
+            self._last_super_skip_reason = str(
+                status.get("reason") or "Insufficient kline history"
+            )
             self._last_super_skip_instant = False
             return None
         if spread > max_spread:
@@ -1363,6 +1474,25 @@ class EventScanOrchestrator:
             self._last_super_skip_instant = True
             return None
 
+        fingerprint = _snapshot_kline_fingerprint(snapshot)
+        cache = getattr(self, "_super_eval_cache", None)
+        if cache is None:
+            cache = {}
+            self._super_eval_cache = cache
+        # Preflight (live_score_only) never uses cache as a fresh confirmation.
+        if not live_score_only:
+            cached = cache.get(key)
+            cache_ttl = 90.0
+            if (
+                cached is not None
+                and cached[0] == fingerprint
+                and (len(cached) < 5 or (time.monotonic() - float(cached[4])) <= cache_ttl)
+            ):
+                signal, reason, instant = cached[1], cached[2], cached[3]
+                self._last_super_skip_reason = reason
+                self._last_super_skip_instant = instant
+                return signal
+
         signal = self._evaluate_symbol(
             key,
             bar_open_ms=0,
@@ -1375,11 +1505,19 @@ class EventScanOrchestrator:
         if signal is None:
             strat = str(getattr(rec, "strategy", "") or "")
             if strat in SMC_STRATEGY_TAGS or strat.startswith("SMC"):
-                self._last_super_skip_reason = "Invalid SMC Orderblock"
+                self._last_super_skip_reason = "No signal — SMC setup invalid this bar"
                 self._last_super_skip_instant = True
             else:
-                self._last_super_skip_reason = "No valid Super setup this bar"
+                self._last_super_skip_reason = "No signal"
                 self._last_super_skip_instant = False
+            if not live_score_only:
+                self._super_eval_cache[key] = (
+                    fingerprint,
+                    None,
+                    self._last_super_skip_reason,
+                    self._last_super_skip_instant,
+                    time.monotonic(),
+                )
             return None
 
         band = score_range_for(signal.strategy)
@@ -1388,14 +1526,27 @@ class EventScanOrchestrator:
         score_for_band = live if live_score_only else max(live, remembered)
         if not band.meets_super(score_for_band):
             self._last_super_skip_reason = (
-                f"Super score {live:.1f} below {band.super_score:.1f}"
+                f"Low score — live {live:.1f} / funnel {remembered:.1f} below "
+                f"Super {band.super_score:.1f} (execution min {band.execution_min:.1f})"
             )
             self._last_super_skip_instant = False
+            if not live_score_only:
+                self._super_eval_cache[key] = (
+                    fingerprint,
+                    None,
+                    self._last_super_skip_reason,
+                    self._last_super_skip_instant,
+                    time.monotonic(),
+                )
             return None
         if rec is not None:
             meta = dict(rec.candidate.get("structure_metadata") or {})
             meta.update(signal.structure_metadata or {})
             meta["funnel_tier"] = "SUPER"
+            meta["funnel_score"] = remembered
+            meta["live_score"] = live
+            meta["execution_min"] = float(band.execution_min)
+            meta["super_floor"] = float(band.super_score)
             meta["backup_strategies"] = list(rec.backup_strategies)
             for meta_key in (
                 "backtest_validated",
@@ -1406,6 +1557,14 @@ class EventScanOrchestrator:
                 if meta_key in rec.candidate:
                     meta.setdefault(meta_key, rec.candidate[meta_key])
             signal.structure_metadata = meta
+        if not live_score_only:
+            self._super_eval_cache[key] = (
+                fingerprint,
+                signal,
+                "",
+                False,
+                time.monotonic(),
+            )
         return signal
 
     def _evaluate_and_collect(
@@ -1446,6 +1605,7 @@ class EventScanOrchestrator:
         touch_scan_cycle(
             scanned=len(symbols),
             universe_total=max(universe_total, len(symbols)),
+            incomplete_klines=len(missing),
         )
         dict_results = [c.to_dict() for c in candidates]
         if dict_results:

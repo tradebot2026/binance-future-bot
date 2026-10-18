@@ -103,7 +103,13 @@ def ensure_daily_baseline(
         wallet = fetch_daily_wallet_baseline(exchange, force=True)
         if wallet <= 0:
             persisted = _load_state()
-            if persisted and persisted.daily_starting_balance > 0:
+            # Never reuse a previous day's baseline as today's start — that
+            # would invent a false daily PnL stop. Retry when wallet is live.
+            if (
+                persisted
+                and persisted.utc_day == today
+                and persisted.daily_starting_balance > 0
+            ):
                 wallet = persisted.daily_starting_balance
         if wallet <= 0:
             system_logger.warning(
@@ -145,7 +151,12 @@ def ensure_daily_baseline(
         return baseline
 
     wallet = fetch_daily_wallet_baseline(exchange, force=True)
-    if wallet <= 0 and persisted and persisted.daily_starting_balance > 0:
+    if (
+        wallet <= 0
+        and persisted
+        and persisted.utc_day == today
+        and persisted.daily_starting_balance > 0
+    ):
         wallet = persisted.daily_starting_balance
 
     if wallet <= 0:

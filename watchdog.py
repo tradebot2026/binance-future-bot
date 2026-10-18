@@ -64,8 +64,16 @@ class WatchdogState:
         try:
             with open(self.path, encoding="utf-8") as handle:
                 data = json.load(handle)
-            self.breach_first_seen = {
+            now_wall = time.time()
+            raw_breach = {
                 str(k): float(v) for k, v in (data.get("breach_first_seen") or {}).items()
+            }
+            # Drop leftover monotonic stamps (< 1e9) so a restart cannot freeze
+            # emergency closes for the previous process's uptime.
+            self.breach_first_seen = {
+                key: stamp
+                for key, stamp in raw_breach.items()
+                if 1_000_000_000 <= stamp <= now_wall + 3600
             }
             self.alert_at = {
                 str(k): float(v) for k, v in (data.get("alert_at") or {}).items()
@@ -79,15 +87,17 @@ class WatchdogState:
             "breach_first_seen": self.breach_first_seen,
             "alert_at": self.alert_at,
             "saved_at": time.time(),
+            "pid": os.getpid(),
+            "role": "watchdog",
         }
         with open(self.path, "w", encoding="utf-8") as handle:
             json.dump(payload, handle, indent=2)
 
     def note_breach(self, key: str) -> float:
-        now = time.monotonic()
+        now = time.time()
         if key not in self.breach_first_seen:
             self.breach_first_seen[key] = now
-        return now - self.breach_first_seen[key]
+        return max(now - self.breach_first_seen[key], 0.0)
 
     def clear_breach(self, prefix: str) -> None:
         drop = [k for k in self.breach_first_seen if k.startswith(prefix)]
@@ -157,56 +167,58 @@ class PositionWatchdog:
         watchdog_logger.info("Watchdog shutdown complete.")
 
     def check_main_bot_health(self) -> bool:
-        """Return True when main bot appears alive and heartbeating."""
-        stale_seconds = self.main_bot_stale_seconds()
+        """Return True when the TP/SL monitor heartbeat is fresh.
+
+        A live PID is not sufficient: if monitor_wall is stale the main process
+        is treated as hung. Auto-restart is allowed only when the PID is gone
+        so a second bot instance cannot be spawned.
+        """
+        from core.ops_heartbeat import evaluate_heartbeat_health, read_heartbeat_payload
+
         process_running = self.is_main_process_running()
+        payload = read_heartbeat_payload()
+        verdict = evaluate_heartbeat_health(
+            payload,
+            process_running=process_running,
+        )
+        if verdict["protection_healthy"]:
+            if not process_running:
+                if self.state.should_alert("main_process_missing", 600):
+                    watchdog_logger.warning(
+                        "Main bot heartbeat OK but process not detected — continuing watchdog."
+                    )
+            return True
 
-        if stale_seconds is None and not process_running:
-            self._alert_main_down(
-                "Main bot process not found and no heartbeat file detected."
-            )
+        failing = ",".join(verdict.get("failing") or ["monitor"])
+        ws_state = str(payload.get("ws_state") or "?")
+        api_err = str(payload.get("last_api_error") or "none")
+        native_unprotected = payload.get("native_unprotected_open", "?")
+        self._alert_main_down(
+            f"Main bot unhealthy ({verdict.get('reason')}) | failing={failing} | "
+            f"process_running={process_running} | ws={ws_state} | "
+            f"native_unprotected={native_unprotected} | api={api_err}."
+        )
+        if verdict.get("allow_restart"):
             self._maybe_restart_main()
-            return False
-
-        if stale_seconds is not None and stale_seconds > Config.WATCHDOG_MAIN_STALE_SECONDS:
-            if process_running:
-                self._alert_main_down(
-                    f"Main bot heartbeat stale ({stale_seconds:.0f}s > "
-                    f"{Config.WATCHDOG_MAIN_STALE_SECONDS}s) but process still running — "
-                    "skipping auto-restart to avoid a duplicate bot."
-                )
-                watchdog_logger.warning(
-                    "Heartbeat stale while main process is alive — not auto-restarting."
-                )
-                return True
-            self._alert_main_down(
-                f"Main bot heartbeat stale ({stale_seconds:.0f}s > "
-                f"{Config.WATCHDOG_MAIN_STALE_SECONDS}s)."
+        else:
+            watchdog_logger.warning(
+                "Hung or stale main process — not auto-restarting to avoid a duplicate bot. "
+                "Emergency close remains SL/TP-breach only. reason=%s",
+                verdict.get("reason"),
             )
-            self._maybe_restart_main()
-            return False
-
-        if not process_running:
-            if self.state.should_alert("main_process_missing", 600):
-                watchdog_logger.warning(
-                    "Main bot heartbeat OK but process not detected — continuing watchdog."
-                )
-        return True
+        return False
 
     def main_bot_stale_seconds(self) -> Optional[float]:
-        """Seconds since last heartbeat file update; None if missing."""
-        path = Config.WATCHDOG_HEARTBEAT_FILE
-        if not os.path.isfile(path):
+        """Seconds since last protection (monitor) heartbeat; None if missing."""
+        from core.ops_heartbeat import read_heartbeat_payload
+
+        data = read_heartbeat_payload()
+        if not data:
             return self._stale_from_system_log()
-        try:
-            with open(path, encoding="utf-8") as handle:
-                data = json.load(handle)
-            ts = float(data.get("timestamp", 0))
-            if ts <= 0:
-                return None
-            return max(time.time() - ts, 0.0)
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        ts = float(data.get("monitor_wall") or 0.0) or float(data.get("timestamp") or 0.0)
+        if ts <= 0:
             return None
+        return max(time.time() - ts, 0.0)
 
     def _stale_from_system_log(self) -> Optional[float]:
         """Fallback: parse last 'Heartbeat |' line from system.log."""
@@ -230,6 +242,22 @@ class PositionWatchdog:
         return None
 
     def is_main_process_running(self) -> bool:
+        from core.instance_lock import another_main_is_running, pid_is_alive, read_lock_pid
+        from core.ops_heartbeat import read_heartbeat_payload
+
+        payload = read_heartbeat_payload()
+        try:
+            hb_pid = int(payload.get("pid") or 0)
+        except (TypeError, ValueError):
+            hb_pid = 0
+        if hb_pid > 0:
+            return pid_is_alive(hb_pid, unknown_means_alive=False)
+        lock_pid = read_lock_pid()
+        if lock_pid and pid_is_alive(lock_pid, unknown_means_alive=False):
+            return True
+        if another_main_is_running():
+            return True
+
         script = Config.WATCHDOG_MAIN_SCRIPT
         try:
             if sys.platform == "win32":
@@ -238,9 +266,11 @@ class PositionWatchdog:
                     "-NoProfile",
                     "-Command",
                     (
-                        "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" "
-                        f"| Where-Object {{ $_.CommandLine -like '*{script}*' -and "
-                        "$_.CommandLine -notlike '*watchdog.py*' }} "
+                        "Get-CimInstance Win32_Process "
+                        "| Where-Object { "
+                        "($_.Name -match '^python(w)?(\\.exe)?$' -or $_.Name -match '^py(\\.exe)?$') "
+                        f"-and $_.CommandLine -like '*{script}*' "
+                        "-and $_.CommandLine -notlike '*watchdog.py*' } "
                         "| Select-Object -First 1 -ExpandProperty ProcessId"
                     ),
                 ]
@@ -255,11 +285,10 @@ class PositionWatchdog:
             )
             if result.returncode != 0:
                 return False
-            output = (result.stdout or "").strip()
-            return bool(output)
+            return bool((result.stdout or "").strip())
         except (subprocess.SubprocessError, OSError) as exc:
             watchdog_logger.debug("Process check failed: %s", exc)
-            return True
+            return False
 
     def _alert_main_down(self, detail: str) -> None:
         if not self.state.should_alert("main_bot_down", 300):
@@ -278,8 +307,10 @@ class PositionWatchdog:
         if not self.state.should_alert("main_restart_attempt", 600):
             return
         script = Config.WATCHDOG_MAIN_SCRIPT
-        if not os.path.isfile(script):
-            watchdog_logger.error("Auto-restart skipped — %s not found.", script)
+        root = os.path.dirname(os.path.abspath(__file__))
+        script_path = script if os.path.isabs(script) else os.path.join(root, script)
+        if not os.path.isfile(script_path):
+            watchdog_logger.error("Auto-restart skipped — %s not found.", script_path)
             return
         from core.instance_lock import another_main_is_running
 
@@ -289,18 +320,14 @@ class PositionWatchdog:
             )
             return
         try:
-            subprocess.Popen(
-                [sys.executable, script],
-                cwd=os.getcwd(),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                start_new_session=True,
-            )
+            from core.process_spawn import spawn_detached_python
+
+            spawn_detached_python(script_path, cwd=root)
             watchdog_logger.warning("Attempted auto-restart of %s.", script)
             self.telegram.send_message(
                 f"♻️ <b>Watchdog</b> attempted to restart <code>{escape_html(script)}</code>."
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
             watchdog_logger.error("Auto-restart failed: %s", exc)
 
     def check_open_positions(self, *, main_bot_healthy: bool) -> None:
@@ -324,15 +351,24 @@ class PositionWatchdog:
             if symbol and side and qty > 0:
                 pos_map[(symbol, side)] = pos
 
-        db_trades = self.db.get_open_trades()
-        if not db_trades:
-            return
+        db_reliable = True
+        try:
+            db_trades = self.db.get_open_trades() or []
+        except Exception as exc:
+            db_reliable = False
+            db_trades = []
+            watchdog_logger.error(
+                "Watchdog DB open trades failed — REST orphan tracking still runs: %s",
+                exc,
+            )
 
+        db_keys: set[tuple[str, str]] = set()
         for trade in db_trades:
             symbol = str(trade.get("symbol", "")).upper()
             side = str(trade.get("side", "LONG")).upper()
             trade_id = str(trade.get("trade_id", ""))
             key = (symbol, side)
+            db_keys.add(key)
             prefix = f"{trade_id}:"
 
             exchange_pos = pos_map.get(key)
@@ -364,11 +400,20 @@ class PositionWatchdog:
             )
 
             if Config.WATCHDOG_EMERGENCY_ONLY_WHEN_MAIN_DOWN and main_bot_healthy:
-                watchdog_logger.debug(
-                    "[%s] Breach observed but main bot healthy — deferring to soft monitor.",
-                    symbol,
-                )
-                continue
+                from core.ops_heartbeat import read_heartbeat_payload
+
+                hb = read_heartbeat_payload()
+                native_on = bool(hb.get("native_tp_sl", True))
+                try:
+                    unprotected = int(hb.get("native_unprotected_open") or 0)
+                except (TypeError, ValueError):
+                    unprotected = 0
+                if native_on and unprotected <= 0:
+                    watchdog_logger.debug(
+                        "[%s] Breach observed but main bot healthy — deferring to soft monitor.",
+                        symbol,
+                    )
+                    continue
 
             grace = Config.WATCHDOG_BREACH_GRACE_SECONDS
             if age < grace:
@@ -382,6 +427,80 @@ class PositionWatchdog:
                 continue
 
             self._emergency_close(trade, exchange_pos, signal, mark)
+
+        self._check_untracked_exchange_positions(
+            pos_map, db_keys, db_reliable=db_reliable
+        )
+
+    def _check_untracked_exchange_positions(
+        self,
+        pos_map: dict[tuple[str, str], dict[str, Any]],
+        db_keys: set[tuple[str, str]],
+        *,
+        db_reliable: bool = True,
+    ) -> None:
+        """Flag and flatten exchange positions that have no DB trade after grace."""
+        from reconciliation import (
+            _set_unresolved_orphans,
+            exchange_orphan_as_trade,
+        )
+
+        orphans: list[dict[str, Any]] = []
+        for key, pos in pos_map.items():
+            if key in db_keys:
+                continue
+            orphans.append(pos)
+        _set_unresolved_orphans(orphans)
+
+        live_ids = {
+            str(exchange_orphan_as_trade(pos).get("trade_id") or "") for pos in orphans
+        }
+        for breach_key in list(self.state.breach_first_seen):
+            if not str(breach_key).startswith("orphan-ex-"):
+                continue
+            tid = str(breach_key).split(":", 1)[0]
+            if tid not in live_ids:
+                self.state.clear_breach(f"{tid}:")
+
+        grace = Config.WATCHDOG_BREACH_GRACE_SECONDS
+        for pos in orphans:
+            trade = exchange_orphan_as_trade(pos)
+            symbol = str(trade.get("symbol") or "").upper()
+            side = str(trade.get("side") or "LONG").upper()
+            trade_id = str(trade.get("trade_id") or "")
+            qty = safe_float(pos.get("quantity") or trade.get("quantity"))
+            mark = safe_float(pos.get("mark_price"))
+            if mark <= 0:
+                mark = self.exchange.fetch_mark_price_rest(symbol) or 0.0
+            breach_key = f"{trade_id}:UNPROTECTED"
+            age = self.state.note_breach(breach_key)
+            watchdog_logger.critical(
+                "[%s] Exchange-only orphan | %s | qty=%s | mark=%.6f | age=%.0fs",
+                symbol,
+                side,
+                qty,
+                mark,
+                age,
+            )
+            if self.state.should_alert(f"orphan-ex:{symbol}:{side}", 120):
+                self.telegram.send_message(
+                    "🚨 <b>Untracked exchange position</b>\n"
+                    f"{escape_html(symbol)} {escape_html(side)} qty={qty}\n"
+                    "<i>No DB trade — entries blocked. Watchdog will flatten "
+                    f"after {grace:.0f}s if it stays untracked.</i>"
+                )
+            if age < grace:
+                continue
+            if not db_reliable:
+                watchdog_logger.critical(
+                    "[%s] Orphan flatten deferred — DB open-trades read failed this cycle.",
+                    symbol,
+                )
+                continue
+            if exit_claim_active(trade_id):
+                continue
+            signal = ExitSignal("SL", "UNPROTECTED_ORPHAN", False, qty)
+            self._emergency_close(trade, pos, signal, mark)
 
     def _evaluate_exit_signal(
         self, trade: dict[str, Any], mark_price: float
@@ -546,6 +665,15 @@ class PositionWatchdog:
         order_response: Optional[dict[str, Any]] = None,
     ) -> None:
         trade_id = str(trade.get("trade_id", ""))
+        from reconciliation import is_synthetic_exchange_orphan
+
+        if is_synthetic_exchange_orphan(trade):
+            watchdog_logger.info(
+                "[POSITION_CLOSED] Synthetic orphan %s flattened | %s | no DB row",
+                trade.get("symbol"),
+                signal.reason,
+            )
+            return
         metadata = self.db.parse_trade_metadata(trade)
         symbol = str(trade.get("symbol", "")).upper()
         side = str(trade.get("side", "LONG")).upper()
@@ -616,6 +744,16 @@ class PositionWatchdog:
         *,
         pnl: Optional[float] = None,
     ) -> None:
+        from reconciliation import is_synthetic_exchange_orphan
+
+        if is_synthetic_exchange_orphan(trade):
+            watchdog_logger.info(
+                "[POSITION_CLOSED] Synthetic orphan %s %s | Reason: Watchdog %s | no DB row",
+                trade.get("symbol"),
+                trade.get("side"),
+                reason,
+            )
+            return
         self.db.close_trade_and_sync_stats(
             trade,
             exit_price=exit_price,

@@ -85,6 +85,11 @@ class TestEntryStageClaim(unittest.TestCase):
                     self.assertEqual(int(row["entry_stage"]), 2)
                     meta = db.parse_trade_metadata(row)
                     self.assertEqual(int(meta["entry_stage"]), 2)
+                    reverted = db.revert_entry_stage("t-dca-1", 2)
+                    self.assertTrue(reverted)
+                    row = db.get_trade("t-dca-1")
+                    self.assertEqual(int(row["entry_stage"]), 1)
+                    self.assertFalse(db.revert_entry_stage("t-dca-1", 2))
                 finally:
                     db.close()
 

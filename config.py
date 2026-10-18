@@ -39,14 +39,14 @@ def _env_use_testnet() -> bool:
 
 
 def _env_dry_run() -> bool:
-    """
-    Explicit DRY_RUN wins. If missing/empty: False on testnet (live test orders),
-    True on mainnet (fail-closed — no live money without an explicit flag).
-    Unrecognized values stay True.
+    """Fail-closed: missing, empty, or unrecognized DRY_RUN means no orders.
+
+    Testnet and Live both require an explicit DRY_RUN=false to submit orders.
+    Unset must never be inferred as 'the operator intended to trade'.
     """
     raw = os.getenv("DRY_RUN")
     if raw is None or not str(raw).strip():
-        return not _env_use_testnet()
+        return True
     value = str(raw).strip().lower()
     if value in ("false", "0", "f", "no"):
         return False
@@ -79,6 +79,9 @@ class Config:
     USE_TESTNET: bool = _env_use_testnet()
     BINANCE_ENV: str = "TESTNET" if _env_use_testnet() else "MAINNET"
     DRY_RUN: bool = _env_dry_run()
+    # Diagnostic market order. Default off — /testtrade cannot place orders
+    # unless the operator sets ENABLE_TESTTRADE_COMMAND=true (Testnet + DRY_RUN=false).
+    ENABLE_TESTTRADE_COMMAND: bool = _env_bool("ENABLE_TESTTRADE_COMMAND", False)
     ALLOW_MAINNET_FORCE_RESUME: bool = _env_bool(
         "ALLOW_MAINNET_FORCE_RESUME", False
     )
@@ -147,6 +150,9 @@ class Config:
     WS_KLINE_SOCKET_STALE_SECONDS: int = _env_int(
         "WS_KLINE_SOCKET_STALE_SECONDS", 600
     )
+    # Scan evaluation reads WS/cache only. Bounded REST kline top-up is gated
+    # separately by allow_bounded_kline_rest_topup() — do not flip this to False
+    # to "fix" history; that reopens unbounded scan-path REST.
     SCAN_WS_ONLY: bool = _env_bool("SCAN_WS_ONLY", True)
     BOOTSTRAP_KLINE_BATCH_SIZE: int = _env_int("BOOTSTRAP_KLINE_BATCH_SIZE", 9)
     BOOK_TICKER_CACHE_SECONDS: int = _env_int("BOOK_TICKER_CACHE_SECONDS", 90)
@@ -327,7 +333,12 @@ class Config:
     MIN_NOTIONAL_RISK_TOLERANCE: float = _env_float("MIN_NOTIONAL_RISK_TOLERANCE", 1.35)
     RESTART_DELAY_SECONDS: int = _env_int("RESTART_DELAY_SECONDS", 10)
     MAX_RESTART_DELAY_SECONDS: int = _env_int("MAX_RESTART_DELAY_SECONDS", 120)
+    # Historical 0 meant unlimited crash auto-restarts (unsafe crash loops).
+    # 0 now applies MAX_AUTO_RESTARTS_HARD_CAP (default 5) so virtual SL/TP
+    # can return after a crash without looping forever. Telegram /restart is
+    # unbounded. Set a positive value to use a tighter bound (still capped).
     MAX_AUTO_RESTARTS: int = _env_int("MAX_AUTO_RESTARTS", 0)
+    MAX_AUTO_RESTARTS_HARD_CAP: int = _env_int("MAX_AUTO_RESTARTS_HARD_CAP", 5)
     ERROR_ALERT_THRESHOLD: int = _env_int("ERROR_ALERT_THRESHOLD", 3)
     CRITICAL_ALERT_COOLDOWN_SECONDS: int = _env_int("CRITICAL_ALERT_COOLDOWN_SECONDS", 300)
 
@@ -347,7 +358,11 @@ class Config:
     ENABLE_BREAK_EVEN: bool = _env_bool("ENABLE_BREAK_EVEN", True)
     ENABLE_TRAILING_STOP: bool = _env_bool("ENABLE_TRAILING_STOP", True)
     ENABLE_PARTIAL_TP: bool = _env_bool("ENABLE_PARTIAL_TP", True)
-    ENABLE_NATIVE_TP_SL: bool = _env_bool("ENABLE_NATIVE_TP_SL", False)
+    # Default ON. Exchange-side STOP_MARKET / TAKE_PROFIT_MARKET is required
+    # crash protection. Set ENABLE_NATIVE_TP_SL=false only for an explicit
+    # virtual-only lab. Soft/virtual SL remains an in-process backup.
+    # Live still requires BINANCE_ENV=MAINNET and USE_TESTNET=false.
+    ENABLE_NATIVE_TP_SL: bool = _env_bool("ENABLE_NATIVE_TP_SL", True)
     ENABLE_SOFT_TP_SL: bool = _env_bool("ENABLE_SOFT_TP_SL", True)
     VIRTUAL_TP_TICKER_MAX_AGE_SECONDS: float = _env_float(
         "VIRTUAL_TP_TICKER_MAX_AGE_SECONDS", 15.0
@@ -794,6 +809,8 @@ class Config:
     ENABLE_MONTHLY_REPORT: bool = _env_bool("ENABLE_MONTHLY_REPORT", True)
     MAX_SCAN_UNIVERSE: int = _env_int("MAX_SCAN_UNIVERSE", 120)
     MAX_ENTRIES_PER_CYCLE: int = _env_int("MAX_ENTRIES_PER_CYCLE", 12)
+    # Informational / historical. Super and execution use STRATEGY_MIN_SCORE
+    # (via execution_min_score). Do not lower the live floor to this value.
     MULTI_CONFLUENCE_MIN_SCORE: float = _env_float("MULTI_CONFLUENCE_MIN_SCORE", 65.0)
     NEAR_MISS_SCORE_MIN: float = _env_float("NEAR_MISS_SCORE_MIN", 65.0)
     NEAR_MISS_SCORE_MAX: float = _env_float("NEAR_MISS_SCORE_MAX", 69.0)
@@ -908,6 +925,27 @@ class Config:
     def testnet_strategy_relax(cls) -> bool:
         """True when Testnet should use looser entry floors (quiet ticker streams)."""
         return bool(cls.USE_TESTNET and cls.TESTNET_RELAX_STRATEGY_THRESHOLDS)
+
+    @classmethod
+    def allow_bounded_kline_rest_topup(cls) -> bool:
+        """One incomplete (symbol, timeframe) REST seed at scan depth, SCAN_WS_ONLY-safe."""
+        return bool(
+            cls.ENABLE_PACED_KLINE_BOOTSTRAP or cls.ENABLE_WS_KLINE_STARTUP_BOOTSTRAP
+        )
+
+    @classmethod
+    def max_crash_auto_restarts(cls) -> int:
+        """Crash-loop bound. Historical 0 (unlimited) now uses HARD_CAP.
+
+        Disabling crash restart entirely would leave virtual SL/TP down after
+        the first crash while native TP/SL is off. A finite cap restores
+        protection without an infinite restart loop.
+        """
+        raw = int(getattr(cls, "MAX_AUTO_RESTARTS", 0) or 0)
+        cap = max(int(getattr(cls, "MAX_AUTO_RESTARTS_HARD_CAP", 5) or 5), 1)
+        if raw <= 0:
+            return cap
+        return min(raw, cap)
 
     @classmethod
     def effective_min_score(cls, base: float) -> float:
@@ -1140,7 +1178,6 @@ class Config:
             os.makedirs(directory, exist_ok=True)
 
     @classmethod
-    @classmethod
     def super_tier_coins_per_minute(cls) -> int:
         """At least 4 Super evals/min so more than two qualified coins stay live."""
         return min(max(int(getattr(cls, "SUPER_TIER_COINS_PER_MINUTE", 4)), 4), 8)
@@ -1189,6 +1226,11 @@ class Config:
         if raw <= 0:
             raw = 2700
         return min(max(raw, 180), 3600)
+
+    @classmethod
+    def orders_allowed(cls) -> bool:
+        """True only when DRY_RUN is explicitly false. Unset DRY_RUN is fail-closed."""
+        return not bool(cls.DRY_RUN)
 
     @classmethod
     def validate_config(cls) -> bool:

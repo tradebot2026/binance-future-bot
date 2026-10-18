@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from typing import Any, Optional, TYPE_CHECKING
 
 from config import Config
+from constants import TRADE_STATUS_OPEN
 from exchange import ClosedPositionPnl
 from logger import error_logger, system_logger, trade_logger
 from utils import safe_float, utc_now
@@ -78,6 +79,17 @@ def resolve_exchange_close_pnl(
 
     exit_price = safe_float(exchange.get_market_price(symbol, side))
     estimated = db.estimate_trade_pnl(trade, exit_price)
+    if abs(estimated) < 1e-12:
+        trade_logger.warning(
+            "[%s] Exchange PnL unavailable and local estimate is 0 — "
+            "not booking a $0.0000 fallback.",
+            symbol,
+        )
+        return ClosedPositionPnl(
+            realized_pnl=0.0,
+            exit_price=exit_price,
+            source="pending",
+        )
     trade_logger.warning(
         "[%s] Exchange PnL unavailable — using local estimate %.4f (exit=%.6f)",
         symbol,
@@ -97,6 +109,7 @@ def finalize_reconciled_trade_close(
     trade: dict[str, Any],
     exit_reason: str,
     manager: Optional["TradeManager"] = None,
+    telegram: Optional["TelegramManager"] = None,
 ) -> float:
     """Close a DB trade through the normal manager pipeline when exchange is flat."""
     symbol = str(trade.get("symbol", "")).upper()
@@ -106,6 +119,7 @@ def finalize_reconciled_trade_close(
     if exit_price <= 0:
         exit_price = safe_float(exchange.get_market_price(symbol, side))
 
+    book_daily_pnl = str(resolved.source or "").lower() != "pending"
     if manager is not None:
         return manager._mark_trade_closed(
             trade,
@@ -114,7 +128,7 @@ def finalize_reconciled_trade_close(
             pnl=resolved.realized_pnl,
             pnl_source=resolved.source,
             notify=True,
-            book_daily_pnl=True,
+            book_daily_pnl=book_daily_pnl,
         )
 
     if hasattr(exchange, "refresh_wallet_after_trade"):
@@ -127,10 +141,26 @@ def finalize_reconciled_trade_close(
         exit_price=exit_price,
         exit_reason=exit_reason,
         pnl=resolved.realized_pnl,
-        book_daily_pnl=True,
+        book_daily_pnl=book_daily_pnl,
         current_balance=balance if balance > 0 else None,
     )
     exchange.clear_position_cache(symbol, side)
+    tg = telegram or getattr(manager, "telegram", None)
+    sender = getattr(tg, "send_close_alert", None) if tg is not None else None
+    if callable(sender):
+        try:
+            sender(
+                symbol=symbol,
+                reason=exit_reason,
+                pnl=total_pnl,
+                strategy=str(trade.get("strategy", "")),
+                trade_id=str(trade.get("trade_id") or ""),
+                exit_price=exit_price,
+                side=side,
+                pnl_source=resolved.source,
+            )
+        except Exception as exc:
+            error_logger.debug("Reconciled-close Telegram alert failed: %s", exc)
     return total_pnl
 
 
@@ -361,6 +391,7 @@ def sync_active_trades_on_demand(
             trade,
             "RECONCILED_MANUAL_CLOSE",
             manager=manager,
+            telegram=telegram,
         )
         position_reconcile_guard.note_present(trade_id)
         summary["closed"].append(
@@ -413,8 +444,11 @@ def symbol_blocked_for_new_entry(
     if not ignore_in_flight and is_symbol_entry_in_flight(symbol):
         return True, f"Entry in flight for {symbol}"
 
-    if db.get_open_trades_for_symbol(symbol):
-        return True, f"Active DB trade exists for {symbol}"
+    try:
+        if db.get_open_trades_for_symbol(symbol):
+            return True, f"Active DB trade exists for {symbol}"
+    except Exception as exc:
+        return True, f"DB open-trades failed for {symbol}: {exc}"
 
     rest_open = exchange.symbol_has_open_position_rest(symbol)
     if rest_open is True:
@@ -425,6 +459,91 @@ def symbol_blocked_for_new_entry(
             return True, f"{side} position visible on {symbol} (WS/cache)"
 
     return False, ""
+
+
+_unresolved_orphan_exchange: list[dict[str, Any]] = []
+_orphan_gate_reason: str = ""
+_state_unreliable_reason: str = ""
+
+
+def mark_state_unreliable(reason: str) -> None:
+    global _state_unreliable_reason
+    _state_unreliable_reason = str(reason or "unknown_state")
+    error_logger.critical("LOCAL/EXCHANGE STATE UNRELIABLE — %s", _state_unreliable_reason)
+
+
+def clear_state_unreliable() -> None:
+    global _state_unreliable_reason
+    _state_unreliable_reason = ""
+
+
+def state_is_unreliable() -> tuple[bool, str]:
+    if _state_unreliable_reason:
+        return True, f"State unreliable: {_state_unreliable_reason} — new entries blocked"
+    return False, ""
+
+
+def unresolved_orphan_exchange_positions() -> list[dict[str, Any]]:
+    return list(_unresolved_orphan_exchange)
+
+
+def exchange_orphan_as_trade(pos: dict[str, Any]) -> dict[str, Any]:
+    """Build a monitor/watchdog record for an exchange position with no DB row."""
+    symbol = str(pos.get("symbol") or "").upper()
+    side = str(pos.get("positionSide") or pos.get("side") or "LONG").upper()
+    qty = safe_float(pos.get("quantity") or pos.get("positionAmt"))
+    entry = safe_float(pos.get("entry_price") or pos.get("entryPrice"))
+    return {
+        "trade_id": f"orphan-ex-{symbol}-{side}",
+        "symbol": symbol,
+        "side": side,
+        "entry_price": entry,
+        "quantity": abs(qty),
+        "status": TRADE_STATUS_OPEN,
+        "stop_loss": 0.0,
+        "take_profit_1": 0.0,
+        "take_profit_2": 0.0,
+        "take_profit_3": 0.0,
+        "opened_at": str(pos.get("opened_at") or utc_now().isoformat()),
+        "metadata": {
+            "orphan_exchange": True,
+            "native_protection_verified": False,
+        },
+    }
+
+
+def is_synthetic_exchange_orphan(trade: dict[str, Any]) -> bool:
+    trade_id = str(trade.get("trade_id") or "")
+    if trade_id.startswith("orphan-ex-"):
+        return True
+    metadata = trade.get("metadata")
+    if isinstance(metadata, dict) and metadata.get("orphan_exchange"):
+        return True
+    return False
+
+
+def entries_blocked_by_unresolved_orphans() -> tuple[bool, str]:
+    """Block new entries while exchange positions exist without a DB record."""
+    if _unresolved_orphan_exchange:
+        n = len(_unresolved_orphan_exchange)
+        reason = _orphan_gate_reason or (
+            f"Unresolved orphan exchange positions ({n}) — new entries blocked "
+            "until operator reconciles"
+        )
+        return True, reason
+    return False, ""
+
+
+def _set_unresolved_orphans(positions: list[dict[str, Any]]) -> None:
+    global _unresolved_orphan_exchange, _orphan_gate_reason
+    _unresolved_orphan_exchange = list(positions)
+    if positions:
+        _orphan_gate_reason = (
+            f"Unresolved orphan exchange positions ({len(positions)}) — "
+            "new entries blocked until operator reconciles"
+        )
+    else:
+        _orphan_gate_reason = ""
 
 
 def reconcile_positions_at_startup(
@@ -517,6 +636,7 @@ def reconcile_positions(
                         trade,
                         "RECONCILED_MANUAL_CLOSE",
                         manager=manager,
+                        telegram=telegram,
                     )
                     position_reconcile_guard.note_present(trade_id)
                     closed_externally += 1
@@ -556,6 +676,7 @@ def reconcile_positions(
                     trade,
                     "RECONCILED_PHANTOM_PURGE",
                     manager=manager,
+                    telegram=telegram,
                 )
                 position_reconcile_guard.note_present(trade_id)
                 closed_externally += 1
@@ -581,6 +702,7 @@ def reconcile_positions(
         if key not in db_keys:
             orphan_exchange.append(pos)
 
+    _set_unresolved_orphans(orphan_exchange)
     if orphan_exchange:
         _persist_orphan_alert(orphan_exchange)
         for pos in orphan_exchange:
@@ -596,13 +718,18 @@ def reconcile_positions(
             lines = [
                 "🚨 <b>Orphan exchange positions detected</b>",
                 "These exist on Binance but are not tracked in the DB:",
+                "<b>New entries are blocked</b> until this is resolved.",
+                "They are now in the monitor/watchdog loop (no invented SL).",
+                "Watchdog flattens unprotected orphans after breach grace.",
             ]
             for pos in orphan_exchange[:10]:
                 lines.append(
                     f"• {pos['symbol']} {pos['positionSide']} "
                     f"qty={pos['quantity']} entry={safe_float(pos.get('entry_price')):.4f}"
                 )
-            lines.append("<i>Manual review or close recommended.</i>")
+            lines.append(
+                "<i>Manual review required — do not auto-adopt as a normal trade.</i>"
+            )
             telegram.send_message("\n".join(lines))
 
     purged_files = purge_stale_recovery_files(db, exchange)
@@ -616,6 +743,7 @@ def reconcile_positions(
         "recovery_lines_purged": purged_files,
     }
 
+    clear_state_unreliable()
     system_logger.info(
         "Reconciliation complete (%s) | exchange_open=%s | phantoms_purged=%s | "
         "orphan_exchange=%s | recovery_lines_purged=%s",
@@ -799,6 +927,7 @@ def _purge_orphan_exchange_file(exchange: "BinanceExchangeManager") -> int:
 def reconcile_uncertain_executions(
     exchange: "BinanceExchangeManager",
     executor: Any = None,
+    manager: Any = None,
 ) -> int:
     """Resolve accepted-but-unconfirmed orders against Binance. Never re-submits."""
     from core.execution_ledger import ExecutionPhase, get_execution_ledger
@@ -844,4 +973,95 @@ def reconcile_uncertain_executions(
                 else ExecutionPhase.ORDER_REJECTED
             )
             ledger.transition(record, phase, extra=f"reconcile status={status}")
+    adopted += reconcile_uncertain_dca(exchange, executor, manager=manager)
     return adopted
+
+
+def reconcile_uncertain_dca(
+    exchange: "BinanceExchangeManager",
+    executor: Any = None,
+    manager: Any = None,
+) -> int:
+    """Resolve claimed-but-unconfirmed DCA adds via order lookup. Never resubmits."""
+    if executor is None:
+        return 0
+    db = getattr(executor, "db", None)
+    if db is None:
+        return 0
+    try:
+        trades = db.get_open_trades() or []
+    except Exception as exc:
+        error_logger.critical("DCA uncertain reconcile aborted — DB failure: %s", exc)
+        return 0
+    resolved = 0
+    for trade in trades:
+        try:
+            metadata = db.parse_trade_metadata(trade)
+        except Exception:
+            continue
+        step = int(safe_float(metadata.get("dca_uncertain_step")))
+        client_id = str(metadata.get("dca_uncertain_client_id") or "")
+        order_id = str(metadata.get("dca_uncertain_order_id") or "")
+        if step not in (2, 3) or not (client_id or order_id):
+            continue
+        symbol = str(trade.get("symbol") or "")
+        order = None
+        if order_id:
+            order = exchange.lookup_order_by_id(symbol, order_id)
+        if not order and client_id:
+            order = exchange.lookup_order_by_client_id(symbol, client_id)
+        if not order:
+            continue
+        status = str(order.get("status") or "").upper()
+        executed = safe_float(order.get("executedQty"))
+        if status in {"FILLED", "PARTIALLY_FILLED"} and executed > 0:
+            result = executor.adopt_confirmed_dca_fill(trade, order, step)
+            if result:
+                resolved += 1
+                trade_logger.info(
+                    "[RECONCILE_DCA] %s step=%s status=%s qty=%.8f",
+                    symbol,
+                    step,
+                    status,
+                    executed,
+                )
+                if result.get("failsafe_close"):
+                    closer = getattr(manager, "failsafe_close_trade", None)
+                    if callable(closer):
+                        closer(
+                            trade,
+                            "INVALID_SL_FAILSAFE",
+                            "DCA fill through planned SL or native protection failed",
+                        )
+                    else:
+                        try:
+                            exchange.close_position_quantity(
+                                symbol,
+                                str(trade.get("side") or "LONG"),
+                                safe_float(trade.get("quantity")),
+                            )
+                        except Exception as exc:
+                            error_logger.critical(
+                                "DCA failsafe close missing manager for %s: %s",
+                                symbol,
+                                exc,
+                            )
+            continue
+        if status in {"CANCELED", "EXPIRED", "REJECTED"} and executed <= 0:
+            revert = getattr(db, "revert_entry_stage", None)
+            if callable(revert):
+                revert(str(trade.get("trade_id") or ""), step)
+            for key in (
+                "dca_uncertain_order_id",
+                "dca_uncertain_client_id",
+                "dca_uncertain_step",
+                "dca_uncertain_status",
+                "dca_uncertain_at",
+            ):
+                metadata.pop(key, None)
+            try:
+                db.update_trade(str(trade["trade_id"]), {"metadata": metadata})
+            except Exception as exc:
+                error_logger.error("Failed to clear DCA uncertain flags: %s", exc)
+            resolved += 1
+    return resolved

@@ -115,7 +115,9 @@ def evaluate_breakout_retest(
     score += touch_quality * 8.0
 
     result.score = min(score, 94.0)
-    result.passed = result.score >= Config.BREAKOUT_RETEST_MIN_SCORE
+    result.passed = result.score >= Config.effective_min_score(
+        Config.BREAKOUT_RETEST_MIN_SCORE
+    )
     result.entry = entry
     result.stop_loss = sl
     result.tp1 = tp1

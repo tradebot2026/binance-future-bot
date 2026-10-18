@@ -36,15 +36,19 @@ from exit_coordinator import (
 )
 from reconciliation import (
     confirm_external_close_allowed,
+    exchange_orphan_as_trade,
     is_exchange_sync_close_reason,
+    is_synthetic_exchange_orphan,
     is_within_position_grace_period,
     position_reconcile_guard,
     resolve_exchange_close_pnl,
     rest_position_quantity,
+    unresolved_orphan_exchange_positions,
 )
 from utils import (
     escape_html,
     resolve_binance_fill_price,
+    round_protective_price,
     round_step_size,
     safe_float,
     utc_now,
@@ -60,6 +64,7 @@ from core.dca_plan import (
     resolved_final_sl,
     should_trigger_add,
     sl_is_armed,
+    sl_is_valid_vs_entry,
 )
 
 if TYPE_CHECKING:
@@ -111,9 +116,13 @@ class TradeManager:
         self._monitor_stop = threading.Event()
         self._close_queue: queue.Queue[Optional[_CloseTask]] = queue.Queue()
         self._close_inflight: set[str] = set()
+        self._close_done: dict[str, threading.Event] = {}
+        self._close_ok: dict[str, bool] = {}
         self._close_lock = threading.Lock()
         self._market_close_attempts: dict[str, int] = {}
         self._market_close_exhausted: set[str] = set()
+        self._qty_rest_confirm_at: dict[str, float] = {}
+        self._force_rest_monitor = False
         self._tick_worker = threading.Thread(
             target=self._price_tick_worker,
             name="price-tick-worker",
@@ -154,6 +163,15 @@ class TradeManager:
         """Stop TP/SL, tick, and close-order worker threads."""
         self._monitor_stop.set()
         self._tick_event.set()
+        try:
+            self._close_queue.put_nowait(None)
+        except Exception:
+            pass
+        current = threading.current_thread()
+        for worker in (self._tick_worker, self._fast_monitor, self._close_worker):
+            if worker is current or not worker.is_alive():
+                continue
+            worker.join(timeout=8.0)
 
     def _register_open_trade_symbols(self) -> None:
         """Ensure every open DB trade receives miniTicker-driven TP/SL evaluation."""
@@ -227,13 +245,16 @@ class TradeManager:
                     )
                     rest_interval = min(rest_interval, 50.0)
                 rest_due = (now - last_rest_refresh) >= rest_interval
-                if rest_due and not user_ok and not self.exchange.is_rest_blocked()[0]:
-                    self._prefetch_live_prices_for_open_trades()
+                force_rest = bool(getattr(self, "_force_rest_monitor", False))
+                # REST-confirm on interval or when a cache miss forced a
+                # quantity check. User-stream gaps shorten rest_interval above.
+                if (rest_due or force_rest) and not self.exchange.is_rest_blocked()[0]:
+                    if not user_ok or force_rest:
+                        self._prefetch_live_prices_for_open_trades()
+                    self._force_rest_monitor = False
                     self.monitor_open_trades(ws_only=False)
                     last_rest_refresh = now
                 else:
-                    if rest_due:
-                        last_rest_refresh = now
                     self.monitor_open_trades(ws_only=True)
                 touch_monitor_loop(source="position_monitor")
             except Exception as exc:
@@ -247,11 +268,57 @@ class TradeManager:
             return original
         return safe_float(trade.get("quantity"))
 
+    def _open_trades_for_monitor(self) -> list[dict[str, Any]]:
+        """DB trades, persist-fail fills, and exchange-only orphans for TP/SL."""
+        try:
+            trades = list(self.db.get_open_trades() or [])
+        except Exception:
+            trades = []
+        seen_ids = {str(t.get("trade_id") or "") for t in trades}
+        seen_keys = {
+            (
+                str(t.get("symbol") or "").upper(),
+                str(t.get("side") or "LONG").upper(),
+            )
+            for t in trades
+        }
+        executor = getattr(self, "executor", None)
+        getter = getattr(executor, "live_orphan_trades", None) if executor else None
+        if callable(getter):
+            for orphan in getter():
+                oid = str(orphan.get("trade_id") or "")
+                key = (
+                    str(orphan.get("symbol") or "").upper(),
+                    str(orphan.get("side") or "LONG").upper(),
+                )
+                if oid and oid not in seen_ids:
+                    trades.append(orphan)
+                    seen_ids.add(oid)
+                    seen_keys.add(key)
+        try:
+            for pos in unresolved_orphan_exchange_positions():
+                synthetic = exchange_orphan_as_trade(pos)
+                oid = str(synthetic.get("trade_id") or "")
+                key = (
+                    str(synthetic.get("symbol") or "").upper(),
+                    str(synthetic.get("side") or "LONG").upper(),
+                )
+                if not key[0] or oid in seen_ids or key in seen_keys:
+                    continue
+                trades.append(synthetic)
+                seen_ids.add(oid)
+                seen_keys.add(key)
+        except Exception:
+            pass
+        return trades
+
     def _process_price_tick(self, symbol: str, price: float) -> None:
         """Evaluate open trades for a symbol (REST-free, off WS callback thread)."""
+        if not Config.ENABLE_SOFT_TP_SL:
+            return
         active_trades = [
             trade
-            for trade in self.db.get_open_trades()
+            for trade in self._open_trades_for_monitor()
             if str(trade.get("symbol", "")).upper() == symbol
         ]
         if not active_trades:
@@ -263,7 +330,7 @@ class TradeManager:
         for trade in active_trades:
             try:
                 self._monitor_single_trade(
-                    trade, qty_map, price=price, ws_only=True
+                    trade, qty_map, price=price, ws_only=True, allow_rest=False
                 )
             except Exception as exc:
                 error_logger.error(
@@ -277,7 +344,7 @@ class TradeManager:
         """Evaluate all active DB trades against live prices and exchange state."""
         try:
             self._drain_pending_external_flats()
-            active_trades = self.db.get_open_trades()
+            active_trades = self._open_trades_for_monitor()
             with self._monitored_lock:
                 self._monitored_symbols = {
                     str(trade.get("symbol", "")).upper() for trade in active_trades
@@ -343,6 +410,39 @@ class TradeManager:
                     qty_map[(symbol, side)] = qty
         return qty_map
 
+    def _rest_confirm_cached_qty(
+        self,
+        symbol: str,
+        position_side: str,
+        *,
+        min_interval: float = 8.0,
+    ) -> Optional[float]:
+        """Urgent REST qty when the cache is 0. Throttled so the 1s loop cannot hammer REST."""
+        try:
+            if self.exchange.rest_account_reads_blocked():
+                return None
+        except Exception:
+            return None
+        key = f"{str(symbol).upper()}:{str(position_side).upper()}"
+        stamps = getattr(self, "_qty_rest_confirm_at", None)
+        if stamps is None:
+            stamps = {}
+            self._qty_rest_confirm_at = stamps
+        now = time.monotonic()
+        last = safe_float(stamps.get(key))
+        if last > 0 and (now - last) < min_interval:
+            return None
+        stamps[key] = now
+        getter = getattr(self.exchange, "get_position_quantity_rest", None)
+        if not callable(getter):
+            return None
+        try:
+            return getter(symbol, position_side, urgent=True)
+        except TypeError:
+            return getter(symbol, position_side)
+        except Exception:
+            return None
+
     def _monitor_single_trade(
         self,
         trade: dict[str, Any],
@@ -350,40 +450,51 @@ class TradeManager:
         price: Optional[float] = None,
         *,
         ws_only: bool = False,
+        allow_rest: bool = True,
     ) -> None:
         symbol = trade["symbol"]
         position_side = trade.get("side", "LONG")
         key = (str(symbol).upper(), str(position_side).upper())
+        synthetic = is_synthetic_exchange_orphan(trade)
+        if not Config.ENABLE_SOFT_TP_SL:
+            return
 
         live_qty = qty_map.get(key, 0.0)
         db_qty = self._trade_quantity_from_db(trade) if live_qty <= 0 else 0.0
 
-        if live_qty <= 0 and not ws_only and not self.exchange.rest_account_reads_blocked():
-            rest_qty = self.exchange.get_position_quantity_rest(
-                symbol, position_side, urgent=True
-            )
-            if rest_qty is not None and rest_qty > 0:
-                position_reconcile_guard.note_present(str(trade["trade_id"]))
-                trade_logger.info(
-                    "[%s] WS/cache missed position — REST confirms qty=%.8f",
-                    symbol,
-                    rest_qty,
-                )
-                live_qty = rest_qty
-                qty_map[key] = rest_qty
+        if live_qty <= 0:
+            self._force_rest_monitor = True
+            if allow_rest:
+                rest_qty = self._rest_confirm_cached_qty(symbol, str(position_side))
+                if rest_qty is not None and rest_qty > 0:
+                    if not synthetic:
+                        position_reconcile_guard.note_present(str(trade["trade_id"]))
+                    trade_logger.info(
+                        "[%s] WS/cache missed position — REST confirms qty=%.8f",
+                        symbol,
+                        rest_qty,
+                    )
+                    live_qty = rest_qty
+                    qty_map[key] = rest_qty
 
         if live_qty <= 0:
+            if synthetic:
+                return
             if is_within_position_grace_period(trade):
                 if db_qty <= 0:
                     return
                 live_qty = db_qty
                 qty_map[key] = db_qty
             elif ws_only:
-                trade_logger.debug(
-                    "[%s] TP/SL eval skipped — exchange qty=0 (waiting REST/manual sync).",
-                    symbol,
-                )
-                return
+                if db_qty > 0:
+                    live_qty = db_qty
+                    qty_map[key] = db_qty
+                else:
+                    trade_logger.debug(
+                        "[%s] TP/SL eval skipped — exchange qty=0 (waiting REST/manual sync).",
+                        symbol,
+                    )
+                    return
             elif self._defer_external_close(trade, symbol):
                 return
             else:
@@ -406,16 +517,34 @@ class TradeManager:
                 position_reconcile_guard.note_present(str(trade["trade_id"]))
                 return
 
+        if synthetic:
+            trade_logger.warning(
+                "[%s] Exchange-only orphan still open qty=%.8f — "
+                "virtual TP/SL skipped; watchdog covers flatten after grace.",
+                symbol,
+                live_qty,
+            )
+            return
+
         position_reconcile_guard.note_present(str(trade["trade_id"]))
 
         if price is None or price <= 0:
             price = self._resolve_monitor_price(symbol, position_side)
+        ws_mark = self._ws_position_mark(symbol, position_side)
+        if ws_mark is not None and ws_mark > 0:
+            price = ws_mark
         if price is None or price <= 0:
             trade_logger.warning(
                 "[%s] TP/SL eval skipped — no live ticker/mark price available.",
                 symbol,
             )
             return
+        try:
+            from core.ops_heartbeat import touch_market_data
+
+            touch_market_data(source="position_mark")
+        except Exception:
+            pass
 
         fresh = self.db.get_trade(trade["trade_id"])
         if fresh:
@@ -440,16 +569,43 @@ class TradeManager:
         elif position_side == "SHORT":
             self._manage_short_trade(trade, price)
 
+    def _sync_dca_stage_from_db(self, trade_id: str) -> int:
+        """Align in-memory DCA stage with SQLite so a revert can retry Entry 2/3."""
+        if not trade_id:
+            return 1
+        fresh = None
+        try:
+            getter = getattr(self.db, "get_trade", None)
+            if callable(getter):
+                fresh = getter(trade_id)
+        except Exception:
+            fresh = None
+        if not fresh:
+            self._dca_stage.pop(trade_id, None)
+            return 1
+        metadata = self.db.parse_trade_metadata(fresh)
+        stage = entry_stage_of(fresh, metadata)
+        self._dca_stage[trade_id] = stage
+        return stage
+
     def _maybe_execute_dca(self, trade: dict[str, Any], price: float) -> None:
         if not dca_enabled() or self.executor is None or price <= 0:
             return
         trade_id = str(trade.get("trade_id") or "")
         if not trade_id or trade_id in self._dca_inflight:
             return
+        if trade_id.startswith("orphan-ex-") or is_synthetic_exchange_orphan(trade):
+            return
+        try:
+            fresh = self.db.get_trade(trade_id)
+        except Exception:
+            fresh = None
+        if fresh:
+            trade = fresh
         metadata = self.db.parse_trade_metadata(trade)
         if not dca_plan_active(metadata):
             return
-        stage = self._dca_stage.get(trade_id) or entry_stage_of(trade, metadata)
+        stage = entry_stage_of(trade, metadata)
         self._dca_stage[trade_id] = stage
         step = next_dca_step(metadata, trade)
         if step is None or stage >= step:
@@ -470,7 +626,7 @@ class TradeManager:
         # Persist the stage claim BEFORE the order so a restart cannot re-fire.
         metadata["entry_stage"] = stage
         if not self.db.claim_entry_stage(trade_id, stage, step, metadata):
-            self._dca_stage[trade_id] = max(stage, step)
+            self._sync_dca_stage_from_db(trade_id)
             return
         self._dca_stage[trade_id] = step
         trade["entry_stage"] = step
@@ -480,6 +636,13 @@ class TradeManager:
         self._dca_inflight.add(trade_id)
         try:
             result = self.executor.execute_dca_add(trade, step, price)
+            if result and result.get("failsafe_close"):
+                self.failsafe_close_trade(
+                    trade,
+                    "INVALID_SL_FAILSAFE",
+                    "DCA fill through planned SL or native protection failed",
+                )
+                return
             if result and self.telegram:
                 try:
                     self.telegram.send_dca_alert(
@@ -504,8 +667,15 @@ class TradeManager:
                     )
         except Exception as exc:
             error_logger.error("DCA add failed for %s: %s", trade.get("symbol"), exc)
+            revert = getattr(self.executor, "_revert_claimed_dca_stage", None)
+            if callable(revert):
+                try:
+                    revert(trade, step, metadata)
+                except Exception:
+                    pass
         finally:
             self._dca_inflight.discard(trade_id)
+            self._sync_dca_stage_from_db(trade_id)
 
     def _ensure_local_exit_memory(self, trade: dict[str, Any]) -> dict[str, Any]:
         """Rebuild local TP/SL in memory if they were never stored (no exchange orders)."""
@@ -837,7 +1007,13 @@ class TradeManager:
 
         if target_sl is None:
             return
-        target_sl = round_step_size(target_sl, rules.tick_size, rules.price_precision)
+        target_sl = round_protective_price(
+            target_sl,
+            rules.tick_size,
+            rules.price_precision,
+            side="LONG" if is_long else "SHORT",
+            kind="SL",
+        )
         if is_long and target_sl <= sl:
             return
         if not is_long and sl > 0 and target_sl >= sl:
@@ -845,6 +1021,7 @@ class TradeManager:
 
         self.db.update_trade(trade["trade_id"], {"stop_loss": target_sl})
         trade["stop_loss"] = target_sl
+        self._sync_native_stop(trade, target_sl)
         trade_logger.info(
             "[%s] Profit SL trailed to %.6f | price=%.6f",
             symbol,
@@ -879,10 +1056,19 @@ class TradeManager:
             elif safety_sl > 0 and sl_is_armed(metadata, trade) and stop_loss <= 0:
                 stop_loss = safety_sl
             if stop_loss > 0 and current_price <= stop_loss:
-                if self._market_close_is_exhausted(str(trade.get("trade_id", "")), "STOP_LOSS"):
+                if entry > 0 and not sl_is_valid_vs_entry("LONG", entry, stop_loss):
+                    self.failsafe_close_trade(
+                        trade,
+                        "INVALID_SL_FAILSAFE",
+                        f"LONG SL not below entry (entry={entry:.6f} sl={stop_loss:.6f})",
+                    )
+                    return
+                if not self._market_close_should_retry(
+                    str(trade.get("trade_id", "")), "STOP_LOSS"
+                ):
+                    self._sync_native_stop(trade, stop_loss)
                     return
                 self._trigger_virtual_sl(trade, current_price, stop_loss)
-                self._cancel_all_native_orders(trade)
                 self._close_position(
                     trade,
                     quantity=self._remaining_close_quantity(trade),
@@ -945,10 +1131,19 @@ class TradeManager:
             elif safety_sl > 0 and sl_is_armed(metadata, trade) and stop_loss <= 0:
                 stop_loss = safety_sl
             if stop_loss > 0 and current_price >= stop_loss:
-                if self._market_close_is_exhausted(str(trade.get("trade_id", "")), "STOP_LOSS"):
+                if entry > 0 and not sl_is_valid_vs_entry("SHORT", entry, stop_loss):
+                    self.failsafe_close_trade(
+                        trade,
+                        "INVALID_SL_FAILSAFE",
+                        f"SHORT SL not above entry (entry={entry:.6f} sl={stop_loss:.6f})",
+                    )
+                    return
+                if not self._market_close_should_retry(
+                    str(trade.get("trade_id", "")), "STOP_LOSS"
+                ):
+                    self._sync_native_stop(trade, stop_loss)
                     return
                 self._trigger_virtual_sl(trade, current_price, stop_loss)
-                self._cancel_all_native_orders(trade)
                 self._close_position(
                     trade,
                     quantity=self._remaining_close_quantity(trade),
@@ -1011,6 +1206,20 @@ class TradeManager:
             symbol, position_side, allow_rest=True
         )
 
+    def _ws_position_mark(self, symbol: str, position_side: str) -> Optional[float]:
+        """Prefer Binance user-stream mark (same family as native MARK_PRICE stops)."""
+        hub = getattr(self.exchange, "_market_data", None)
+        if hub is None:
+            return None
+        getter = getattr(hub, "get_ws_mark_price", None)
+        if not callable(getter):
+            return None
+        try:
+            mark = getter(symbol, position_side)
+        except Exception:
+            return None
+        return mark if mark is not None and mark > 0 else None
+
     def _trigger_virtual_tp(
         self,
         trade: dict[str, Any],
@@ -1059,6 +1268,38 @@ class TradeManager:
                 if oid:
                     order_map[str(level).upper()] = str(oid)
         return order_map
+
+    def _sync_native_stop(self, trade: dict[str, Any], new_sl: float) -> None:
+        """Replace the exchange STOP when virtual SL trails. No-op if native is off."""
+        if not Config.ENABLE_NATIVE_TP_SL or new_sl <= 0:
+            return
+        metadata = self.db.parse_trade_metadata(trade)
+        from core.exchange_protection import (
+            apply_protection_metadata,
+            ensure_native_stop,
+            protection_is_verified,
+        )
+
+        ok, reason, oid = ensure_native_stop(
+            self.exchange,
+            symbol=str(trade.get("symbol") or ""),
+            position_side=str(trade.get("side") or "LONG"),
+            sl_price=new_sl,
+            entry_price=safe_float(trade.get("entry_price")),
+            old_sl_order_id=str(metadata.get("native_sl_order_id") or "") or None,
+        )
+        apply_protection_metadata(metadata, reason=reason, order_id=oid)
+        try:
+            self.db.update_trade(str(trade.get("trade_id")), {"metadata": metadata})
+            trade["metadata"] = metadata
+        except Exception:
+            pass
+        if not protection_is_verified(reason, oid):
+            error_logger.critical(
+                "Native SL trail not verified for %s: %s",
+                trade.get("symbol"),
+                reason,
+            )
 
     def _cancel_all_native_orders(self, trade: dict[str, Any]) -> None:
         if not Config.ENABLE_NATIVE_TP_SL:
@@ -1136,8 +1377,10 @@ class TradeManager:
         if fresh:
             trade = fresh
         if trade.get("status") == TRADE_STATUS_CLOSED:
+            self._cancel_native_tp_order(trade, level)
             return
 
+        self._cancel_native_tp_order(trade, level)
         metadata = self.db.parse_trade_metadata(trade)
         updates: dict[str, Any] = {"metadata": metadata}
         new_sl: Optional[float] = None
@@ -1178,16 +1421,29 @@ class TradeManager:
 
         if new_sl is not None and Config.ENABLE_NATIVE_TP_SL:
             metadata = self.db.parse_trade_metadata(trade)
-            if metadata.get("native_orders_placed"):
-                new_sl_id = self.exchange.refresh_native_stop_loss(
+            from core.exchange_protection import (
+                apply_protection_metadata,
+                ensure_native_stop,
+                protection_is_verified,
+            )
+
+            ok, reason, new_sl_id = ensure_native_stop(
+                self.exchange,
+                symbol=trade["symbol"],
+                position_side=str(trade.get("side", "LONG")),
+                sl_price=new_sl,
+                entry_price=safe_float(trade.get("entry_price")),
+                old_sl_order_id=str(metadata.get("native_sl_order_id") or "") or None,
+            )
+            apply_protection_metadata(metadata, reason=reason, order_id=new_sl_id)
+            self.db.update_trade(trade["trade_id"], {"metadata": metadata})
+            if not protection_is_verified(reason, new_sl_id):
+                error_logger.critical(
+                    "Native SL after %s not verified for %s: %s",
+                    level,
                     trade["symbol"],
-                    str(trade.get("side", "LONG")),
-                    new_sl,
-                    old_sl_order_id=str(metadata.get("native_sl_order_id") or ""),
+                    reason,
                 )
-                if new_sl_id:
-                    metadata["native_sl_order_id"] = new_sl_id
-                    self.db.update_trade(trade["trade_id"], {"metadata": metadata})
 
         if self.telegram:
             fill_price = safe_float(metadata.get("last_close_fill_price"))
@@ -1236,6 +1492,7 @@ class TradeManager:
                 break
             trade_id = str(task.trade.get("trade_id", ""))
             inflight_key = f"{trade_id}:{task.reason}"
+            ok = False
             try:
                 ok = self._execute_close_order(
                     task.trade,
@@ -1262,10 +1519,17 @@ class TradeManager:
                     self._rollback_tp_lock(task.trade, task.tp_level)
                 if task.result_box is not None:
                     task.result_box[0] = False
+                ok = False
             finally:
                 release_exit(trade_id, "main")
                 with self._close_lock:
                     self._close_inflight.discard(inflight_key)
+                    if not hasattr(self, "_close_ok"):
+                        self._close_ok = {}
+                    self._close_ok[inflight_key] = bool(ok)
+                    done = getattr(self, "_close_done", {}).get(inflight_key)
+                    if done is not None:
+                        done.set()
                 if task.result_event is not None:
                     task.result_event.set()
                 self._close_queue.task_done()
@@ -1301,10 +1565,12 @@ class TradeManager:
                 updated = True
             if metadata.get("runner_active") or current_price > entry:
                 metadata["trailing_active"] = True
-                candidate_sl = round_step_size(
+                candidate_sl = round_protective_price(
                     best_price - trail_distance,
                     rules.tick_size,
                     rules.price_precision,
+                    side="LONG",
+                    kind="SL",
                 )
                 if candidate_sl > current_sl:
                     self.db.update_trade(
@@ -1322,10 +1588,12 @@ class TradeManager:
                 updated = True
             if metadata.get("runner_active") or current_price < entry:
                 metadata["trailing_active"] = True
-                candidate_sl = round_step_size(
+                candidate_sl = round_protective_price(
                     best_price + trail_distance,
                     rules.tick_size,
                     rules.price_precision,
+                    side="SHORT",
+                    kind="SL",
                 )
                 if candidate_sl < current_sl:
                     self.db.update_trade(
@@ -1337,6 +1605,8 @@ class TradeManager:
                     sl_moved = True
                     updated = True
 
+        if sl_moved:
+            self._sync_native_stop(trade, new_sl)
         if updated and metadata.get("trailing_active"):
             self.db.update_trade(trade["trade_id"], {"metadata": metadata})
         if sl_moved and self.telegram:
@@ -1411,6 +1681,8 @@ class TradeManager:
             self._market_close_attempts = {}
         if not hasattr(self, "_market_close_exhausted"):
             self._market_close_exhausted = set()
+        if not hasattr(self, "_market_close_exhausted_at"):
+            self._market_close_exhausted_at: dict[str, float] = {}
 
     def _market_close_key(self, trade_id: str, reason: str) -> str:
         return f"{trade_id}:{reason}"
@@ -1428,7 +1700,22 @@ class TradeManager:
         self._market_close_attempts[key] = count
         if count >= self._market_close_max_attempts():
             self._market_close_exhausted.add(key)
+            self._market_close_exhausted_at[key] = time.monotonic()
         return count
+
+    def _market_close_should_retry(self, trade_id: str, reason: str) -> bool:
+        """True when a market close may be queued. Restores native SL during cooldown."""
+        if not self._market_close_is_exhausted(trade_id, reason):
+            return True
+        self._ensure_close_attempt_state()
+        key = self._market_close_key(trade_id, reason)
+        started = float(self._market_close_exhausted_at.get(key) or 0.0)
+        if started > 0.0 and (time.monotonic() - started) >= 45.0:
+            self._market_close_exhausted.discard(key)
+            self._market_close_attempts.pop(key, None)
+            self._market_close_exhausted_at.pop(key, None)
+            return True
+        return False
 
     def _clear_market_close_attempts(self, trade_id: str) -> None:
         self._ensure_close_attempt_state()
@@ -1437,6 +1724,7 @@ class TradeManager:
             if key.startswith(prefix):
                 self._market_close_attempts.pop(key, None)
                 self._market_close_exhausted.discard(key)
+                self._market_close_exhausted_at.pop(key, None)
 
     def _inspect_exchange_position_qty(
         self, symbol: str, position_side: str
@@ -1571,6 +1859,33 @@ class TradeManager:
         )
         return True
 
+    def failsafe_close_trade(self, trade: dict[str, Any], reason: str, detail: str) -> None:
+        """Market-close a position that cannot be protected. Alerts the operator."""
+        symbol = str(trade.get("symbol") or "")
+        side = str(trade.get("side") or "")
+        error_logger.critical(
+            "FAILSAFE_CLOSE %s %s | reason=%s | %s",
+            symbol,
+            side,
+            reason,
+            detail,
+        )
+        if self.telegram:
+            try:
+                self.telegram.send_message(
+                    f"🚨 <b>FAILSAFE CLOSE</b>\n"
+                    f"{escape_html(symbol)} {escape_html(side)}\n"
+                    f"Reason: {escape_html(reason)}\n"
+                    f"<i>{escape_html(detail)}</i>"
+                )
+            except Exception as exc:
+                error_logger.warning("Fail-safe Telegram alert failed: %s", exc)
+        self._close_position(
+            trade,
+            quantity=self._remaining_close_quantity(trade),
+            reason=reason,
+        )
+
     def _close_position(
         self,
         trade: dict[str, Any],
@@ -1637,26 +1952,56 @@ class TradeManager:
             else:
                 return False
 
+        if not hasattr(self, "_close_done"):
+            self._close_done = {}
+            self._close_ok = {}
+
+        duplicate_done: Optional[threading.Event] = None
+        already_inflight = False
         with self._close_lock:
             if inflight_key in self._close_inflight:
-                return True
-            if exit_claim_active(trade_id) or not claim_exit(trade_id, "main"):
-                trade_logger.debug(
-                    "[%s] Close deferred — exit claim held by another process.",
-                    symbol,
-                )
+                already_inflight = True
+                duplicate_done = self._close_done.get(inflight_key)
+            else:
+                if exit_claim_active(trade_id) or not claim_exit(trade_id, "main"):
+                    trade_logger.debug(
+                        "[%s] Close deferred — exit claim held by another process.",
+                        symbol,
+                    )
+                    return False
+                self._close_inflight.add(inflight_key)
+                self._close_done[inflight_key] = threading.Event()
+                self._close_ok[inflight_key] = False
+                if not partial:
+                    attempts = self._note_market_close_attempt(trade_id, reason)
+                    trade_logger.info(
+                        "[%s] Executing Market Close attempt %s/%s | trigger=%s | qty=%s",
+                        symbol,
+                        attempts,
+                        self._market_close_max_attempts(),
+                        reason,
+                        close_qty,
+                    )
+
+        if already_inflight:
+            if not blocking:
                 return False
-            self._close_inflight.add(inflight_key)
-            if not partial:
-                attempts = self._note_market_close_attempt(trade_id, reason)
-                trade_logger.info(
-                    "[%s] Executing Market Close attempt %s/%s | trigger=%s | qty=%s",
-                    symbol,
-                    attempts,
-                    self._market_close_max_attempts(),
-                    reason,
-                    close_qty,
+            if duplicate_done is not None:
+                timeout = (
+                    self.CLOSE_ORDER_MAX_RETRIES
+                    * self.CLOSE_ORDER_RETRY_DELAY_SECONDS
+                    * 3
+                    + 15.0
                 )
+                if not duplicate_done.wait(timeout=timeout):
+                    error_logger.warning(
+                        "Duplicate close wait timed out for %s (%s) after %.0fs.",
+                        symbol,
+                        reason,
+                        timeout,
+                    )
+                    return False
+            return bool(self._close_ok.get(inflight_key, False))
 
         task = _CloseTask(
             trade=trade,
@@ -1976,6 +2321,13 @@ class TradeManager:
         trade_id = str(trade["trade_id"])
         symbol = str(trade.get("symbol", ""))
         position_side = str(trade.get("side", "LONG")).upper()
+        if is_synthetic_exchange_orphan(trade):
+            trade_logger.info(
+                "[%s] Synthetic exchange orphan %s — skip DB close.",
+                symbol,
+                trade_id,
+            )
+            return 0.0
 
         with trade_close_mutex(trade_id, blocking=True) as acquired:
             if not acquired:
@@ -2080,6 +2432,9 @@ class TradeManager:
             if resolved.exit_price > 0:
                 exit_price = resolved.exit_price
 
+        if str(pnl_source or "").lower() == "pending":
+            book_daily_pnl = False
+
         total_pnl = self.db.close_trade_and_sync_stats(
             trade,
             exit_price=exit_price,
@@ -2121,6 +2476,7 @@ class TradeManager:
                 exit_price=close_px,
                 live_price=live_px,
                 side=position_side,
+                pnl_source=pnl_source,
             )
 
         outcome = "WIN" if safe_float(trade.get("pnl")) > 0 else "LOSS"

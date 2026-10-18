@@ -93,7 +93,9 @@ def evaluate_vol_expansion_mr(
         score += 6.0
 
     result.score = min(score, 90.0)
-    result.passed = result.score >= Config.VEMR_MIN_SCORE and adx_15m <= 30
+    result.passed = (
+        result.score >= Config.effective_min_score(Config.VEMR_MIN_SCORE) and adx_15m <= 30
+    )
     if not result.passed:
         result.reasons.append(f"score_or_adx_fail_{result.score:.1f}")
     return result

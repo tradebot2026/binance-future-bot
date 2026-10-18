@@ -78,16 +78,22 @@ def format_cache_only_health_message(
 ) -> str:
     """Build the /health|/diagnostics report from in-process caches and SQLite."""
     from core.bot_health import (
+        get_incomplete_kline_count,
         get_monitor_stall_recoveries,
         get_scan_age_seconds,
         get_scan_counts,
+        get_scan_history_ready,
         get_uptime_seconds,
         is_monitor_watchdog_active,
+        watchdog_sibling_status,
     )
+    from core.system_health import system_health_snapshot
     from core.ops_heartbeat import (
+        get_last_api_error,
         get_main_stall_seconds,
         get_monitor_stall_seconds,
         get_reconcile_stall_seconds,
+        get_ws_health_state,
         read_heartbeat_payload,
     )
     from utils import utc_now
@@ -122,6 +128,9 @@ def format_cache_only_health_message(
         hub = getter() if callable(getter) else getattr(exchange, "_market_data", None)
 
     ws_state = "UNAVAILABLE"
+    hb_ws = str(get_ws_health_state() or hb_payload.get("ws_state") or "").upper()
+    if hb_ws:
+        ws_state = hb_ws
     ticker_age = -1.0
     book_age = -1.0
     user_age = -1.0
@@ -152,7 +161,11 @@ def format_cache_only_health_message(
     entries_paused = False
     pause_reason = ""
     if scheduler is not None:
-        entries_paused, pause_reason = scheduler.is_entry_paused()
+        peek = getattr(scheduler, "peek_entry_pause", None)
+        if callable(peek):
+            entries_paused, pause_reason = peek()
+        else:
+            entries_paused, pause_reason = scheduler.is_entry_paused()
     elif controller is not None:
         entries_paused, pause_reason = controller.is_manually_paused()
     if engine_stalled:
@@ -172,7 +185,12 @@ def format_cache_only_health_message(
             syms = getattr(pipeline, "_last_universe_symbols", []) or []
             universe_total = len(syms)
             scanned = universe_total
-    if scan_age is None:
+    if not get_scan_history_ready():
+        scan_line = (
+            f"NOT READY — incomplete kline history "
+            f"({get_incomplete_kline_count()} symbol(s)); Super eval skipped"
+        )
+    elif scan_age is None:
         scan_line = f"No scan yet | Universe: {universe_total}"
     else:
         scan_line = (
@@ -262,10 +280,52 @@ def format_cache_only_health_message(
     hb_fresh = max(float(Config.HEARTBEAT_SECONDS) * 3, 90.0)
     rec_fresh = max(float(Config.RECONCILIATION_INTERVAL_SECONDS) * 1.5, 180.0)
     mon_fresh = max(float(Config.MONITOR_LOOP_STALL_SECONDS), 45.0)
+    sibling = watchdog_sibling_status()
+    sibling_line = (
+        "DETECTED"
+        if sibling.get("fresh")
+        else "ABSENT — start python watchdog.py in a separate process"
+    )
+    open_for_health = int(wal.get("open_trades") or 0) if wal.get("ok") else 0
+    if not wal.get("ok"):
+        open_for_health = int(hb_payload.get("native_open") or 0)
+    health = system_health_snapshot(
+        open_trades=open_for_health,
+        db_ok=bool(wal.get("ok")),
+        ws_state=ws_state,
+    )
+    overall = str(health.get("overall") or "UNKNOWN")
+    reason_txt = "; ".join(health.get("reasons") or []) or "none"
+    native_open = int(hb_payload.get("native_open") or 0)
+    native_verified = int(hb_payload.get("native_verified") or 0)
+    native_unprotected = int(hb_payload.get("native_unprotected_open") or 0)
+    if Config.ENABLE_NATIVE_TP_SL:
+        native_line = (
+            f"ON | verified {native_verified}/{native_open}"
+            + (f" | UNPROTECTED {native_unprotected}" if native_unprotected else "")
+        )
+    else:
+        native_line = "OFF — virtual SL only; process death = unprotected"
+
+    api_err, api_err_at = get_last_api_error()
+    if not api_err:
+        api_err = str(hb_payload.get("last_api_error") or "")
+        api_err_at = safe_float(hb_payload.get("last_api_error_at"))
+    if api_err:
+        age_bit = ""
+        if api_err_at > 0:
+            age_bit = f" ({_format_duration(max(now.timestamp() - api_err_at, 0.0))} ago)"
+        api_err_line = f"Last API error: {escape_html(api_err[:120])}{age_bit}"
+        if errors_line == "<i>none</i>":
+            errors_line = f"• {api_err_line}"
+        else:
+            errors_line = f"• {api_err_line}\n{errors_line}"
 
     return (
         f"🩺 <b>BOT HEALTH AND DIAGNOSTICS</b>\n"
         f"🌐 <b>Mode:</b> {escape_html(mode)}\n"
+        f"🏷 <b>Overall:</b> {escape_html(overall)}\n"
+        f"<i>{escape_html(reason_txt)}</i>\n"
         f"<i>Cache-only — no Binance REST</i>\n\n"
         f"⏱️ <b>Last Refreshed:</b> {refreshed}\n"
         f"💓 <b>Heartbeat:</b> {escape_html(hb_line)}\n"
@@ -286,7 +346,9 @@ def format_cache_only_health_message(
             f"🗄 <b>Database:</b> {db_line}\n"
             f"🧠 <b>Engine:</b> {engine_line}\n"
             f"📊 <b>Scanner:</b> {escape_html(scan_line)}\n"
-            f"🛡️ <b>Watchdog:</b> {escape_html(watchdog_line)}\n"
+            f"🛡️ <b>In-process monitor WD:</b> {escape_html(watchdog_line)}\n"
+            f"🛡️ <b>Sibling watchdog.py:</b> {escape_html(sibling_line)}\n"
+            f"🛡️ <b>Exchange TP/SL:</b> {escape_html(native_line)}\n"
             f"🧵 <b>Workers:</b> {escape_html(threads)}\n"
             f"⏳ <b>Uptime:</b> {uptime}\n"
             f"⚠️ <b>Recent errors:</b>\n{errors_line}\n"

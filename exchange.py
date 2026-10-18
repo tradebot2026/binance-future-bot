@@ -43,7 +43,7 @@ from kline_bootstrap import (
     next_kline_page,
 )
 from logger import error_logger, system_logger, trade_logger
-from utils import amount_to_precision, round_step_size, safe_float
+from utils import amount_to_precision, round_protective_price, round_step_size, safe_float
 
 
 @dataclass
@@ -252,6 +252,7 @@ class BinanceExchangeManager:
         self._last_degraded_rest_at: dict[str, float] = {}
         self._account_rest_cache = AccountRestCache()
         self._position_cache = PositionCache()
+        self._position_snapshot_authoritative = False
         self._position_refresh_lock = threading.Lock()
         self._position_backoff_until: float = 0.0
         self._scan_mode = False
@@ -620,6 +621,9 @@ class BinanceExchangeManager:
             halt_seconds=float(halt_seconds),
             banned=banned,
         )
+        self._note_heartbeat_api_error(
+            f"rate_limit code={exc.code} halt~{halt_seconds}s: {message}"
+        )
         self._rest_token_bucket.trigger_hard_stop(float(halt_seconds))
         already_blocked = False
         if self._market_data:
@@ -642,6 +646,16 @@ class BinanceExchangeManager:
                 exc=exc,
             )
         return halt_seconds
+
+    @staticmethod
+    def _note_heartbeat_api_error(message: str) -> None:
+        """Record the last REST/API failure for /health and watchdog (never raises)."""
+        try:
+            from core.ops_heartbeat import note_api_error
+
+            note_api_error(message)
+        except Exception:
+            pass
 
     # ---------------- Internal helpers ----------------
 
@@ -1471,6 +1485,7 @@ class BinanceExchangeManager:
                     self._last_account_rest_at = time.monotonic()
                 return result
             except BinanceAPIException as exc:
+                self._note_heartbeat_api_error(f"{exc.code}: {exc.message}")
                 if exc.code == -2022 or "reduceonly order is rejected" in str(
                     exc.message
                 ).lower():
@@ -1494,6 +1509,7 @@ class BinanceExchangeManager:
                 raise ExchangeError(str(exc.message)) from exc
             except (ConnectionError, TimeoutError, OSError) as exc:
                 if attempt >= network_retries:
+                    self._note_heartbeat_api_error(str(exc))
                     if self._critical_alerts:
                         self._critical_alerts.notify(
                             "API_DISCONNECT",
@@ -1678,6 +1694,7 @@ class BinanceExchangeManager:
         self._position_cache.positions = open_positions
         self._position_cache.unrealized_pnl_total = unrealized_total
         self._position_cache.updated_at = time.monotonic()
+        self._position_snapshot_authoritative = True
         return open_positions
 
     def _merge_ws_positions_into_cache(
@@ -1705,7 +1722,12 @@ class BinanceExchangeManager:
         self._position_cache.positions = merged
         self._position_cache.unrealized_pnl_total = unrealized_total
         self._position_cache.updated_at = time.monotonic()
+        self._position_snapshot_authoritative = True
         return merged
+
+    def position_snapshot_authoritative(self) -> bool:
+        """True after a confirmed WS position snapshot or REST position parse."""
+        return bool(getattr(self, "_position_snapshot_authoritative", False))
 
     def _refresh_positions_cache(self, force: bool = False) -> list[dict[str, Any]]:
         """Prefer user-data WebSocket; REST refresh throttled to ACCOUNT_REST_MIN_INTERVAL."""
@@ -1720,7 +1742,12 @@ class BinanceExchangeManager:
                 return self._merge_ws_positions_into_cache(ws_positions)
             if self._position_cache.positions:
                 return list(self._position_cache.positions)
-            if not self._market_data.user_stream_is_stale():
+            # Empty WS + empty cache is only "truly flat" after a confirmed snapshot.
+            # Otherwise fall through to REST so net-long/caps cannot treat unknown as zero.
+            if (
+                getattr(self, "_position_snapshot_authoritative", False)
+                and not self._market_data.user_stream_is_stale()
+            ):
                 return []
 
         if not force and self._position_cache.is_valid():
@@ -3314,7 +3341,10 @@ class BinanceExchangeManager:
 
     def get_open_positions_count(self, force_refresh: bool = False) -> int:
         """Count non-zero hedge-mode positions on the exchange."""
-        return len(self.get_all_open_positions(force_refresh=force_refresh))
+        rows = self.get_all_open_positions(force_refresh=force_refresh)
+        if rows is None:
+            return 0
+        return len(rows)
 
     def get_all_open_positions(self, force_refresh: bool = False) -> list[dict[str, Any]]:
         """Return cached non-zero hedge-mode positions (REST refresh throttled)."""
@@ -3756,6 +3786,10 @@ class BinanceExchangeManager:
         reduce_only: bool = False,
         new_client_order_id: Optional[str] = None,
     ) -> Optional[dict[str, Any]]:
+        if not Config.orders_allowed():
+            raise OrderExecutionError(
+                "DRY_RUN or unset DRY_RUN — orders_allowed() is false (fail-closed)"
+            )
         rules = self.get_symbol_rules(symbol)
         clean_qty = amount_to_precision(
             quantity, rules.step_size, rules.quantity_precision
@@ -3921,9 +3955,23 @@ class BinanceExchangeManager:
 
     # ---------------- Native TP/SL (exchange conditional orders) ----------------
 
-    def _format_stop_price(self, symbol: str, stop_price: float) -> str:
+    def _format_stop_price(
+        self,
+        symbol: str,
+        stop_price: float,
+        *,
+        position_side: str = "LONG",
+        order_type: str = "STOP_MARKET",
+    ) -> str:
         rules = self.get_symbol_rules(symbol)
-        clean = round_step_size(stop_price, rules.tick_size, rules.price_precision)
+        kind = "SL" if "STOP" in str(order_type).upper() else "TP"
+        clean = round_protective_price(
+            stop_price,
+            rules.tick_size,
+            rules.price_precision,
+            side=position_side,
+            kind=kind,
+        )
         return f"{clean:.{rules.price_precision}f}"
 
     def place_conditional_order(
@@ -3949,7 +3997,12 @@ class BinanceExchangeManager:
             "side": side,
             "positionSide": position_side,
             "type": order_type,
-            "stopPrice": self._format_stop_price(symbol, stop_price),
+            "stopPrice": self._format_stop_price(
+                symbol,
+                stop_price,
+                position_side=position_side,
+                order_type=order_type,
+            ),
             "workingType": Config.NATIVE_TP_WORKING_TYPE,
         }
         if close_position:
@@ -4014,7 +4067,19 @@ class BinanceExchangeManager:
             )
             sl_id = str(sl_resp.get("orderId", ""))
             if sl_id:
-                placed["SL"] = sl_id
+                from core.exchange_protection import verify_protective_order_status
+
+                status = verify_protective_order_status(self, symbol, sl_id)
+                if status in {"CANCELED", "EXPIRED", "REJECTED", "UNVERIFIED"}:
+                    error_logger.critical(
+                        "Native SL ACK not verified %s %s id=%s status=%s",
+                        symbol,
+                        position_side,
+                        sl_id,
+                        status,
+                    )
+                else:
+                    placed["SL"] = sl_id
 
         for level, tp_price, tp_qty in tp_specs:
             if tp_price <= 0 or tp_qty <= 0:
@@ -4041,9 +4106,13 @@ class BinanceExchangeManager:
                     exc,
                 )
 
-        if sl_price > 0 and "SL" not in placed and not tp_order_ids:
-            raise OrderExecutionError(f"Failed to place any native exit orders on {symbol}")
-
+        if sl_price > 0 and "SL" not in placed:
+            error_logger.critical(
+                "Native bracket returned without a verified SL on %s %s — "
+                "ACK is not protection",
+                symbol,
+                position_side,
+            )
         return placed
 
     def cancel_order_by_id(self, symbol: str, order_id: str) -> bool:
@@ -4137,22 +4206,32 @@ class BinanceExchangeManager:
         position_side: str,
         new_sl_price: float,
         old_sl_order_id: Optional[str] = None,
+        entry_price: float = 0.0,
     ) -> Optional[str]:
-        """Replace native SL after break-even / trailing update."""
-        if old_sl_order_id:
-            self.cancel_order_by_id(symbol, old_sl_order_id)
-        if new_sl_price <= 0:
-            return None
-        close_side = "SELL" if position_side.upper() == "LONG" else "BUY"
-        resp = self.place_conditional_order(
-            symbol,
-            close_side,
-            position_side,
-            "STOP_MARKET",
-            new_sl_price,
-            close_position=True,
+        """Replace native SL after break-even / trailing update.
+
+        Places the new STOP_MARKET first and cancels the previous id only after
+        the replacement orderId is confirmed (no unprotected gap).
+        """
+        from core.exchange_protection import ensure_native_stop
+
+        ok, reason, order_id = ensure_native_stop(
+            self,
+            symbol=symbol,
+            position_side=position_side,
+            sl_price=new_sl_price,
+            entry_price=entry_price,
+            old_sl_order_id=old_sl_order_id,
         )
-        return str(resp.get("orderId", "")) or None
+        if not ok:
+            error_logger.critical(
+                "Native SL refresh failed for %s %s (%s) — existing stop kept if present",
+                symbol,
+                position_side,
+                reason,
+            )
+            return None
+        return order_id
 
     def close_position_quantity(
         self,

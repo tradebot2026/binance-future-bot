@@ -41,6 +41,29 @@ def round_step_size_up(value: float, step_size: float, precision: int) -> float:
     return round(rounded, precision)
 
 
+def round_protective_price(
+    value: float,
+    step_size: float,
+    precision: int,
+    *,
+    side: str,
+    kind: str = "SL",
+) -> float:
+    """Round SL/TP to a valid tick without pulling it through the market.
+
+    Flooring every price (``round_step_size``) moves a SHORT stop *toward*
+    entry and can place it on the wrong side. Protective prices are rounded
+    *away* from the market: LONG SL / SHORT TP floor, SHORT SL / LONG TP ceil.
+    This is at most one tick and does not widen the planned risk percentage.
+    """
+    kind_u = str(kind or "SL").upper()
+    is_long = str(side).upper() == "LONG"
+    away_up = (kind_u == "SL" and not is_long) or (kind_u != "SL" and is_long)
+    if away_up:
+        return round_step_size_up(value, step_size, precision)
+    return round_step_size(value, step_size, precision)
+
+
 def amount_to_precision(
     quantity: float, step_size: float, quantity_precision: int
 ) -> float:

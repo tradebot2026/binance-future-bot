@@ -63,6 +63,62 @@ def _format_tp_pnl(amount: float, portion_pct: float) -> str:
     return f"{sign}${abs(amount):.2f} Profit on {portion_pct:.0f}%"
 
 
+_SUBMITTED_STATUSES = {"NEW", "ACK", "ACKNOWLEDGED", "SUBMITTED", "PENDING"}
+_REJECTED_STATUSES = {"REJECTED", "EXPIRED", "CANCELED", "CANCELLED"}
+
+
+def classify_exchange_order_status(response: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """Map an exchange order payload to FILLED / PARTIALLY_FILLED / SUBMITTED / REJECTED / UNKNOWN.
+
+    ACK / NEW is never a confirmed fill. executedQty fallback to planned qty is forbidden.
+    """
+    if not isinstance(response, dict) or not response:
+        return {
+            "status": "UNKNOWN",
+            "raw_status": "",
+            "executed_qty": 0.0,
+            "avg_price": 0.0,
+            "confirmed_fill": False,
+            "headline": "TEST TRADE UNKNOWN",
+        }
+    raw = str(response.get("status") or "").strip().upper()
+    executed = safe_float(response.get("executedQty"))
+    avg = safe_float(response.get("avgPrice"))
+    if raw == "FILLED" and executed > 0:
+        status = "FILLED"
+    elif raw == "PARTIALLY_FILLED" and executed > 0:
+        status = "PARTIALLY_FILLED"
+    elif raw == "FILLED" and executed <= 0:
+        status = "UNKNOWN"
+    elif raw in _SUBMITTED_STATUSES or raw == "NEW":
+        status = "SUBMITTED"
+    elif raw in _REJECTED_STATUSES:
+        status = "REJECTED"
+    elif not raw:
+        status = "UNKNOWN"
+    else:
+        status = "UNKNOWN"
+    confirmed = status == "FILLED"
+    if confirmed:
+        headline = "TEST TRADE FILLED"
+    elif status == "PARTIALLY_FILLED":
+        headline = "TEST TRADE PARTIALLY_FILLED"
+    elif status == "SUBMITTED":
+        headline = "TEST TRADE SUBMITTED"
+    elif status == "REJECTED":
+        headline = "TEST TRADE REJECTED"
+    else:
+        headline = "TEST TRADE UNKNOWN"
+    return {
+        "status": status,
+        "raw_status": raw,
+        "executed_qty": executed if executed > 0 else 0.0,
+        "avg_price": avg if avg > 0 else 0.0,
+        "confirmed_fill": confirmed,
+        "headline": headline,
+    }
+
+
 class TelegramManager:
     """Sends trade alerts and handles authorized user commands in a daemon thread."""
 
@@ -261,12 +317,38 @@ class TelegramManager:
 
     # ---------------- Messaging ----------------
 
-    def send_message(self, text: str) -> None:
+    @staticmethod
+    def _is_critical_alert(text: str) -> bool:
+        raw = str(text or "")
+        upper = raw.upper()
+        markers = (
+            "🚨",
+            "WATCHDOG",
+            "FAILSAFE",
+            "ORPHAN",
+            "EMERGENCY CLOSE",
+            "UNTRACKED EXCHANGE",
+            "UNPROTECTED",
+            "NATIVE SL",
+            "STOP_MARKET",
+            "DAILY MAX LOSS",
+            "DAILY PNL CHECK UNAVAILABLE",
+        )
+        return any(marker in raw or marker in upper for marker in markers)
+
+    def send_message(self, text: str, *, critical: bool = False) -> None:
         if not self.enabled or self.bot is None:
             return
         try:
             self._outbound.put_nowait(text)
+            return
         except queue.Full:
+            if critical or self._is_critical_alert(text):
+                error_logger.warning(
+                    "Telegram outbound queue full — sending critical alert immediately."
+                )
+                self._send_now(text)
+                return
             error_logger.warning("Telegram outbound queue full — dropping message.")
 
     def send_trade_alert(
@@ -285,6 +367,13 @@ class TelegramManager:
         backtest_wins: int = 0,
         backtest_trades: int = 0,
         dca_plan: Optional[dict[str, Any]] = None,
+        fill_status: str = "FILLED",
+        native_sl_order_id: str = "",
+        native_protection_verified: bool = False,
+        native_enabled: Optional[bool] = None,
+        funnel_score: float = 0.0,
+        live_score: float = 0.0,
+        execution_min: float = 0.0,
     ) -> None:
         emoji = "🟢" if action == "LONG" else "🔴"
         tp1_qty = quantity * TP1_PORTION if quantity > 0 else 0.0
@@ -305,13 +394,19 @@ class TelegramManager:
         )
 
         msg = (
-            f"{emoji} <b>NEW TRADE EXECUTED</b>\n\n"
+            f"{emoji} <b>NEW TRADE EXECUTED</b>\n"
+            f"<i>Fill confirmed ({escape_html(fill_status or 'FILLED')}) "
+            f"— not an ACK</i>\n\n"
             f"🪙 <b>Pair:</b> {escape_html(symbol)}\n"
             f"🎯 <b>Action:</b> {escape_html(action)}\n"
             f"🧠 <b>Strategy:</b> {escape_html(strategy_display_label(strategy))}\n"
             f"🏷 <b>Tag:</b> {escape_html(strategy)}\n"
-            f"📊 <b>Score:</b> {score:.1f}\n"
+            f"📊 <b>Live score:</b> {(live_score or score):.1f}\n"
         )
+        if funnel_score > 0:
+            msg += f"📊 <b>Funnel score:</b> {funnel_score:.1f} <i>(classification, not a fill)</i>\n"
+        if execution_min > 0:
+            msg += f"📏 <b>Execution min:</b> {execution_min:.1f}\n"
         if backtest_trades > 0:
             msg += (
                 f"📊 <b>Backtest WR:</b> {backtest_win_rate:.1f}% "
@@ -322,6 +417,24 @@ class TelegramManager:
             msg += f"💵 <b>Fill (Binance):</b> {display_px:.6f}\n"
         if quantity > 0:
             msg += f"📦 <b>Size:</b> {quantity:.4f}\n"
+        native_on = (
+            bool(Config.ENABLE_NATIVE_TP_SL)
+            if native_enabled is None
+            else bool(native_enabled)
+        )
+        if native_on and native_protection_verified and native_sl_order_id:
+            msg += f"🛡 <b>Exchange SL:</b> verified id={escape_html(native_sl_order_id)}\n"
+        elif native_on and native_sl_order_id:
+            msg += (
+                f"🛡 <b>Exchange SL:</b> UNCERTAIN id={escape_html(native_sl_order_id)} "
+                f"— ACK is not verification\n"
+            )
+        elif native_on:
+            msg += "🛡 <b>Exchange SL:</b> NOT VERIFIED — virtual fallback only\n"
+        else:
+            msg += (
+                "🛡 <b>Exchange SL:</b> OFF (virtual only; unprotected if process stops)\n"
+            )
 
         plan = dca_plan or {}
         entry2 = safe_float(plan.get("entry2"))
@@ -362,6 +475,41 @@ class TelegramManager:
 
         self.send_message(msg)
 
+    def send_uncertain_order_alert(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        status: str,
+        client_order_id: str = "",
+        order_id: str = "",
+        context: str = "order",
+    ) -> None:
+        self.send_message(
+            "⚠️ <b>UNCERTAIN ORDER</b>\n"
+            f"{escape_html(symbol)} {escape_html(side)}\n"
+            f"Context: {escape_html(context)}\n"
+            f"Status: {escape_html(status or 'UNKNOWN')}\n"
+            f"orderId={escape_html(order_id or '?')} "
+            f"clientId={escape_html(client_order_id or '?')}\n"
+            "<i>Stage/reservation stays claimed. Not resubmitting. Reconciling.</i>"
+        )
+
+    def send_protection_alert(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        detail: str,
+        verified: bool,
+    ) -> None:
+        title = "🛡 Protection confirmed" if verified else "🚨 Protection missing"
+        self.send_message(
+            f"<b>{title}</b>\n"
+            f"{escape_html(symbol)} {escape_html(side)}\n"
+            f"<i>{escape_html(detail)}</i>"
+        )
+
     def send_close_alert(
         self,
         symbol: str,
@@ -373,6 +521,7 @@ class TelegramManager:
         exit_price: float = 0.0,
         live_price: float = 0.0,
         side: str = "",
+        pnl_source: str = "",
     ) -> None:
         from core.close_notification_guard import try_claim_close_notification
 
@@ -421,12 +570,19 @@ class TelegramManager:
         if strategy:
             msg += f"\n🧠 <b>Strategy:</b> {escape_html(strategy_display_label(strategy))}"
         if pnl is not None:
-            if pnl > 0:
+            source = str(pnl_source or "").lower()
+            exchange_confirmed = source in ("usertrades", "income", "ws")
+            if abs(float(pnl)) < 1e-12 and not exchange_confirmed:
+                msg += (
+                    "\n💰 <b>Realized PnL:</b> pending "
+                    "<i>(awaiting Binance userTrades/income)</i>"
+                )
+            elif pnl > 0:
                 msg += f"\n💰 <b>Realized Profit:</b> +${pnl:.4f}"
             elif pnl < 0:
                 msg += f"\n💰 <b>Realized PnL:</b> -${abs(pnl):.4f}"
             else:
-                msg += f"\n💰 <b>Realized PnL:</b> $0.0000"
+                msg += f"\n💰 <b>Realized PnL:</b> $0.0000 <i>(exchange confirmed)</i>"
         self.send_message(msg)
 
     def send_tp_level_alert(
@@ -667,6 +823,11 @@ class TelegramManager:
             return "🚫 /testtrade is blocked on MAINNET."
         if Config.DRY_RUN:
             return "🚫 /testtrade skipped — DRY_RUN is enabled."
+        if not bool(getattr(Config, "ENABLE_TESTTRADE_COMMAND", False)):
+            return (
+                "🚫 /testtrade disabled. Set ENABLE_TESTTRADE_COMMAND=true "
+                "on Testnet with DRY_RUN=false to allow this diagnostic order."
+            )
         if self.exchange is None:
             return "⚠️ Exchange not attached."
 
@@ -724,21 +885,35 @@ class TelegramManager:
         if not response:
             return f"❌ Exchange returned an empty response for {escape_html(symbol)}."
 
+        classified = classify_exchange_order_status(response if isinstance(response, dict) else {})
         order_id = escape_html(str(response.get("orderId", "?")))
-        status = escape_html(str(response.get("status", "?")))
-        avg = safe_float(response.get("avgPrice")) or price
-        filled = safe_float(response.get("executedQty")) or qty
-        return (
-            f"✅ <b>TEST TRADE SUBMITTED</b>\n\n"
-            f"🪙 <b>Symbol:</b> {escape_html(symbol)}\n"
-            f"🎯 <b>Side:</b> LONG MARKET\n"
-            f"💵 <b>REST price:</b> {price:.6f}\n"
-            f"📦 <b>Qty:</b> {filled:g}\n"
-            f"🏷 <b>Order ID:</b> {order_id}\n"
-            f"📌 <b>Status:</b> {status}\n"
-            f"📈 <b>Avg fill:</b> {avg:.6f}\n"
-            f"<i>Use /closeall to flatten if you do not want this position.</i>"
+        status_label = escape_html(str(classified["status"]))
+        raw_status = escape_html(str(classified["raw_status"] or "?"))
+        filled = float(classified["executed_qty"])
+        avg = float(classified["avg_price"])
+        icon = "✅" if classified["confirmed_fill"] else "⚠️"
+        lines = [
+            f"{icon} <b>{escape_html(classified['headline'])}</b>",
+            "",
+            f"🪙 <b>Symbol:</b> {escape_html(symbol)}",
+            f"🎯 <b>Side:</b> LONG MARKET",
+            f"💵 <b>REST price:</b> {price:.6f}",
+            f"📦 <b>Requested qty:</b> {qty:g}",
+            f"📦 <b>Executed qty:</b> {filled:g}",
+            f"🏷 <b>Order ID:</b> {order_id}",
+            f"📌 <b>Status:</b> {status_label} <i>(exchange {raw_status})</i>",
+        ]
+        if classified["confirmed_fill"] and avg > 0:
+            lines.append(f"📈 <b>Avg fill:</b> {avg:.6f}")
+        elif not classified["confirmed_fill"]:
+            lines.append(
+                "<i>Not a confirmed fill — SUBMITTED/ACK is not a trade. "
+                "Use /active to check the exchange position.</i>"
+            )
+        lines.append(
+            "<i>Use /closeall to flatten if you do not want this position.</i>"
         )
+        return "\n".join(lines)
 
     # ---------------- Command handlers ----------------
 

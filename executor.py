@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import uuid
 from typing import Any, Optional
@@ -34,8 +35,11 @@ from core.dca_plan import (
     dca_enabled,
     dca_entry_count,
     entry_stage_of,
+    last_resort_sl_hit,
     mark_dca_filled,
     resolved_final_sl,
+    sl_is_valid_vs_entry,
+    update_weighted_average,
 )
 from core.entry_in_flight_mutex import entry_in_flight_mutex
 from core.execution_governor import ExecutionGovernor
@@ -45,10 +49,18 @@ from utils import (
     cap_quantity_to_notional,
     minimum_order_quantity,
     resolve_binance_fill_price,
+    round_protective_price,
     round_step_size,
     safe_float,
     utc_now,
+    utc_today_str,
 )
+
+
+def _is_hard_order_reject(exc: BaseException) -> bool:
+    """True when Binance definitively rejected the order (safe to un-claim DCA)."""
+    msg = str(exc).upper()
+    return "ORDER_REJECTED" in msg or "FILTER FAILURE" in msg
 
 
 _REJECT_LOG_AT: dict[str, float] = {}
@@ -120,7 +132,53 @@ class TradeExecutor:
     def __init__(self, exchange: BinanceExchangeManager, db: DatabaseManager) -> None:
         self.exchange = exchange
         self.db = db
+        self.telegram = None
         self._entry_governor = ExecutionGovernor()
+        self._live_orphans: dict[str, dict[str, Any]] = {}
+        self._live_orphans_lock = threading.Lock()
+
+    def _notify_uncertain_order(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        status: str,
+        client_order_id: str = "",
+        order_id: str = "",
+        context: str = "order",
+    ) -> None:
+        tg = getattr(self, "telegram", None)
+        sender = getattr(tg, "send_uncertain_order_alert", None) if tg is not None else None
+        if not callable(sender):
+            return
+        try:
+            sender(
+                symbol=symbol,
+                side=side,
+                status=status,
+                client_order_id=client_order_id,
+                order_id=order_id,
+                context=context,
+            )
+        except Exception as exc:
+            error_logger.debug("Uncertain-order Telegram alert failed: %s", exc)
+
+    def _notify_protection(
+        self,
+        *,
+        symbol: str,
+        side: str,
+        detail: str,
+        verified: bool,
+    ) -> None:
+        tg = getattr(self, "telegram", None)
+        sender = getattr(tg, "send_protection_alert", None) if tg is not None else None
+        if not callable(sender):
+            return
+        try:
+            sender(symbol=symbol, side=side, detail=detail, verified=verified)
+        except Exception as exc:
+            error_logger.debug("Protection Telegram alert failed: %s", exc)
 
     def _validate_stop_loss(
         self, action: str, entry_price: float, sl_price: float
@@ -197,10 +255,18 @@ class TradeExecutor:
             sl, tp1, tp2, tp3 = compute_range_sl_tp(
                 action, execution_price, atr, rmeta
             )
-            sl = round_step_size(sl, rules.tick_size, rules.price_precision)
-            tp1 = round_step_size(tp1, rules.tick_size, rules.price_precision)
-            tp2 = round_step_size(tp2, rules.tick_size, rules.price_precision)
-            tp3 = round_step_size(tp3, rules.tick_size, rules.price_precision)
+            sl = round_protective_price(
+                sl, rules.tick_size, rules.price_precision, side=action, kind="SL"
+            )
+            tp1 = round_protective_price(
+                tp1, rules.tick_size, rules.price_precision, side=action, kind="TP"
+            )
+            tp2 = round_protective_price(
+                tp2, rules.tick_size, rules.price_precision, side=action, kind="TP"
+            )
+            tp3 = round_protective_price(
+                tp3, rules.tick_size, rules.price_precision, side=action, kind="TP"
+            )
         else:
             sl, tp1, tp2, tp3 = self.calculate_sl_tp(
                 action, execution_price, atr, rules, structure=structure
@@ -269,9 +335,15 @@ class TradeExecutor:
             new_tp2 = entry_price - abs(tp2 - entry_price) * scale if tp2 > 0 else tp2
             new_tp3 = entry_price - abs(tp3 - entry_price) * scale if tp3 > 0 else tp3
 
-        new_tp1 = round_step_size(new_tp1, rules.tick_size, rules.price_precision)
-        new_tp2 = round_step_size(new_tp2, rules.tick_size, rules.price_precision)
-        new_tp3 = round_step_size(new_tp3, rules.tick_size, rules.price_precision)
+        new_tp1 = round_protective_price(
+            new_tp1, rules.tick_size, rules.price_precision, side=action, kind="TP"
+        )
+        new_tp2 = round_protective_price(
+            new_tp2, rules.tick_size, rules.price_precision, side=action, kind="TP"
+        )
+        new_tp3 = round_protective_price(
+            new_tp3, rules.tick_size, rules.price_precision, side=action, kind="TP"
+        )
 
         trade_logger.info(
             "RR optimized — TP extended for effective 1:%.1f "
@@ -334,10 +406,18 @@ class TradeExecutor:
             _, tp1, tp2, tp3 = compute_rr_ladder(action, entry_price, sl)
 
         return (
-            round_step_size(sl, rules.tick_size, rules.price_precision),
-            round_step_size(tp1, rules.tick_size, rules.price_precision),
-            round_step_size(tp2, rules.tick_size, rules.price_precision),
-            round_step_size(tp3, rules.tick_size, rules.price_precision),
+            round_protective_price(
+                sl, rules.tick_size, rules.price_precision, side=action, kind="SL"
+            ),
+            round_protective_price(
+                tp1, rules.tick_size, rules.price_precision, side=action, kind="TP"
+            ),
+            round_protective_price(
+                tp2, rules.tick_size, rules.price_precision, side=action, kind="TP"
+            ),
+            round_protective_price(
+                tp3, rules.tick_size, rules.price_precision, side=action, kind="TP"
+            ),
         )
 
     @staticmethod
@@ -547,6 +627,7 @@ class TradeExecutor:
         return False
 
     def _persist_orphan_fill(self, trade_data: dict[str, Any]) -> None:
+        self._register_live_orphan(trade_data)
         path = os.path.join(Config.DATA_DIR, "orphan_fills.jsonl")
         try:
             with open(path, "a", encoding="utf-8") as handle:
@@ -554,16 +635,80 @@ class TradeExecutor:
         except OSError as exc:
             error_logger.error("Failed to write orphan fill recovery file: %s", exc)
 
+    def _register_live_orphan(self, trade_data: dict[str, Any]) -> None:
+        trade_id = str(trade_data.get("trade_id") or "")
+        if not trade_id:
+            return
+        with self._live_orphans_lock:
+            self._live_orphans[trade_id] = dict(trade_data)
+
+    def live_orphan_trades(self) -> list[dict[str, Any]]:
+        """Open fills the DB has not accepted yet — still monitored for SL/TP."""
+        with self._live_orphans_lock:
+            return [dict(row) for row in self._live_orphans.values()]
+
+    def forget_live_orphan(self, trade_id: str) -> None:
+        with self._live_orphans_lock:
+            self._live_orphans.pop(str(trade_id or ""), None)
+
+    def purge_orphans_present_in_db(self) -> None:
+        with self._live_orphans_lock:
+            ids = list(self._live_orphans)
+        getter = getattr(self.db, "get_trade", None)
+        if not callable(getter):
+            return
+        for trade_id in ids:
+            try:
+                if getter(trade_id) is not None:
+                    self.forget_live_orphan(trade_id)
+            except Exception:
+                continue
+
+    def _wallet_for_dca_plan(self) -> float:
+        """Live wallet, else today's daily baseline. Never invent a balance."""
+        try:
+            wallet = float(self.exchange.get_futures_balance(force_refresh=False) or 0.0)
+        except Exception:
+            wallet = 0.0
+        if wallet > 0:
+            return wallet
+        try:
+            stats = self.db.get_daily_stats(utc_today_str()) or {}
+            return safe_float(stats.get("start_balance"))
+        except Exception:
+            return 0.0
+
+    def _revert_claimed_dca_stage(
+        self, trade: dict[str, Any], step: int, metadata: dict[str, Any]
+    ) -> None:
+        if metadata.get("dca_uncertain_client_id") or metadata.get(
+            "dca_uncertain_order_id"
+        ):
+            return
+        revert = getattr(self.db, "revert_entry_stage", None)
+        reverted = False
+        if callable(revert):
+            reverted = bool(revert(str(trade.get("trade_id") or ""), step))
+        if reverted:
+            prior = max(int(step) - 1, 1)
+            trade["entry_stage"] = prior
+            metadata["entry_stage"] = prior
+            metadata["dca_entries"] = prior
+            trade["metadata"] = metadata
+
     def _should_attach_native_exits(
         self,
         attach_native_exits: bool = False,
         metadata: Optional[dict[str, Any]] = None,
         structure: Optional[dict[str, Any]] = None,
     ) -> bool:
-        """Resolve native TP/SL — off unless ENABLE_NATIVE_TP_SL is explicitly True."""
-        if Config.ENABLE_NATIVE_TP_SL:
-            return True
-        return False
+        """Native TP/SL follows ENABLE_NATIVE_TP_SL (default True).
+
+        Virtual in-process SL is a backup, not a substitute. Callers cannot
+        enable native by passing attach_native_exits while the config flag is False.
+        """
+        del attach_native_exits, metadata, structure
+        return bool(Config.ENABLE_NATIVE_TP_SL)
 
     def _place_native_exit_orders(
         self,
@@ -577,7 +722,7 @@ class TradeExecutor:
         tp3: float,
         metadata: dict[str, Any],
         quantity: float,
-    ) -> None:
+    ) -> bool:
         """Place exchange-native STOP_MARKET + TAKE_PROFIT_MARKET bracket after entry."""
         tp_specs: list[tuple[str, float, float]] = []
         if Config.ENABLE_PARTIAL_TP:
@@ -589,35 +734,104 @@ class TradeExecutor:
         else:
             tp_specs = [("TP3", tp3, quantity)]
 
-        try:
-            order_map = self.exchange.place_native_exit_bracket(
+        from core.exchange_protection import (
+            alert_unprotected_position,
+            apply_protection_metadata,
+            ensure_native_stop,
+            protection_is_verified,
+            verify_protective_order_status,
+        )
+
+        telegram = getattr(self, "telegram", None)
+
+        if sl <= 0:
+            metadata["native_orders_placed"] = False
+            metadata["native_protection_verified"] = False
+            self.db.update_trade(trade_id, {"metadata": metadata})
+            error_logger.critical(
+                "PROTECTION_PLACEMENT_FAILED %s %s — invalid SL, native bracket skipped",
+                symbol,
+                position_side,
+            )
+            alert_unprotected_position(
+                telegram, symbol=symbol, position_side=position_side, reason="invalid_sl"
+            )
+            return False
+
+        old_id = str(metadata.get("native_sl_order_id") or "") or None
+        ok, reason, oid = ensure_native_stop(
+            self.exchange,
+            symbol=symbol,
+            position_side=position_side,
+            sl_price=sl,
+            old_sl_order_id=old_id,
+        )
+        apply_protection_metadata(metadata, reason=reason, order_id=oid)
+        verified = bool(metadata.get("native_protection_verified"))
+        self.db.update_trade(trade_id, {"metadata": metadata})
+        if not verified:
+            alert_unprotected_position(
+                telegram,
                 symbol=symbol,
                 position_side=position_side,
-                sl_price=sl,
-                tp_specs=tp_specs,
+                reason=reason,
             )
-            metadata["native_orders_placed"] = bool(order_map)
-            metadata["native_sl_order_id"] = order_map.get("SL")
-            metadata["native_tp_order_ids"] = {
-                k: v for k, v in order_map.items() if k != "SL"
-            }
+            return False
+
+        tp_ids: dict[str, str] = {}
+        for level, tp_price, tp_qty in tp_specs:
+            if tp_price <= 0 or tp_qty <= 0:
+                continue
+            try:
+                close_side = "SELL" if str(position_side).upper() == "LONG" else "BUY"
+                tp_resp = self.exchange.place_conditional_order(
+                    symbol,
+                    close_side,
+                    position_side,
+                    "TAKE_PROFIT_MARKET",
+                    tp_price,
+                    quantity=tp_qty,
+                )
+                tp_id = str((tp_resp or {}).get("orderId") or "")
+                if not tp_id:
+                    continue
+                status = verify_protective_order_status(self.exchange, symbol, tp_id)
+                if status in {"CANCELED", "EXPIRED", "REJECTED", "UNVERIFIED"}:
+                    error_logger.warning(
+                        "Native %s unverified %s status=%s — SL remains %s",
+                        level,
+                        symbol,
+                        status,
+                        oid,
+                    )
+                    continue
+                tp_ids[level.upper()] = tp_id
+            except Exception as exc:
+                error_logger.warning(
+                    "Native %s order failed for %s %s: %s",
+                    level,
+                    symbol,
+                    position_side,
+                    exc,
+                )
+        if tp_ids:
+            metadata["native_tp_order_ids"] = tp_ids
             self.db.update_trade(trade_id, {"metadata": metadata})
-            trade_logger.info(
-                "Native TP/SL bracket placed | %s %s | SL=%.6f | orders=%s",
-                symbol,
-                position_side,
-                sl,
-                list(order_map.keys()),
-            )
-        except Exception as exc:
-            metadata["native_orders_placed"] = False
-            self.db.update_trade(trade_id, {"metadata": metadata})
-            error_logger.warning(
-                "Native TP/SL placement failed for %s %s — soft monitor fallback active: %s",
-                symbol,
-                position_side,
-                exc,
-            )
+        trade_logger.info(
+            "Native SL verified | %s %s | sl=%.6f | orderId=%s | tps=%s",
+            symbol,
+            position_side,
+            sl,
+            oid,
+            list(tp_ids.keys()),
+        )
+        self._notify_protection(
+            symbol=symbol,
+            side=position_side,
+            detail=f"verified id={oid}",
+            verified=True,
+        )
+        return True
 
     def execute_trade(
         self,
@@ -1019,6 +1233,16 @@ class TradeExecutor:
             )
             return None
         sl, tp1, tp2, tp3 = pre_levels
+        if last_resort_sl_hit(action, current_price, sl) or not sl_is_valid_vs_entry(
+            action, current_price, sl
+        ):
+            log_execution_rejected(
+                symbol,
+                f"live price already through planned SL "
+                f"price={current_price:.6f} sl={sl:.6f}",
+                strategy=strategy,
+            )
+            return None
         if not range_mode:
             opposing = safe_float(structure.get("opposing_liquidity"))
             rr_ok, rr_reason = check_opposing_liquidity_rr(
@@ -1194,6 +1418,14 @@ class TradeExecutor:
                 exchange_order_id or "?",
                 order_status or "UNKNOWN",
             )
+            self._notify_uncertain_order(
+                symbol=symbol,
+                side=action,
+                status=order_status or "UNKNOWN",
+                client_order_id=client_order_id,
+                order_id=exchange_order_id,
+                context="entry",
+            )
             return None
 
         return self._complete_filled_entry(
@@ -1226,9 +1458,13 @@ class TradeExecutor:
         status = str(fill.get("status") or "FILLED").upper()
         if status not in {"FILLED", "PARTIALLY_FILLED"}:
             return None
-        fill_qty = safe_float(fill.get("executedQty")) or record.quantity
-        fill_price = safe_float(fill.get("avgPrice")) or record.entry
+        fill_qty = safe_float(fill.get("executedQty"))
+        fill_price = safe_float(fill.get("avgPrice"))
         if fill_qty <= 0 or record.atr <= 0:
+            return None
+        if fill_price <= 0:
+            fill_price = float(record.entry or 0.0)
+        if fill_price <= 0:
             return None
         rules = self.exchange.get_symbol_rules(record.symbol)
         structure: dict[str, Any] = {}
@@ -1268,6 +1504,7 @@ class TradeExecutor:
             leverage=Config.MAX_LEVERAGE,
             metadata=metadata,
             rules=rules,
+            attach_native_exits=bool(Config.ENABLE_NATIVE_TP_SL),
         )
 
     def _complete_filled_entry(
@@ -1291,19 +1528,8 @@ class TradeExecutor:
         position_side = action
         order_status = str(response.get("status") or "").upper()
         exchange_order_id = str(response.get("orderId", ""))
-        if record:
-            ledger = get_execution_ledger()
-            if record.is_opened():
-                return None
-            ledger.transition(
-                record,
-                ExecutionPhase.ORDER_FILLED
-                if order_status == "FILLED"
-                else ExecutionPhase.PARTIALLY_FILLED,
-                binance_order_id=exchange_order_id,
-                quantity=quantity,
-                entry=resolve_binance_fill_price(response, fallback=current_price),
-            )
+        if record and record.is_opened():
+            return None
         fill_price = resolve_binance_fill_price(response, fallback=current_price)
 
         post_levels = self._resolve_execution_levels(
@@ -1345,11 +1571,7 @@ class TradeExecutor:
         metadata["best_price"] = fill_price
         metadata["r_distance"] = abs(fill_price - sl)
         if dca_enabled():
-            wallet = 0.0
-            try:
-                wallet = float(self.exchange.get_futures_balance(force_refresh=False) or 0.0)
-            except Exception:
-                wallet = 0.0
+            wallet = self._wallet_for_dca_plan()
             apply_initial_dca_plan(
                 metadata,
                 fill_price,
@@ -1360,10 +1582,47 @@ class TradeExecutor:
                 leverage=leverage,
                 side=action,
             )
+            metadata["avg_entry_price"] = fill_price
+            metadata["dca_entry1_fill"] = fill_price
+            metadata["dca_entry1_qty"] = quantity
             capped_sl = resolved_final_sl(metadata, action)
             if capped_sl > 0:
                 sl = capped_sl
                 metadata["r_distance"] = abs(fill_price - sl)
+            if not sl_is_valid_vs_entry(action, fill_price, sl) or last_resort_sl_hit(
+                action, fill_price, sl
+            ):
+                error_logger.critical(
+                    "Post-fill wallet-capped SL invalid for %s %s | fill=%.6f sl=%.6f "
+                    "— fail-safe close",
+                    symbol,
+                    action,
+                    fill_price,
+                    sl,
+                )
+                self._persist_orphan_fill(
+                    {
+                        "trade_id": str(uuid.uuid4()),
+                        "symbol": symbol,
+                        "side": action,
+                        "entry_price": fill_price,
+                        "quantity": quantity,
+                        "status": TRADE_STATUS_OPEN,
+                        "exchange_order_id": exchange_order_id,
+                        "opened_at": utc_now().isoformat(),
+                        "strategy": strategy,
+                        "metadata": metadata,
+                    }
+                )
+                try:
+                    self.exchange.close_position_quantity(symbol, position_side, quantity)
+                except Exception as exc:
+                    error_logger.critical(
+                        "FAILSAFE_CLOSE failed after invalid capped SL %s: %s",
+                        symbol,
+                        exc,
+                    )
+                return None
 
         trade_id = str(uuid.uuid4())
         opened_at = utc_now().isoformat()
@@ -1398,7 +1657,9 @@ class TradeExecutor:
         db_logged = False
         try:
             db_logged = self._persist_trade_with_retry(trade_data)
-            if not db_logged:
+            if db_logged:
+                self.forget_live_orphan(trade_id)
+            else:
                 error_logger.error(
                     "CRITICAL ORPHAN FILL | %s %s | orderId=%s | trade_id=%s",
                     symbol,
@@ -1411,6 +1672,16 @@ class TradeExecutor:
             self.exchange.seed_position_after_fill(
                 symbol, position_side, quantity, fill_price
             )
+            if record:
+                get_execution_ledger().transition(
+                    record,
+                    ExecutionPhase.ORDER_FILLED
+                    if order_status == "FILLED"
+                    else ExecutionPhase.PARTIALLY_FILLED,
+                    binance_order_id=exchange_order_id,
+                    quantity=quantity,
+                    entry=fill_price,
+                )
 
             place_native = self._should_attach_native_exits(
                 attach_native_exits,
@@ -1418,8 +1689,8 @@ class TradeExecutor:
                 structure,
             )
             if place_native:
-                sl_for_native = 0.0 if dca_enabled() else sl
-                self._place_native_exit_orders(
+                sl_for_native = sl if sl_is_valid_vs_entry(action, fill_price, sl) else 0.0
+                native_ok = self._place_native_exit_orders(
                     trade_id=trade_id,
                     symbol=symbol,
                     position_side=position_side,
@@ -1430,6 +1701,25 @@ class TradeExecutor:
                     metadata=metadata,
                     quantity=quantity,
                 )
+                if not native_ok:
+                    error_logger.critical(
+                        "FAILSAFE_CLOSE %s %s after native SL could not be verified",
+                        symbol,
+                        action,
+                    )
+                    try:
+                        self.exchange.close_position_quantity(
+                            symbol, position_side, quantity
+                        )
+                    except Exception as exc:
+                        error_logger.critical(
+                            "FAILSAFE_CLOSE failed for %s %s: %s — position may be naked",
+                            symbol,
+                            action,
+                            exc,
+                        )
+                    self._persist_orphan_fill(trade_data)
+                    return None
 
             if not self.exchange.is_rest_blocked()[0]:
                 refined = fill_price
@@ -1454,14 +1744,7 @@ class TradeExecutor:
                             }
                         )
                         if dca_enabled() and dca_entry_count(metadata) <= 1:
-                            wallet = 0.0
-                            try:
-                                wallet = float(
-                                    self.exchange.get_futures_balance(force_refresh=False)
-                                    or 0.0
-                                )
-                            except Exception:
-                                wallet = 0.0
+                            wallet = self._wallet_for_dca_plan()
                             metadata.update(
                                 build_dca_plan(
                                     fill_price,
@@ -1487,8 +1770,12 @@ class TradeExecutor:
                             metadata=metadata,
                         )
                         if place_native:
-                            sl_for_native = 0.0 if dca_enabled() else sl
-                            self._place_native_exit_orders(
+                            sl_for_native = (
+                                sl
+                                if sl_is_valid_vs_entry(action, fill_price, sl)
+                                else 0.0
+                            )
+                            native_ok = self._place_native_exit_orders(
                                 trade_id=trade_id,
                                 symbol=symbol,
                                 position_side=position_side,
@@ -1499,6 +1786,24 @@ class TradeExecutor:
                                 metadata=metadata,
                                 quantity=quantity,
                             )
+                            if not native_ok:
+                                error_logger.critical(
+                                    "FAILSAFE_CLOSE %s %s after refined native SL failed",
+                                    symbol,
+                                    action,
+                                )
+                                try:
+                                    self.exchange.close_position_quantity(
+                                        symbol, position_side, quantity
+                                    )
+                                except Exception as exc:
+                                    error_logger.critical(
+                                        "FAILSAFE_CLOSE failed for %s: %s",
+                                        symbol,
+                                        exc,
+                                    )
+                                self._persist_orphan_fill(trade_data)
+                                return None
                     else:
                         self.db.update_trade(trade_id, {"entry_price": fill_price})
                     self.exchange.seed_position_after_fill(
@@ -1517,6 +1822,12 @@ class TradeExecutor:
             )
             return None
 
+        try:
+            from core.ops_heartbeat import touch_execution
+
+            touch_execution(source="position_confirmed")
+        except Exception:
+            pass
         trade_logger.info(
             "[POSITION_CONFIRMED] %s %s | strategy=%s | qty=%s | fill=%.6f | SL=%.6f | TP1=%.6f | "
             "R=%.6f | size_mult=%.2f | trade_id=%s | exec=%s",
@@ -1566,8 +1877,6 @@ class TradeExecutor:
         current_price: float,
     ) -> Optional[dict[str, Any]]:
         """Add Entry 2 or 3 using 1% of wallet. Does not move TP or Base Entry Price."""
-        if not dca_enabled() or Config.DRY_RUN:
-            return None
         if step not in (2, 3):
             return None
         symbol = str(trade.get("symbol") or "")
@@ -1579,18 +1888,41 @@ class TradeExecutor:
         # Stage must already be claimed (from_stage+1) so restarts cannot re-fire.
         if stage != step:
             return None
+        if metadata.get("dca_uncertain_client_id") or metadata.get("dca_uncertain_order_id"):
+            error_logger.critical(
+                "DCA entry %s %s skipped — previous add still uncertain; not resubmitting",
+                step,
+                symbol,
+            )
+            return None
+        if not dca_enabled() or Config.DRY_RUN:
+            self._revert_claimed_dca_stage(trade, step, metadata)
+            return None
         base = safe_float(metadata.get("base_entry_price")) or safe_float(
             trade.get("entry_price")
         )
         if base <= 0:
+            self._revert_claimed_dca_stage(trade, step, metadata)
             return None
         if self.exchange.is_rest_blocked()[0]:
+            self._revert_claimed_dca_stage(trade, step, metadata)
             return None
 
-        balance = self.exchange.get_futures_balance(force_refresh=False)
+        balance = self._wallet_for_dca_plan()
         if balance <= 0:
+            self._revert_claimed_dca_stage(trade, step, metadata)
             return None
-        rules = self.exchange.get_symbol_rules(symbol)
+        try:
+            rules = self.exchange.get_symbol_rules(symbol)
+        except Exception as exc:
+            error_logger.error(
+                "DCA entry %s skipped for %s — symbol rules failed: %s",
+                step,
+                symbol,
+                exc,
+            )
+            self._revert_claimed_dca_stage(trade, step, metadata)
+            return None
         notional = balance * dca_add_wallet_fraction()
         quantity = notional / current_price
         quantity = self._format_quantity(self.exchange, quantity, rules, symbol)
@@ -1613,9 +1945,11 @@ class TradeExecutor:
             rules.quantity_precision,
         )
         if quantity <= 0:
+            self._revert_claimed_dca_stage(trade, step, metadata)
             return None
 
         order_side = "BUY" if side == "LONG" else "SELL"
+        client_order_id = f"dca{step}{str(trade.get('trade_id') or 'x').replace('-', '')[:16]}"
         try:
             response = self.exchange.execute_futures_order(
                 symbol=symbol,
@@ -1624,25 +1958,151 @@ class TradeExecutor:
                 quantity=quantity,
                 price=None,
                 reduce_only=False,
-                new_client_order_id=f"dca{step}{str(trade.get('trade_id') or 'x').replace('-', '')[:16]}",
+                new_client_order_id=client_order_id,
             )
         except Exception as exc:
             error_logger.error(
                 "DCA entry %s failed for %s: %s", step, symbol, exc
             )
+            if _is_hard_order_reject(exc):
+                revert = getattr(self.db, "revert_entry_stage", None)
+                if callable(revert):
+                    revert(str(trade.get("trade_id") or ""), step)
+                return None
+            self._mark_dca_uncertain(
+                trade,
+                metadata,
+                step,
+                client_order_id=client_order_id,
+                order_id="",
+                status="TIMEOUT_OR_UNKNOWN",
+            )
             return None
         if not isinstance(response, dict):
+            self._mark_dca_uncertain(
+                trade,
+                metadata,
+                step,
+                client_order_id=client_order_id,
+                order_id="",
+                status="NON_DICT_RESPONSE",
+            )
             return None
 
-        add_qty = safe_float(response.get("executedQty")) or quantity
+        order_status = str(response.get("status") or "").upper()
+        if order_status in {"CANCELED", "EXPIRED", "REJECTED"}:
+            revert = getattr(self.db, "revert_entry_stage", None)
+            if callable(revert):
+                revert(str(trade.get("trade_id") or ""), step)
+            return None
+        if order_status not in {"FILLED", "PARTIALLY_FILLED"}:
+            self._mark_dca_uncertain(
+                trade,
+                metadata,
+                step,
+                client_order_id=client_order_id,
+                order_id=str(response.get("orderId") or ""),
+                status=order_status or "UNKNOWN",
+            )
+            return None
+
+        add_qty = safe_float(response.get("executedQty"))
+        if add_qty <= 0:
+            self._mark_dca_uncertain(
+                trade,
+                metadata,
+                step,
+                client_order_id=client_order_id,
+                order_id=str(response.get("orderId") or ""),
+                status=f"{order_status}_QTY0",
+            )
+            return None
+        return self._apply_confirmed_dca_fill(
+            trade, metadata, step, response, current_price, base
+        )
+
+    def _mark_dca_uncertain(
+        self,
+        trade: dict[str, Any],
+        metadata: dict[str, Any],
+        step: int,
+        *,
+        client_order_id: str,
+        order_id: str,
+        status: str,
+    ) -> None:
+        metadata["dca_uncertain_order_id"] = str(order_id or "")
+        metadata["dca_uncertain_client_id"] = client_order_id
+        metadata["dca_uncertain_step"] = step
+        metadata["dca_uncertain_status"] = status
+        metadata["dca_uncertain_at"] = time.time()
+        error_logger.critical(
+            "DCA entry %s %s uncertain (status=%s orderId=%s clientId=%s) — "
+            "stage stays claimed; will reconcile via lookup; not resubmitting",
+            step,
+            trade.get("symbol"),
+            status or "UNKNOWN",
+            order_id or "?",
+            client_order_id,
+        )
+        self.db.update_trade(str(trade["trade_id"]), {"metadata": metadata})
+        trade["metadata"] = metadata
+        self._notify_uncertain_order(
+            symbol=str(trade.get("symbol") or ""),
+            side=str(trade.get("side") or ""),
+            status=status or "UNKNOWN",
+            client_order_id=client_order_id,
+            order_id=order_id,
+            context=f"DCA{step}",
+        )
+
+    def adopt_confirmed_dca_fill(
+        self,
+        trade: dict[str, Any],
+        order: dict[str, Any],
+        step: int,
+    ) -> Optional[dict[str, Any]]:
+        """Apply a reconciled DCA fill. Never submits a new order."""
+        metadata = self.db.parse_trade_metadata(trade)
+        base = safe_float(metadata.get("base_entry_price")) or safe_float(
+            trade.get("entry_price")
+        )
+        add_qty = safe_float(order.get("executedQty"))
+        if add_qty <= 0:
+            return None
+        current_price = resolve_binance_fill_price(order, fallback=base)
+        return self._apply_confirmed_dca_fill(
+            trade, metadata, step, order, current_price, base
+        )
+
+    def _apply_confirmed_dca_fill(
+        self,
+        trade: dict[str, Any],
+        metadata: dict[str, Any],
+        step: int,
+        response: dict[str, Any],
+        current_price: float,
+        base: float,
+    ) -> Optional[dict[str, Any]]:
+        symbol = str(trade.get("symbol") or "")
+        side = str(trade.get("side") or "LONG").upper()
+        add_qty = safe_float(response.get("executedQty"))
+        if add_qty <= 0:
+            return None
         prior_qty = safe_float(trade.get("quantity"))
         new_qty = prior_qty + add_qty
         mark_dca_filled(metadata, step)
+        for key in (
+            "dca_uncertain_order_id",
+            "dca_uncertain_client_id",
+            "dca_uncertain_step",
+            "dca_uncertain_status",
+            "dca_uncertain_at",
+        ):
+            metadata.pop(key, None)
         live_mark = 0.0
         try:
-            live_mark = safe_float(
-                self.exchange.get_market_price(symbol, side)
-            )
+            live_mark = safe_float(self.exchange.get_market_price(symbol, side))
         except Exception:
             live_mark = 0.0
         fill_price = resolve_binance_fill_price(
@@ -1650,12 +2110,21 @@ class TradeExecutor:
         )
         metadata[f"dca_entry{step}_fill"] = fill_price
         metadata[f"dca_entry{step}_qty"] = add_qty
+        prior_avg = safe_float(metadata.get("avg_entry_price")) or safe_float(
+            trade.get("entry_price")
+        )
+        avg_entry = update_weighted_average(
+            metadata,
+            prior_avg=prior_avg,
+            prior_qty=prior_qty,
+            fill_price=fill_price,
+            add_qty=add_qty,
+        )
         patch: dict[str, Any] = {
             "quantity": new_qty,
             "entry_stage": step,
             "metadata": metadata,
         }
-        # Final SL is the Entry-1 plan (wallet-capped) — never Binance avg entry.
         if step >= 3:
             final_sl = resolved_final_sl(metadata, side)
             if final_sl > 0:
@@ -1663,22 +2132,48 @@ class TradeExecutor:
                 metadata["dca_sl_armed"] = True
                 patch["metadata"] = metadata
                 if Config.ENABLE_NATIVE_TP_SL:
-                    try:
-                        self.exchange.place_native_exit_bracket(
-                            symbol=symbol,
-                            position_side=side,
-                            sl_price=final_sl,
-                            tp_specs=[],
-                        )
-                    except Exception as exc:
-                        error_logger.warning(
-                            "Native final SL after Entry 3 failed for %s: %s",
+                    from core.exchange_protection import (
+                        apply_protection_metadata,
+                        ensure_native_stop,
+                        protection_is_verified,
+                    )
+
+                    ok, reason, oid = ensure_native_stop(
+                        self.exchange,
+                        symbol=symbol,
+                        position_side=side,
+                        sl_price=final_sl,
+                        entry_price=base,
+                        old_sl_order_id=str(metadata.get("native_sl_order_id") or "")
+                        or None,
+                    )
+                    apply_protection_metadata(metadata, reason=reason, order_id=oid)
+                    patch["metadata"] = metadata
+                    if not protection_is_verified(reason, oid):
+                        error_logger.critical(
+                            "PROTECTION_PLACEMENT_FAILED native final SL after Entry 3 "
+                            "for %s: %s — fail-safe close required",
                             symbol,
-                            exc,
+                            reason,
                         )
+                        patch["dca_failsafe_close"] = True
         self.db.update_trade(str(trade["trade_id"]), patch)
         trade.update(patch)
-        self.exchange.seed_position_after_fill(symbol, side, new_qty, base)
+        seed_px = avg_entry if avg_entry > 0 else base
+        self.exchange.seed_position_after_fill(symbol, side, new_qty, seed_px)
+        safety_sl = resolved_final_sl(metadata, side)
+        check_px = live_mark or fill_price
+        failsafe_close = bool(patch.get("dca_failsafe_close"))
+        if safety_sl > 0 and last_resort_sl_hit(side, check_px, safety_sl):
+            failsafe_close = True
+            error_logger.critical(
+                "DCA add %s %s filled through planned SL | live=%.6f sl=%.6f "
+                "— fail-safe close",
+                step,
+                symbol,
+                check_px,
+                safety_sl,
+            )
         sl_now = safe_float(patch.get("stop_loss")) or safe_float(trade.get("stop_loss"))
         trade_logger.info(
             "[DCA] Entry %s filled %s %s | add_qty=%.8f total=%.8f | "
@@ -1708,4 +2203,5 @@ class TradeExecutor:
             "entry3": safe_float(metadata.get("dca_entry3_px")),
             "stop_loss": sl_now,
             "sl_armed": step >= 3,
+            "failsafe_close": failsafe_close,
         }

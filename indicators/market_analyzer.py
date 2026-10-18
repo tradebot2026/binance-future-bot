@@ -2,10 +2,43 @@
 
 from __future__ import annotations
 
+import threading
+from collections import OrderedDict
+
 import pandas as pd
 import ta
 
 MIN_ANALYZER_BARS = 250
+_INDICATOR_CACHE_MAX = 96
+_INDICATOR_CACHE: OrderedDict[tuple, pd.DataFrame] = OrderedDict()
+_INDICATOR_CACHE_LOCK = threading.Lock()
+
+
+def _indicator_fingerprint(df: pd.DataFrame) -> tuple:
+    """Content key so identical closed-bar frames reuse one indicator pass."""
+    n = len(df)
+    last = df.iloc[-1]
+    ts = last["timestamp"] if "timestamp" in df.columns else n
+    if hasattr(ts, "value"):
+        ts_i = int(ts.value)
+    else:
+        try:
+            ts_i = int(pd.Timestamp(ts).value)
+        except Exception:
+            ts_i = int(n)
+    return (
+        int(n),
+        ts_i,
+        round(float(last.get("close") or 0.0), 8),
+        round(float(last.get("high") or 0.0), 8),
+        round(float(last.get("low") or 0.0), 8),
+        round(float(last.get("volume") or 0.0), 8),
+    )
+
+
+def clear_indicator_cache() -> None:
+    with _INDICATOR_CACHE_LOCK:
+        _INDICATOR_CACHE.clear()
 
 
 class MarketAnalyzer:
@@ -15,6 +48,20 @@ class MarketAnalyzer:
     def apply_all_indicators(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty or len(df) < MIN_ANALYZER_BARS:
             return df
+
+        if (
+            "ema_200" in df.columns
+            and "atr" in df.columns
+            and "bos_bullish" in df.columns
+        ):
+            return df
+
+        key = _indicator_fingerprint(df)
+        with _INDICATOR_CACHE_LOCK:
+            cached = _INDICATOR_CACHE.get(key)
+            if cached is not None:
+                _INDICATOR_CACHE.move_to_end(key)
+                return cached
 
         df = df.copy()
 
@@ -99,6 +146,11 @@ class MarketAnalyzer:
 
         df.dropna(subset=["ema_200", "last_swing_high", "last_swing_low"], inplace=True)
         df.reset_index(drop=True, inplace=True)
+        with _INDICATOR_CACHE_LOCK:
+            _INDICATOR_CACHE[key] = df
+            _INDICATOR_CACHE.move_to_end(key)
+            while len(_INDICATOR_CACHE) > _INDICATOR_CACHE_MAX:
+                _INDICATOR_CACHE.popitem(last=False)
         return df
 
     @staticmethod

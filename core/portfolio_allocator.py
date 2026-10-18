@@ -283,6 +283,9 @@ class PortfolioAllocator:
     def _check_net_exposure(
         self, candidate: SignalCandidate, balance: float
     ) -> tuple[bool, str]:
+        authoritative = getattr(self.exchange, "position_snapshot_authoritative", None)
+        if callable(authoritative) and not bool(authoritative()):
+            return False, "position snapshot not authoritative"
         long_notional = 0.0
         short_notional = 0.0
         for pos in self.exchange.get_all_open_positions(force_refresh=False):

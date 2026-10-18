@@ -29,7 +29,10 @@ from risk_manager import RiskManager
 from core.instance_lock import acquire_main_lock, release_main_lock
 from core.minute_clock import MinuteScanClock
 from reconciliation import (
+    entries_blocked_by_unresolved_orphans,
+    mark_state_unreliable,
     reconcile_positions_at_startup,
+    state_is_unreliable,
 )
 from scheduler import DailyScheduler
 from telegram_bot import TelegramManager
@@ -196,19 +199,30 @@ def _validate_candidate(candidate: dict[str, Any]) -> tuple[bool, str, dict[str,
     if price <= 0:
         return False, f"invalid price ({price})", {}
     if is_range_strategy(strategy):
-        min_required = Config.RANGE_MIN_SCORE
+        min_required = Config.effective_min_score(Config.RANGE_MIN_SCORE)
     elif strategy == STRATEGY_SMC_TREND:
+        from core.strategy_score_ranges import execution_min_score
+
         structure = candidate.get("structure_metadata") or {}
         confluence = str(
             candidate.get("confluence") or structure.get("confluence_type", "")
         )
         macro = str(candidate.get("macro_trend") or structure.get("macro_trend", "NEUTRAL"))
-        min_required = effective_smc_min_score(confluence, macro)
+        min_required = Config.effective_min_score(
+            effective_smc_min_score(confluence, macro)
+        )
+        # Super dispatch already uses execution_min (STRATEGY_MIN_SCORE).
+        # Multi-confluence 65 cannot execute below that floor.
+        min_required = max(min_required, execution_min_score(STRATEGY_SMC_TREND))
     else:
         min_required = ScoringEngine.strategy_min_score(strategy)
 
     if score < min_required:
-        return False, f"score {score:.1f} below minimum {min_required:.1f}", {}
+        return (
+            False,
+            f"score {score:.1f} below execution minimum {min_required:.1f}",
+            {},
+        )
 
     structure = candidate.get("structure_metadata") or {}
     normalized = {
@@ -236,26 +250,69 @@ def _validate_candidate(candidate: dict[str, Any]) -> tuple[bool, str, dict[str,
     return True, "", normalized
 
 
+def _market_data_blocks_new_entries(exchange: Any) -> tuple[bool, str]:
+    """Block new entries while WS is reconnecting/stale/warming. Protection continues."""
+    if exchange is None:
+        return False, ""
+    hub = getattr(exchange, "_market_data", None)
+    if hub is None:
+        return False, ""
+    checker = getattr(hub, "ws_state_is_degraded", None)
+    if not callable(checker):
+        return False, ""
+    try:
+        degraded = checker()
+    except Exception:
+        return True, "websocket health check failed — new entries blocked"
+    if degraded is True:
+        return True, "websocket reconnecting, warming up, or stale — new entries blocked"
+    return False, ""
+
+
 def _entries_allowed(
     scheduler: DailyScheduler,
     risk: RiskManager,
     db: DatabaseManager,
 ) -> tuple[bool, str]:
-    is_paused, pause_reason = scheduler.is_entry_paused()
-    if is_paused:
-        return False, pause_reason
+    try:
+        unreliable, unreliable_reason = state_is_unreliable()
+        if unreliable:
+            return False, unreliable_reason
 
-    if risk.get_exchange_open_positions_count() >= Config.MAX_POSITIONS:
-        return False, (
-            f"Max open positions reached on exchange "
-            f"({risk.get_exchange_open_positions_count()}/{Config.MAX_POSITIONS})."
+        blocked, orphan_reason = entries_blocked_by_unresolved_orphans()
+        if blocked:
+            return False, orphan_reason
+
+        md_blocked, md_reason = _market_data_blocks_new_entries(
+            getattr(risk, "exchange", None)
         )
+        if md_blocked:
+            return False, md_reason
 
-    allowed, reason = risk.can_open_trade()
-    if not allowed:
-        return False, reason
+        is_paused, pause_reason = scheduler.is_entry_paused()
+        if is_paused:
+            return False, pause_reason
 
-    return True, ""
+        try:
+            db_open = int(db.get_active_trades_count() or 0)
+        except Exception:
+            db_open = int(Config.MAX_POSITIONS)
+        exchange_open = int(risk.get_exchange_open_positions_count() or 0)
+        booked_open = max(exchange_open, db_open)
+        if booked_open >= Config.MAX_POSITIONS:
+            return False, (
+                f"Max open positions reached "
+                f"({booked_open}/{Config.MAX_POSITIONS})."
+            )
+
+        allowed, reason = risk.can_open_trade()
+        if not allowed:
+            return False, reason
+
+        return True, ""
+    except Exception as exc:
+        error_logger.critical("Entry gate failed closed: %s", exc)
+        return False, f"entry_gate_error:{exc}"
 
 
 def _execute_candidates(
@@ -442,6 +499,8 @@ def _execute_candidates(
                     "<i>Check data/orphan_fills.jsonl — will auto-recover on next restart.</i>"
                 )
             else:
+                meta = result.get("metadata") or {}
+                structure = normalized.get("structure_metadata") or {}
                 tg.send_trade_alert(
                     action=result["action"],
                     symbol=result["symbol"],
@@ -457,6 +516,15 @@ def _execute_candidates(
                     backtest_wins=int(normalized.get("backtest_wins") or 0),
                     backtest_trades=int(normalized.get("backtest_trades") or 0),
                     dca_plan=telegram_dca_levels(result.get("metadata")),
+                    fill_status="FILLED",
+                    native_sl_order_id=str(meta.get("native_sl_order_id") or ""),
+                    native_protection_verified=bool(
+                        meta.get("native_protection_verified")
+                    ),
+                    funnel_score=safe_float(structure.get("funnel_score")),
+                    live_score=safe_float(structure.get("live_score"))
+                    or float(normalized["score"]),
+                    execution_min=safe_float(structure.get("execution_min")),
                 )
 
             scheduler.notify_trade_event()
@@ -515,6 +583,7 @@ def _adopt_pending_user_fills(
                 clearer(str(result.get("symbol", "")))
         if not result.get("orphan_fill"):
             meta = result.get("metadata") or {}
+            structure = meta.get("structure") if isinstance(meta.get("structure"), dict) else {}
             tg.send_trade_alert(
                 action=result["action"],
                 symbol=result["symbol"],
@@ -530,15 +599,32 @@ def _adopt_pending_user_fills(
                 backtest_wins=int(safe_float(meta.get("backtest_wins"))),
                 backtest_trades=int(safe_float(meta.get("backtest_trades"))),
                 dca_plan=telegram_dca_levels(meta),
+                fill_status=str(result.get("fill_status") or "FILLED"),
+                native_sl_order_id=str(meta.get("native_sl_order_id") or ""),
+                native_protection_verified=bool(
+                    meta.get("native_protection_verified")
+                ),
+                funnel_score=safe_float(structure.get("funnel_score")),
+                live_score=safe_float(structure.get("live_score"))
+                or float(result.get("score", 0.0)),
+                execution_min=safe_float(structure.get("execution_min")),
             )
         scheduler.notify_trade_event()
         risk.notify_trade_event()
 
 
-def _write_bot_heartbeat(cycle: int) -> None:
+def _write_bot_heartbeat(cycle: int, market_data: Any = None) -> None:
     """Touch heartbeat file for watchdog.py process health checks."""
-    from core.ops_heartbeat import touch_main_loop
+    from core.ops_heartbeat import set_ws_health_state, touch_main_loop
 
+    if market_data is not None:
+        snap_fn = getattr(market_data, "get_ws_health_snapshot", None)
+        if callable(snap_fn):
+            try:
+                snap = snap_fn() or {}
+                set_ws_health_state(str(snap.get("state") or ""))
+            except Exception:
+                pass
     touch_main_loop(cycle=cycle)
 
 
@@ -696,6 +782,7 @@ def main(controller: Optional[BotController] = None) -> str:
             controller=controller,
         )
         scheduler.telegram = tg
+        executor.telegram = tg
         critical_alerts.attach_telegram(tg)
 
         if startup_ban and startup_ban.is_banned:
@@ -718,9 +805,20 @@ def main(controller: Optional[BotController] = None) -> str:
         if scanner is not None and scanner.orchestrator is not None:
             scanner.orchestrator.attach_validator(validator)
             scanner.orchestrator.attach_telegram(tg)
-            scheduler.attach_day_rollover_hook(
-                scanner.orchestrator.on_utc_day_rollover
-            )
+
+        def _on_utc_day_rollover(day: str) -> None:
+            reset_peak = getattr(risk, "reset_daily_drawdown_peak", None)
+            if callable(reset_peak):
+                try:
+                    reset_peak()
+                except Exception as exc:
+                    error_logger.error("Peak realized PnL reset failed: %s", exc)
+            orch = getattr(scanner, "orchestrator", None) if scanner is not None else None
+            hook = getattr(orch, "on_utc_day_rollover", None) if orch is not None else None
+            if callable(hook):
+                hook(day)
+
+        scheduler.attach_day_rollover_hook(_on_utc_day_rollover)
         if Config.ENABLE_ASYNC_BACKTEST_VALIDATION:
             validator.start()
 
@@ -743,7 +841,42 @@ def main(controller: Optional[BotController] = None) -> str:
         try:
             reconcile_positions_at_startup(exchange, db, tg, manager=manager)
         except Exception as exc:
-            error_logger.error("Startup reconciliation failed (continuing): %s", exc)
+            error_logger.critical(
+                "Startup reconciliation failed — new entries blocked until a later "
+                "successful reconcile: %s",
+                exc,
+            )
+            mark_state_unreliable(f"startup_reconcile_failed:{exc}")
+
+        if Config.ENABLE_NATIVE_TP_SL:
+            from core.exchange_protection import restore_open_trade_protection
+
+            restore_open_trade_protection(
+                exchange, db, manager=manager, telegram=tg
+            )
+            try:
+                tg.send_message(
+                    "🛡 <b>Native exchange TP/SL is ON</b>\n"
+                    "STOP_MARKET / TAKE_PROFIT_MARKET orders are verified on Binance.\n"
+                    "<i>Virtual SL remains an in-process backup.</i>"
+                )
+            except Exception:
+                pass
+        else:
+            error_logger.critical(
+                "NATIVE_TP_SL_DISABLED — open positions are protected only by in-process "
+                "virtual SL/TP. Crash, kill, hang, or missing market data leaves Binance "
+                "positions unprotected. Do not treat this process as crash-safe."
+            )
+            try:
+                tg.send_message(
+                    "⚠️ <b>Native exchange TP/SL is OFF</b>\n"
+                    "Open positions survive only while this process runs virtual SL/TP.\n"
+                    "<i>Crash/kill/hang = unprotected Binance positions. "
+                    "Controlled Testnet only.</i>"
+                )
+            except Exception:
+                pass
 
         if scanner is not None and scanner.orchestrator is not None:
             scanner.bootstrap_scan_universe()
@@ -756,6 +889,12 @@ def main(controller: Optional[BotController] = None) -> str:
             _bootstrap_scan_universe_at_startup(scanner, exchange, market_data)
 
         start_monitor_watchdog(market_data, telegram=tg, stop_event=manager.stop_event)
+        system_logger.critical(
+            "SUPERVISION: watchdog.py is a sibling process and is NOT started by "
+            "main.py (a child would die with this process). Crash auto-restarts=%s "
+            "(historical 0=unlimited is now this cap; Telegram /restart still works).",
+            Config.max_crash_auto_restarts(),
+        )
         background_ops = start_background_ops(
             exchange,
             db,
@@ -768,6 +907,7 @@ def main(controller: Optional[BotController] = None) -> str:
         system_logger.info("Initialization complete. Entering main trading loop.")
 
         last_heartbeat = time.monotonic()
+        loop_boot_mono = last_heartbeat
         last_report_day = ""
         cycle = 0
         consecutive_errors = 0
@@ -900,7 +1040,8 @@ def main(controller: Optional[BotController] = None) -> str:
                         snap.unrealized_pnl,
                         snap.drawdown_percent,
                     )
-                    _write_bot_heartbeat(cycle)
+                    _write_bot_heartbeat(cycle, market_data)
+                    _maybe_warn_missing_watchdog(tg, loop_boot_mono)
                     last_heartbeat = now
 
                 consecutive_errors = 0
@@ -961,10 +1102,63 @@ def main(controller: Optional[BotController] = None) -> str:
         release_main_lock()
 
 
+_WATCHDOG_ABSENT_ALERTED = False
+
+
+def _maybe_warn_missing_watchdog(
+    tg: Optional[TelegramManager], started_mono: float
+) -> None:
+    """Alert once if sibling watchdog.py has not saved state. Never spawn it."""
+    global _WATCHDOG_ABSENT_ALERTED
+    if _WATCHDOG_ABSENT_ALERTED:
+        return
+    from core.bot_health import watchdog_sibling_status
+
+    status = watchdog_sibling_status()
+    if status.get("fresh"):
+        _WATCHDOG_ABSENT_ALERTED = True
+        system_logger.info(
+            "External watchdog.py detected (pid=%s age=%.0fs).",
+            status.get("pid"),
+            float(status.get("age_seconds") or 0.0),
+        )
+        return
+    grace = float(status.get("stale_after") or 90.0)
+    if (time.monotonic() - started_mono) < grace:
+        return
+    _WATCHDOG_ABSENT_ALERTED = True
+    error_logger.critical(
+        "WATCHDOG_PROCESS_ABSENT — start `python watchdog.py` in a SEPARATE "
+        "process. main.py will not spawn it (a child would die with this process)."
+    )
+    if tg is None:
+        return
+    try:
+        tg.send_message(
+            "⚠️ <b>External watchdog.py is not running</b>\n"
+            "Start it in a separate process. This bot will not spawn it.\n"
+            "<i>Native TP/SL stays on the exchange; watchdog is the extra safety net.</i>"
+        )
+    except Exception:
+        pass
+
+
 def run_with_auto_restart() -> None:
     """Restart the bot after recoverable crashes or network failures."""
+    from core.restart_state import (
+        acknowledge_manual_start,
+        mark_crash_restart,
+        mark_restart_exhausted,
+    )
+
     restart_count = 0
     controller = BotController()
+    crash_limit = Config.max_crash_auto_restarts()
+    acknowledge_manual_start()
+    system_logger.info(
+        "Crash auto-restart bound=%s (historical 0=unlimited now uses HARD_CAP).",
+        crash_limit,
+    )
 
     while True:
         try:
@@ -992,11 +1186,17 @@ def run_with_auto_restart() -> None:
                 exc,
             )
             error_logger.critical(traceback.format_exc())
+            mark_crash_restart(restart_count, crash_limit)
 
-            if Config.MAX_AUTO_RESTARTS > 0 and restart_count >= Config.MAX_AUTO_RESTARTS:
+            if restart_count > crash_limit:
+                mark_restart_exhausted(restart_count, crash_limit)
                 error_logger.critical(
-                    "Max auto-restarts (%s) reached — stopping bot.",
-                    Config.MAX_AUTO_RESTARTS,
+                    "Crash auto-restart stopped (count=%s limit=%s). "
+                    "Start watchdog.py then python main.py. Telegram /restart "
+                    "works only after a manual start. Positions may be unprotected "
+                    "while native TP/SL is OFF.",
+                    restart_count,
+                    crash_limit,
                 )
                 break
 

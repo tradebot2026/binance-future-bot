@@ -555,8 +555,12 @@ class DatabaseManager:
                 ).fetchall()
                 return [dict(row) for row in rows]
         except sqlite3.Error as exc:
-            error_logger.error("Failed to fetch open trades for %s: %s", symbol, exc)
-            return []
+            error_logger.critical(
+                "DB_OPEN_TRADES_FAILED for %s — fail closed, not treating as flat: %s",
+                symbol,
+                exc,
+            )
+            raise DatabaseError(f"get_open_trades_for_symbol failed: {exc}") from exc
 
     def get_open_trades_by_strategy(self, strategy: str) -> List[dict[str, Any]]:
         placeholders = ",".join("?" for _ in ACTIVE_TRADE_STATUSES)
@@ -571,10 +575,12 @@ class DatabaseManager:
                 ).fetchall()
                 return [dict(row) for row in rows]
         except sqlite3.Error as exc:
-            error_logger.error(
-                "Failed to fetch open trades for strategy %s: %s", strategy, exc
+            error_logger.critical(
+                "DB_OPEN_TRADES_FAILED for strategy %s — fail closed: %s",
+                strategy,
+                exc,
             )
-            return []
+            raise DatabaseError(f"get_open_trades_by_strategy failed: {exc}") from exc
 
     def get_open_trades(self) -> List[dict[str, Any]]:
         """Return active trades ordered FIFO."""
@@ -588,8 +594,11 @@ class DatabaseManager:
                 rows = conn.execute(query, ACTIVE_TRADE_STATUSES).fetchall()
                 return [dict(row) for row in rows]
         except sqlite3.Error as exc:
-            error_logger.error("Failed to fetch open trades: %s", exc)
-            return []
+            error_logger.critical(
+                "DB_OPEN_TRADES_FAILED — fail closed, not treating book as flat: %s",
+                exc,
+            )
+            raise DatabaseError(f"get_open_trades failed: {exc}") from exc
 
     def get_trade(self, trade_id: str) -> Optional[dict[str, Any]]:
         try:
@@ -1419,6 +1428,58 @@ class DatabaseManager:
                     "Failed to claim entry_stage %s→%s for %s: %s",
                     from_stage,
                     to_stage,
+                    trade_id,
+                    exc,
+                )
+                return False
+
+    def revert_entry_stage(self, trade_id: str, claimed_step: int) -> bool:
+        """Roll back a DCA stage claim after a rejected/failed add (not after uncertain ACK)."""
+        if claimed_step not in (2, 3) or not trade_id:
+            return False
+        prior = claimed_step - 1
+        with self._write_lock:
+            try:
+                with self.connection() as conn:
+                    row = conn.execute(
+                        "SELECT entry_stage, metadata FROM trades WHERE trade_id = ?",
+                        (trade_id,),
+                    ).fetchone()
+                    if row is None:
+                        return False
+                    stored_meta = self.parse_trade_metadata({"metadata": row["metadata"]})
+                    current = 1
+                    for raw in (
+                        row["entry_stage"],
+                        stored_meta.get("entry_stage"),
+                        stored_meta.get("dca_entries"),
+                    ):
+                        try:
+                            if raw is not None:
+                                current = max(current, int(raw))
+                        except (TypeError, ValueError):
+                            pass
+                    if current != claimed_step:
+                        return False
+                    stored_meta["entry_stage"] = prior
+                    stored_meta["dca_entries"] = prior
+                    stored_meta.pop("dca_sl_armed", None)
+                    payload = json.dumps(stored_meta)
+                    cursor = conn.execute(
+                        """
+                        UPDATE trades
+                        SET entry_stage = ?, metadata = ?
+                        WHERE trade_id = ? AND COALESCE(entry_stage, 1) = ?
+                        """,
+                        (prior, payload, trade_id, claimed_step),
+                    )
+                    conn.commit()
+                    return cursor.rowcount == 1
+            except sqlite3.Error as exc:
+                error_logger.error(
+                    "Failed to revert entry_stage %s→%s for %s: %s",
+                    claimed_step,
+                    prior,
                     trade_id,
                     exc,
                 )

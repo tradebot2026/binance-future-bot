@@ -1,0 +1,16 @@
+[Unit]
+Description=HYBRID_SNIPER main trading process
+After=network-online.target hybrid-sniper-watchdog.service
+Wants=network-online.target hybrid-sniper-watchdog.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/hybrid-sniper
+ExecStart=/usr/bin/python3 -u main.py
+Restart=on-failure
+RestartSec=8
+# Instance lock still prevents a second main.py.
+# Native TP/SL defaults ON in config.py. Set ENABLE_NATIVE_TP_SL=false only for a virtual-only lab.
+
+[Install]
+WantedBy=multi-user.target

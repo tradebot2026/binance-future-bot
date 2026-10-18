@@ -22,11 +22,16 @@ from constants import (
 
 @dataclass(frozen=True)
 class StrategyScoreRange:
-    """Inclusive Hot band is [hot, super). Super is >= super. Normal is < hot."""
+    """Inclusive Hot band is [hot, super). Super is >= super. Normal is < hot.
+
+    Super is never below ``execution_min``. Hot may stay below execution min
+    because Hot only queues REST backtests; it does not dispatch entries.
+    """
 
     strategy: str
     super_score: float
     hot_score: float
+    execution_min: float = 0.0
 
     def classify(self, score: float) -> str:
         if score >= self.super_score:
@@ -42,8 +47,9 @@ class StrategyScoreRange:
         return score >= self.super_score
 
 
-# Funnel floors are below execution min-score so valid mid-setup coins can
-# enter Hot REST / Super rotation instead of stalling in Normal.
+# Super defaults may sit just below live execution min so Testnet relax can
+# still produce a Super band. score_range_for() then raises Super to the
+# execution floor. Hot stays below Super and may remain below execution min.
 _DEFAULT_SUPER: dict[str, float] = {
     STRATEGY_SMC_TREND: 68.0,
     STRATEGY_SMC_LEGACY: 68.0,
@@ -99,8 +105,22 @@ def _super_default(strategy: str, hot: float) -> float:
     return min(99.0, hot + 10.0)
 
 
+def execution_min_score(strategy: str) -> float:
+    """Execution floor for this strategy (Testnet relax applied). Never lowered here."""
+    tag = str(strategy or "").upper()
+    if tag == STRATEGY_SMC_LEGACY:
+        tag = STRATEGY_SMC_TREND
+    attr = _MIN_SCORE_ATTR.get(tag, "STRATEGY_MIN_SCORE")
+    base = float(getattr(Config, attr, Config.STRATEGY_MIN_SCORE))
+    return Config.effective_min_score(base)
+
+
 def score_range_for(strategy: str) -> StrategyScoreRange:
-    """Resolved Super/Hot floors for one strategy (Testnet relax applied)."""
+    """Resolved Super/Hot floors for one strategy (Testnet relax applied).
+
+    Super is raised to the execution minimum when the funnel default sits
+    below it. Execution floors are never reduced to match Super.
+    """
     tag = str(strategy or "").upper()
     if tag == STRATEGY_SMC_LEGACY:
         tag = STRATEGY_SMC_TREND
@@ -113,9 +133,16 @@ def score_range_for(strategy: str) -> StrategyScoreRange:
         super_score = _super_default(tag, hot)
     hot = Config.effective_min_score(hot)
     super_score = Config.effective_min_score(super_score)
+    exec_min = execution_min_score(tag)
+    super_score = max(super_score, exec_min)
     if super_score <= hot:
-        super_score = min(99.0, hot + 5.0)
-    return StrategyScoreRange(strategy=tag, super_score=super_score, hot_score=hot)
+        hot = min(hot, max(super_score - 1.0, 0.0))
+    return StrategyScoreRange(
+        strategy=tag,
+        super_score=super_score,
+        hot_score=hot,
+        execution_min=exec_min,
+    )
 
 
 def classify_score(strategy: str, score: float) -> str:

@@ -15,6 +15,7 @@ env/
 data/
 logs/
 reports/
+backups/
 *.sqlite
 *.sqlite-journal
 *.sqlite-wal

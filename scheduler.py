@@ -58,40 +58,56 @@ class DailyScheduler:
         """Called after UTC day reset so Super can enter the validation window."""
         self._on_day_rollover = hook
 
+    def _has_valid_baseline(self) -> bool:
+        stats = self.db.get_daily_stats(self.today_str) or {}
+        return safe_float(stats.get("start_balance")) > 0
+
+    def _refresh_daily_baseline(self, *, allow_sleep: bool) -> float:
+        """Resolve today's start_balance. Never invent a pause from a missing wallet."""
+        if self._has_valid_baseline():
+            self._startup_initialized = True
+            stats = self.db.get_daily_stats(self.today_str) or {}
+            return safe_float(stats.get("start_balance"))
+
+        if allow_sleep:
+            max_attempts = max(Config.STARTUP_BALANCE_MAX_ATTEMPTS, 1)
+            delay = max(Config.STARTUP_BALANCE_RETRY_SECONDS, 0.5)
+            for attempt in range(1, max_attempts + 1):
+                baseline = ensure_daily_baseline(
+                    self.exchange, self.db, utc_day=self.today_str
+                )
+                if baseline > 0:
+                    self._startup_initialized = True
+                    system_logger.info(
+                        "Trading day %s initialized with daily starting balance $%.2f.",
+                        self.today_str,
+                        baseline,
+                    )
+                    return baseline
+                if attempt < max_attempts:
+                    system_logger.debug(
+                        "Startup balance unavailable (attempt %s/%s) — retrying in %.1fs.",
+                        attempt,
+                        max_attempts,
+                        delay,
+                    )
+                    time.sleep(delay)
+            system_logger.warning(
+                "Could not initialize daily stats for %s: balance unavailable.",
+                self.today_str,
+            )
+            return 0.0
+
+        baseline = ensure_daily_baseline(
+            self.exchange, self.db, utc_day=self.today_str
+        )
+        if baseline > 0:
+            self._startup_initialized = True
+        return max(float(baseline or 0.0), 0.0)
+
     def ensure_startup_initialized(self) -> None:
         """Initialize daily stats once WS/REST balance is available (startup retries)."""
-        if self._startup_initialized:
-            return
-
-        max_attempts = max(Config.STARTUP_BALANCE_MAX_ATTEMPTS, 1)
-        delay = max(Config.STARTUP_BALANCE_RETRY_SECONDS, 0.5)
-
-        for attempt in range(1, max_attempts + 1):
-            baseline = ensure_daily_baseline(
-                self.exchange, self.db, utc_day=self.today_str
-            )
-            if baseline > 0:
-                self._startup_initialized = True
-                system_logger.info(
-                    "Trading day %s initialized with daily starting balance $%.2f.",
-                    self.today_str,
-                    baseline,
-                )
-                return
-
-            if attempt < max_attempts:
-                system_logger.debug(
-                    "Startup balance unavailable (attempt %s/%s) — retrying in %.1fs.",
-                    attempt,
-                    max_attempts,
-                    delay,
-                )
-                time.sleep(delay)
-
-        system_logger.warning(
-            "Could not initialize daily stats for %s: balance unavailable.",
-            self.today_str,
-        )
+        self._refresh_daily_baseline(allow_sleep=True)
 
     # ---------------- Public API ----------------
 
@@ -105,6 +121,20 @@ class DailyScheduler:
             if manual:
                 return True, reason
         return self.check_daily_limits()
+
+    def peek_entry_pause(self) -> tuple[bool, str]:
+        """Read-only pause view for /health — no rollover, REST, or status writes."""
+        if self.controller:
+            manual, reason = self.controller.is_manually_paused()
+            if manual:
+                return True, reason
+        try:
+            stats = self.db.get_daily_stats(utc_today_str()) or {}
+        except Exception:
+            return False, ""
+        if stats.get("status") == DAILY_STATUS_PAUSED:
+            return True, "Daily limit already reached — entries paused for today."
+        return False, ""
 
     def pause_entries_manual(self, reason: str = "Manual pause via Telegram") -> None:
         if self.controller:
@@ -160,15 +190,19 @@ class DailyScheduler:
 
     def check_daily_limits(self) -> tuple[bool, str]:
         """Evaluate day rollover and realized-PnL daily profit/loss thresholds."""
-        self.ensure_startup_initialized()
         self._handle_day_rollover()
-
+        baseline = self._refresh_daily_baseline(allow_sleep=False)
         stats = self.db.get_daily_stats(self.today_str)
-        if not stats:
-            self.ensure_startup_initialized()
-            stats = self.db.get_daily_stats(self.today_str)
-            if not stats:
-                return False, ""
+        if baseline <= 0 or not stats:
+            system_logger.warning(
+                "Daily PnL check unavailable: wallet baseline missing for %s "
+                "— new entries blocked (circuit breaker not deferred).",
+                self.today_str,
+            )
+            return True, (
+                "Daily PnL check unavailable (baseline/wallet invalid) — "
+                "new entries blocked."
+            )
 
         if self.controller and self.controller.is_daily_limit_overridden():
             return False, ""
@@ -177,35 +211,23 @@ class DailyScheduler:
         stats = self.db.get_daily_stats(self.today_str) or stats
 
         if stats.get("status") == DAILY_STATUS_PAUSED:
-            still_in_breach = daily_profit_target_reached(
-                metrics
-            ) or daily_max_loss_reached(metrics)
-            if still_in_breach:
-                return True, "Daily limit already reached — entries paused for today."
-            balance = (
-                metrics.current_wallet
-                if metrics.current_wallet > 0
-                else self._get_balance(force_refresh=False)
-            )
-            self.db.set_daily_status(
-                self.today_str, DAILY_STATUS_ACTIVE, balance
-            )
-            system_logger.info(
-                "Daily PAUSED status cleared for %s — profit/loss limits not in breach.",
-                self.today_str,
-            )
+            return True, "Daily limit already reached — entries paused for today."
 
         now = time.monotonic()
         if now - self._last_limit_check_at < self._limit_check_interval:
             return False, ""
 
         self._last_limit_check_at = now
-        if metrics.start_balance <= 0:
+        if metrics.start_balance <= 0 or metrics.current_wallet <= 0:
             system_logger.warning(
-                "Daily PnL check skipped: invalid start balance for %s.",
+                "Daily PnL check unavailable: invalid start/current wallet for %s "
+                "— new entries blocked (circuit breaker not deferred).",
                 self.today_str,
             )
-            return False, ""
+            return True, (
+                "Daily PnL check unavailable (invalid start/current wallet) — "
+                "new entries blocked."
+            )
 
         current_balance = self._get_balance(force_refresh=False)
         self.db.update_daily_balance(self.today_str, current_balance, DAILY_STATUS_ACTIVE)
@@ -287,6 +309,7 @@ class DailyScheduler:
         system_logger.info("UTC day rollover detected: %s -> %s", self.today_str, current_day)
         self.today_str = current_day
         self._last_limit_check_at = 0.0
+        self._startup_initialized = False
         if self.controller:
             self.controller.clear_daily_limit_override()
         self._initialize_trading_day(force_balance_refresh=True)
@@ -320,11 +343,13 @@ class DailyScheduler:
             )
         if baseline <= 0:
             system_logger.warning(
-                "Could not initialize daily stats for %s: wallet unavailable.",
+                "Could not initialize daily stats for %s: wallet unavailable "
+                "(will retry; entries not paused as a daily stop).",
                 self.today_str,
             )
             return
 
+        self._startup_initialized = True
         system_logger.info(
             "Trading day %s — daily starting balance $%.2f.",
             self.today_str,

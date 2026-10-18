@@ -78,7 +78,7 @@ def evaluate_vp_breakout(
         score += 5.0
 
     result.score = min(score, 94.0)
-    result.passed = result.score >= Config.VPB_MIN_SCORE and vol_ok
+    result.passed = result.score >= Config.effective_min_score(Config.VPB_MIN_SCORE) and vol_ok
     if not result.passed and "score_below" not in str(result.reasons):
         result.reasons.append(f"score_below_min_{result.score:.1f}")
     return result

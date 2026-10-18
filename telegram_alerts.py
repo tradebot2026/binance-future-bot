@@ -39,6 +39,17 @@ def format_runtime_health_block(
         if hub is not None and hasattr(hub, "get_ws_health_snapshot"):
             snap = hub.get_ws_health_snapshot() or {}
             ws_state = str(snap.get("state", "UNKNOWN")).upper()
+        else:
+            try:
+                from core.ops_heartbeat import get_ws_health_state, read_heartbeat_payload
+
+                ws_state = str(
+                    get_ws_health_state()
+                    or (read_heartbeat_payload() or {}).get("ws_state")
+                    or "UNKNOWN"
+                ).upper()
+            except Exception:
+                ws_state = "UNKNOWN"
         if hasattr(exchange, "rest_usage_snapshot"):
             usage = exchange.rest_usage_snapshot() or {}
             api_state = str(usage.get("state", "UNKNOWN"))
@@ -67,15 +78,38 @@ def format_runtime_health_block(
                 scan_line = "DYNAMIC 2-COIN/MIN ACTIVE"
     ledger = get_execution_ledger().recent_summary()
     queued = get_execution_ledger().queued_count()
+    from core.bot_health import get_incomplete_kline_count, get_scan_history_ready
+    from core.ops_heartbeat import get_last_api_error, read_heartbeat_payload
+    from core.system_health import system_health_snapshot
+
+    health = system_health_snapshot(
+        open_trades=int(open_positions or 0),
+        db_ok=True,
+        ws_state=ws_state,
+    )
+    overall = str(health.get("overall") or "UNKNOWN")
+    if not get_scan_history_ready():
+        scan_line = (
+            f"NOT READY (incomplete klines {get_incomplete_kline_count()})"
+        )
+    api_err, _ = get_last_api_error()
+    if not api_err:
+        api_err = str((read_heartbeat_payload() or {}).get("last_api_error") or "")
+    api_err_bit = (
+        f"\nLAST API ERROR: {escape_html(api_err[:80])}" if api_err else ""
+    )
     if compact:
         return (
             f"\n🤖 <b>RUNTIME STATUS:</b>\n"
+            f"OVERALL: {escape_html(overall)}\n"
             f"WS: {escape_html(ws_state)} | API: {escape_html(api_state)}\n"
             f"RATE LIMIT: {escape_html(api_state)}\n"
             f"SCANNER: {escape_html(scan_line)}"
+            f"{api_err_bit}"
         )
     return (
         f"\n🛰 <b>RUNTIME</b>\n"
+        f"OVERALL: {escape_html(overall)}\n"
         f"WS: {escape_html(ws_state)} | API: {escape_html(api_state)}\n"
         f"RATE LIMIT: {escape_html(api_state)} | EXECUTION: {escape_html(exec_state)}\n"
         f"SCANNER: {escape_html(scan_line)}\n"
@@ -83,6 +117,7 @@ def format_runtime_health_block(
         f"APPROVED: {ledger['approved']} | SUBMITTED: {ledger['submitted']} | "
         f"FILLED: {ledger['filled']} | REJECTED: {ledger['rejected']} | "
         f"FAILED: {ledger['failed']}"
+        f"{api_err_bit}"
     )
 
 
@@ -510,7 +545,9 @@ def format_watchlist_message(
 
     super_list = super_rows or []
     lines.append("")
-    lines.append(f"⭐ <b>Super Tier</b> ({len(super_list)}) • Local TP/SL")
+    lines.append(
+        f"⭐ <b>Super Tier</b> ({len(super_list)}) • funnel scores (≥ exec min), not fills"
+    )
     if super_list:
         for sym, strat, score in super_list[:12]:
             lines.append(

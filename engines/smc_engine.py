@@ -777,7 +777,15 @@ def effective_smc_min_score(confluence_type: str, macro_trend: str) -> float:
         min_score = Config.STRATEGY_MIN_SCORE
         if macro_trend == "NEUTRAL" and Config.ALLOW_NEUTRAL_MACRO_SETUPS:
             min_score = max(min_score, Config.NEUTRAL_MACRO_MIN_SCORE)
-    return min_score
+    # Engine floor cannot sit below Super/execution. Testnet relax applies;
+    # live STRATEGY_MIN_SCORE is never reduced.
+    from core.strategy_score_ranges import execution_min_score
+    from constants import STRATEGY_SMC_TREND
+
+    return max(
+        Config.effective_min_score(min_score),
+        execution_min_score(STRATEGY_SMC_TREND),
+    )
 
 
 def size_multiplier_for_score(score: float) -> float:
